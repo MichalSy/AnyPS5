@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "SceShaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "CacheKey.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -89,6 +90,18 @@ void expectFailure(TAction action, std::string_view reason) {
         return;
     }
     throw std::runtime_error("expected graphics rejection: " + std::string(reason));
+}
+
+void hostImportBudgetTests() {
+    VkPhysicalDeviceMemoryProperties memory{};
+    memory.memoryHeapCount = 2;
+    memory.memoryHeaps[0] = {24ull << 30u, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryHeaps[1] = {47ull << 30u, 0};
+    Require(AgcDriver::Graphics::DefaultHostImportBudget(memory) == (45ull << 30u), "the host import budget is not the system memory heap less 2 GiB");
+    memory.memoryHeaps[1].size = 8ull << 30u;
+    Require(AgcDriver::Graphics::DefaultHostImportBudget(memory) == (6ull << 30u), "a small system memory heap lowered the host import budget below 6 GiB");
+    memory.memoryHeapCount = 1;
+    Require(AgcDriver::Graphics::DefaultHostImportBudget(memory) == (6ull << 30u), "a device without a system memory heap has no 6 GiB host import budget");
 }
 
 void stateTests() {
@@ -4182,6 +4195,7 @@ int main() {
             AgcDriver::Graphics::ValidateDepthBounds(unrestricted, bounded);
         }
         RunGuestLeaseWaitTests();
+        hostImportBudgetTests();
         stateTests();
         RunMsaaStateTests();
         RunColorResolveStateTests();
