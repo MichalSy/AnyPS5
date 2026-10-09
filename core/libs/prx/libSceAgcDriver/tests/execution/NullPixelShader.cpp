@@ -13,6 +13,7 @@
 #include <iostream>
 #include <string_view>
 #include <vector>
+#include <spirv/unified1/spirv.hpp>
 
 namespace {
 
@@ -262,7 +263,6 @@ void CheckRegisteredDraw(bool rectangleOnly = false, bool pairAbi = false) {
             }
         }
     }
-    AgcDriverShutdown_nid_postfix();
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(Stencil.data());
@@ -345,7 +345,6 @@ void CheckDepthOnly(std::uint32_t primitiveType, bool explicitNull) {
             }
         }
     }
-    AgcDriverShutdown_nid_postfix();
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(Stencil.data());
@@ -355,14 +354,162 @@ void CheckDepthOnly(std::uint32_t primitiveType, bool explicitNull) {
     std::cout << "depth-only null pixel draw, stencil-only depth preservation, scissor and color preservation passed\n";
 }
 
+alignas(256) constexpr std::array<std::uint32_t, 8> PixelDepthCode{
+    0x7e0e02f2u, 0x7e0002ffu, 0x3f400000u, 0xf8001081u,
+    0x00000000u, 0xf800180fu, 0x07070707u, 0xbf810000u
+};
+
+bool HasExecutionMode(std::span<const std::uint32_t> words, spv::ExecutionMode mode) {
+    for (std::size_t offset = 5; offset < words.size();) {
+        const auto count = words[offset] >> 16u;
+        Require(count != 0u && count <= words.size() - offset, "invalid prepared pixel instruction");
+        if ((words[offset] & 0xffffu) == spv::OpExecutionMode && count >= 3u && words[offset + 2u] == mode) return true;
+        offset += count;
+    }
+    return false;
+}
+
+void CheckDepthExportAbi(AgcDriver::VulkanDevice& device) {
+    for (const std::uint32_t zOrder : {0u, 1u}) {
+        auto snapshot = Snapshot(0x30000u, 1);
+        snapshot->code.assign(PixelDepthCode.begin(), PixelDepthCode.end());
+        AgcDriver::Registers context{
+            {0x1b3, 2}, {0x1b4, 2}, {0x1b6, 0x8001}, {0x191, 32},
+            {0x1c5, 9}, {0x203, 0x801u | (zOrder << 4u)}, {0x1c4, 1}
+        };
+        const auto enabled = AgcDriver::Graphics::DecodePixelStageInfo(context, {});
+        Require(enabled.depthExportEnable && !enabled.earlyZ, "depth export did not suppress early fragment tests");
+        RecompileRequest request{{ShaderStage::Fragment, snapshot->codeAddress, snapshot->code, 0, snapshot->header}, {32, 0, {}, {}, enabled, {}, {}}, device.Target(), {0, 0, 0, 128}};
+        for (const auto capacity : {128u, 0u}) {
+            request.layout.pushConstantSizeBytes = capacity;
+            snapshot->prepared->entries.push_back({0, PrepareShader(request)});
+        }
+        context[0x203] &= ~1u;
+        const auto disabled = AgcDriver::Graphics::DecodePixelStageInfo(context, {});
+        Require(!disabled.depthExportEnable && disabled.earlyZ == (zOrder == 1u), "disabling depth export did not recompute early fragment tests");
+        request.context.pixel = disabled;
+        request.layout = {0, 0, 0, 128};
+        bool rejected = false;
+        try {
+            static_cast<void>(SourceHandleFor(*snapshot, 0, request));
+        } catch (const std::exception& error) {
+            Require(std::string_view(error.what()).find("prepared shader artifact is missing") != std::string_view::npos, "disabled depth ABI failed for an unrelated reason");
+            rejected = true;
+        }
+        Require(rejected, "enabled depth artifact accepted a different static depth ABI");
+        for (const auto capacity : {128u, 0u}) {
+            request.layout.pushConstantSizeBytes = capacity;
+            snapshot->prepared->entries.push_back({0, PrepareShader(request)});
+        }
+        for (const bool exportDepth : {true, false}) {
+            request.context.pixel = exportDepth ? enabled : disabled;
+            for (const auto layout : {BindingLayout{0, 0, 0, 128}, BindingLayout{0, 0, 20, 108}, BindingLayout{0, 0, 0, 0}}) {
+                request.layout = layout;
+                const auto handle = SourceHandleFor(*snapshot, 0, request);
+                const auto& words = GetPreparedArtifact(*handle).spirv.Words();
+                Require(HasExecutionMode(words, spv::ExecutionModeDepthReplacing) == exportDepth, "prepared pixel retained the wrong depth export execution mode");
+                Require(HasExecutionMode(words, spv::ExecutionModeEarlyFragmentTests) == (!exportDepth && zOrder == 1u), "prepared pixel retained the wrong early depth execution mode");
+                const auto invocation = InvocationFor(*snapshot, 0, request);
+                Require(invocation.Request().layout.pushConstantOffsetBytes == layout.pushConstantOffsetBytes, "prepared pixel lost its actual preceding-stage push offset");
+            }
+        }
+        for (const bool changeInterpolator : {true, false}) {
+            request.context.pixel = disabled;
+            request.layout = {0, 0, 0, 128};
+            if (changeInterpolator) request.context.pixel->interpolatorSettings[0] = 0;
+            else request.context.pixel->earlyZ = !disabled.earlyZ;
+            rejected = false;
+            try {
+                static_cast<void>(SourceHandleFor(*snapshot, 0, request));
+            } catch (const std::exception& error) {
+                Require(std::string_view(error.what()).find("prepared shader artifact is missing") != std::string_view::npos, "unprepared pixel ABI failed for an unrelated reason");
+                rejected = true;
+            }
+            Require(rejected, "preparing depth variants relaxed an unrelated static pixel ABI");
+        }
+    }
+    std::cout << "prepared depth export, early fragment tests, push offsets and strict pixel ABI passed\n";
+}
+
+void CheckRegisteredDepthExport(std::uint32_t zOrder) {
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(Pixels.data(), Pixels.size(), true, true);
+        mutation.Add(Depth.data(), Depth.size(), true, true);
+        mutation.Add(Stencil.data(), Stencil.size(), true, true);
+    }
+    auto queue = Queue();
+    queue.context[0x200] = 0x76;
+    queue.context[0x011] = 0;
+    Header<3, 1> vertex;
+    vertex.Initialize(2, VertexCode.data(), sizeof(VertexCode));
+    vertex.registers = {{{0xc8, queue.shader.at(0xc8)}, {0xc9, queue.shader.at(0xc9)}, {0x8b, queue.shader.at(0x8b)}}};
+    vertex.context = {{{0x2d5, 0x2000}}};
+    Header<3, 6> color;
+    color.Initialize(1, PixelCode.data(), sizeof(PixelCode));
+    color.registers = {{{0x8, queue.shader.at(0x8)}, {0x9, queue.shader.at(0x9)}, {0xb, queue.shader.at(0xb)}}};
+    color.context = {{{0x1b3, 2}, {0x1b4, 2}, {0x1b6, 0x8000}, {0x1c5, 9}, {0x203, 0x800}, {0x1c4, 0}}};
+    auto exportQueue = queue;
+    Bind(exportQueue, 0x8, reinterpret_cast<std::uintptr_t>(PixelDepthCode.data()));
+    exportQueue.context[0x1b6] = 0x8001;
+    exportQueue.context[0x191] = 32;
+    exportQueue.context[0x1c4] = 1;
+    exportQueue.context[0x203] = 0x801u | (zOrder << 4u);
+    Header<3, 7> pixel;
+    pixel.Initialize(1, PixelDepthCode.data(), sizeof(PixelDepthCode));
+    pixel.registers = {{{0x8, exportQueue.shader.at(0x8)}, {0x9, exportQueue.shader.at(0x9)}, {0xb, exportQueue.shader.at(0xb)}}};
+    pixel.context = {{{0x1b3, 2}, {0x1b4, 2}, {0x1b6, 0x8001}, {0x1c5, 9}, {0x203, exportQueue.context.at(0x203)}, {0x1c4, 1}, {0x191, 0}}};
+    AgcDriverRegisterShader_nid_postfix(&vertex.shader);
+    AgcDriverRegisterShader_nid_postfix(&color.shader);
+    AgcDriverRegisterShader_nid_postfix(&pixel.shader);
+    const std::array<const Shader*, 1> stages{&vertex.shader};
+    const std::array<ShaderRegister, 1> primitive{{{0x242, 4}}};
+    AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, {}, primitive);
+    const std::array<ShaderRegister, 1> interpolant{{{0x191, 32}}};
+    AgcDriverResolveShaderAbi_nid_postfix(&pixel.shader, interpolant, {});
+    AgcDriverResolveShaderAbi_nid_postfix(&pixel.shader, interpolant, {});
+    const auto verifyDepth = [&](float reference, VkCompareOp compare, bool expectedPass) {
+        for (auto& position : Vertices) position[2] = reference;
+        Pixels.fill(std::byte{0x40});
+        auto verify = queue;
+        verify.context[0x200] = (static_cast<std::uint32_t>(compare) << 4u) | 2u;
+        Submit(verify);
+        const auto expected = expectedPass ? std::byte{255} : std::byte{0x40};
+        Require(std::all_of(Pixels.begin(), Pixels.begin() + Width * Height * 4u, [&](std::byte value) { return value == expected; }), "registered depth variant produced the wrong stored depth");
+        Require(std::all_of(Pixels.begin() + Width * Height * 4u, Pixels.end(), [](std::byte value) { return value == std::byte{0x40}; }), "depth verification draw changed color padding");
+    };
+    for (const bool exportDepth : {true, false, true, false}) {
+        for (auto& position : Vertices) position[2] = 0.25f;
+        Submit(queue);
+        verifyDepth(0.25f, VK_COMPARE_OP_EQUAL, true);
+        for (auto& position : Vertices) position[2] = 0.25f;
+        auto draw = exportQueue;
+        if (!exportDepth) draw.context[0x203] &= ~1u;
+        const auto pixelInfo = AgcDriver::Graphics::DecodePixelStageInfo(draw.context, {});
+        Require(pixelInfo.depthExportEnable == exportDepth && pixelInfo.earlyZ == (!exportDepth && zOrder == 1u), "registered depth fixture decoded the wrong pixel controls");
+        Submit(draw);
+        verifyDepth(exportDepth ? 0.75f : 0.25f, VK_COMPARE_OP_EQUAL, true);
+        verifyDepth(0.5f, VK_COMPARE_OP_LESS, exportDepth);
+        Require(pixel.context[4].value == (0x801u | (zOrder << 4u)) && pixel.context[6].value == 0, "preparing a depth variant changed the registered shader header");
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(Stencil.data());
+        mutation.Remove(Depth.data());
+        mutation.Remove(Pixels.data());
+    }
+    std::cout << "registered enabled/disabled depth export and resolved interpolants passed: zOrder=" << zOrder << '\n';
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--abi" || std::string_view(argv[1]) == "--draw" || std::string_view(argv[1]) == "--rect" || std::string_view(argv[1]) == "--rect-pair" || std::string_view(argv[1]) == "--depth-only" || std::string_view(argv[1]) == "--depth-only-rect" || std::string_view(argv[1]) == "--depth-only-zero" || std::string_view(argv[1]) == "--depth-only-rect-zero")), "invalid test arguments");
+        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--abi" || std::string_view(argv[1]) == "--draw" || std::string_view(argv[1]) == "--rect" || std::string_view(argv[1]) == "--rect-pair" || std::string_view(argv[1]) == "--depth-only" || std::string_view(argv[1]) == "--depth-only-rect" || std::string_view(argv[1]) == "--depth-only-zero" || std::string_view(argv[1]) == "--depth-only-rect-zero" || std::string_view(argv[1]) == "--depth-variants")), "invalid test arguments");
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         if (argc == 1 || std::string_view(argv[1]) == "--abi") CheckDecodedAbi(*device);
+        if (argc == 1 || std::string_view(argv[1]) == "--depth-variants") CheckDepthExportAbi(*device);
         device.reset();
         if (argc == 1 || std::string_view(argv[1]) == "--draw") CheckRegisteredDraw();
         if (argc == 2 && std::string_view(argv[1]) == "--rect") CheckRegisteredDraw(true);
@@ -371,6 +518,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--depth-only-rect") CheckDepthOnly(17u, false);
         if (argc == 2 && std::string_view(argv[1]) == "--depth-only-zero") CheckDepthOnly(4u, true);
         if (argc == 2 && std::string_view(argv[1]) == "--depth-only-rect-zero") CheckDepthOnly(17u, true);
+        if (argc == 1 || std::string_view(argv[1]) == "--depth-variants") {
+            CheckRegisteredDepthExport(0u);
+            CheckRegisteredDepthExport(1u);
+        }
+        if (argc == 1 || std::string_view(argv[1]) != "--abi") AgcDriverShutdown_nid_postfix();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

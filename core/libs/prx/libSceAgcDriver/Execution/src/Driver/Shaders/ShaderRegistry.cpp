@@ -215,6 +215,25 @@ void WriteFirstDifference(std::ostream& output, std::span<const TValue> requeste
     else output << *mismatch.second;
 }
 
+void WriteKeyDifferences(std::ostream& output, std::span<const std::uint64_t> requested, std::span<const std::uint64_t> prepared) {
+    constexpr std::size_t limit = 6;
+    std::size_t count = 0;
+    output << '[';
+    for (std::size_t index = 0; index < std::max(requested.size(), prepared.size()); ++index) {
+        if (index < requested.size() && index < prepared.size() && requested[index] == prepared[index]) continue;
+        if (count++ >= limit) continue;
+        if (count != 1) output << ',';
+        output << index << ':';
+        if (index < requested.size()) output << requested[index];
+        else output << "missing";
+        output << '/';
+        if (index < prepared.size()) output << prepared[index];
+        else output << "missing";
+    }
+    output << ']';
+    if (count > limit) output << " keyDeltasOmitted=" << count - limit;
+}
+
 std::string MissingPreparedShaderMessage(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, std::span<const std::uint64_t> key) {
     constexpr std::size_t candidateLimit = 8;
     std::ostringstream layouts;
@@ -236,6 +255,8 @@ std::string MissingPreparedShaderMessage(const ShaderSnapshot& snapshot, std::si
         candidates << ": wave=" << artifact.info.waveSize << " userBase=" << artifact.info.userDataBase
             << " userCount=" << artifact.info.userDataCount << " keySize=" << key.size() << '/' << handle.staticKey.size() << " keyDelta=";
         WriteFirstDifference(candidates, key, std::span<const std::uint64_t>(handle.staticKey));
+        candidates << " keyDeltas=";
+        WriteKeyDifferences(candidates, key, std::span<const std::uint64_t>(handle.staticKey));
         const auto code = ShaderRecompiler::GetPreparedCode(handle);
         candidates << " codeSize=" << request.shader.code.size() << '/' << code.size()
             << " codeEqual=" << std::ranges::equal(request.shader.code, code) << " codeDelta=";
@@ -511,6 +532,15 @@ PreparedRegistration PrepareRegistered(const ShaderSnapshot& snapshot, const Vul
     } else if (pixel) {
         request.layout.pushConstantSizeBytes = 0;
         append();
+        if (pixel->depthExportEnable) {
+            auto context = state.context;
+            context[0x203] &= ~1u;
+            request.context.pixel = Graphics::DecodePixelStageInfo(context, {});
+            request.layout.pushConstantSizeBytes = 128;
+            append();
+            request.layout.pushConstantSizeBytes = 0;
+            append();
+        }
     }
     return prepared;
 }

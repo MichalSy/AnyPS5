@@ -273,6 +273,10 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
             Require(mismatch.find("codeEqual=1 codeDelta=none") != std::string::npos && mismatch.find("pixel={") != std::string::npos && mismatch.size() < 8192, "prepared fragment diagnostic lost its context or exceeded its limit");
             const auto sourceMismatch = Reject([&] { static_cast<void>(SourceHandleFor(*program.snapshot, program.codeOffset, request)); }, "artifact is missing");
             Require(sourceMismatch == mismatch, "prepared source and invocation mismatch diagnostics disagree");
+            auto multipleDifferencesRequest = request;
+            multipleDifferencesRequest.context.pixel->depthExportEnable = !multipleDifferencesRequest.context.pixel->depthExportEnable;
+            const auto multipleDifferences = Reject([&] { static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, multipleDifferencesRequest)); }, "artifact is missing");
+            Require(multipleDifferences.find("keyDeltas=[8:1026/1027,24:") != std::string::npos && multipleDifferences.size() < 8192, "prepared mismatch diagnostic lost a later static ABI difference");
             auto changedCodeRequest = request;
             changedCodeRequest.context.pixel->interpolatorSettings[0] ^= 1u;
             std::vector<std::uint32_t> changedCode(program.binary.code.begin(), program.binary.code.end());

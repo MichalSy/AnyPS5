@@ -24,7 +24,16 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
     };
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
-    const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
+    const auto invocation = [&] {
+        try {
+            return InvocationFor(*program.snapshot, program.codeOffset, request);
+        } catch (const std::runtime_error& error) {
+            throw std::runtime_error(std::string(error.what()) + " drawContext={cbTargetMask=" + std::to_string(readRegister(queue.context, 0x8e))
+                + " cbShaderMask=" + std::to_string(readRegister(queue.context, 0x8f))
+                + " zFormat=" + std::to_string(readRegister(queue.context, 0x1c4))
+                + " dbShaderControl=" + std::to_string(readRegister(queue.context, 0x203)) + '}');
+        }
+    }();
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
