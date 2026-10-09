@@ -122,10 +122,11 @@ void CheckAbi() {
     Reject([] { BindingNumber(Stage::Main, Binding::Count); }, "invalid stage or binding");
     Reject([] { ShaderRecompiler::RuntimeAbi::RequireVersion(0u); }, "incompatible version");
     Reject([] { ShaderRecompiler::RuntimeAbi::RequireVersion(10u); }, "incompatible version");
+    Reject([] { ShaderRecompiler::RuntimeAbi::RequireVersion(11u); }, "incompatible version");
     ShaderRecompiler::RuntimeAbi::RequireVersion(ShaderRecompiler::RuntimeAbi::Version);
     using namespace ShaderRecompiler;
-    Require(RuntimeAbi::Version == 11u && RuntimeAbi::SampledHeapCapacity == 32u && RuntimeAbi::BindlessTableCapacity == 16u, "sampled and bindless heap capacities are not independent");
-    Require(RuntimeAbi::StorageHeapCapacity == 4u && RuntimeAbi::SamplerHeapCapacity == 16u, "storage or sampler heap capacity changed");
+    Require(RuntimeAbi::Version == 12u && RuntimeAbi::SampledHeapCapacity == 32u && RuntimeAbi::BindlessTableCapacity == 16u, "sampled and bindless heap capacities are not independent");
+    Require(RuntimeAbi::StorageHeapCapacity == 4u && RuntimeAbi::SamplerHeapCapacity == 32u, "storage or sampler heap capacity changed");
     Require(PipelineSpecialization::DescriptorIndexStride == 128u && RuntimeAbi::SampledHeapCapacity < PipelineSpecialization::DescriptorIndexStride, "sampled heap exceeds the descriptor specialization stride");
     std::set<std::uint32_t> indices;
     for (std::uint32_t binding = RuntimeAbi::FirstImageBinding; binding <= static_cast<std::uint32_t>(Binding::Samplers); ++binding) {
@@ -134,8 +135,8 @@ void CheckAbi() {
             Require(indices.insert(id).second && id < PipelineSpecialization::ImageModeBase, "typed heap descriptor specialization IDs overlap");
         }
     }
-    Require(sizeof(RuntimeAbi::ResourceMetadata) == 48u && sizeof(RuntimeAbi::ShaderData) == 13760u, "runtime metadata size changed");
-    Require(RuntimeAbi::UserDataDword == 4u && RuntimeAbi::BufferOffsetsDword == 132u && RuntimeAbi::DispatchThreadLimitDword == 164u && RuntimeAbi::ExportMappingsDword == 3432u, "runtime metadata offsets changed");
+    Require(sizeof(RuntimeAbi::ResourceMetadata) == 48u && sizeof(RuntimeAbi::ShaderData) == 14528u, "runtime metadata size changed");
+    Require(RuntimeAbi::UserDataDword == 4u && RuntimeAbi::BufferOffsetsDword == 132u && RuntimeAbi::DispatchThreadLimitDword == 164u && RuntimeAbi::ExportMappingsDword == 3624u, "runtime metadata offsets changed");
     Require(offsetof(RuntimeAbi::ShaderData, images) == 672u && offsetof(RuntimeAbi::ShaderData, samplers) == 12960u, "image or sampler metadata offset changed");
 }
 
@@ -153,6 +154,8 @@ void CheckHeaps() {
     image.numericClass = IrTextureNumericClass::Float;
     image.dimension = RdnaImageDimension::Dim2D;
     const auto single = allocate(image, 1u);
+    const auto sixteenSamplers = allocate(image, 1u, 16u);
+    Require(BindingAllocator{}.FindBinding(sixteenSamplers.layout, DescriptorBindingKind::Samplers).resources.size() == 32u, "sixteen logical samplers must fit with both descriptor variants");
     const auto nineteen = allocate(image, 19u);
     const auto full = allocate(image, 32u, RuntimeAbi::SamplerHeapCapacity / 2u);
     const auto binding = DescriptorBindingForImage(image);
