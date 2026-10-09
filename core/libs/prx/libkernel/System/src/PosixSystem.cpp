@@ -185,7 +185,8 @@ int APS5_VABI getrlimit_nid_postfix(int resource, GuestResourceLimit* limit) {
 
 int APS5_VABI sysctl_nid_postfix(const int* name, unsigned nameLength, void* oldValue, std::size_t* oldLength, const void* newValue, std::size_t newLength) {
     if (!name) return Failure(14);
-    if (!nameLength || nameLength > 24) return Failure(22);
+    if (nameLength < 2 || nameLength > 24) return Failure(22);
+    if (newValue && nameLength == 2 && name[0] == 6 && name[1] == 3) return Failure(1);
     if (newValue || newLength) return Failure(45);
     const int saved = *__error_nid_postfix();
     try {

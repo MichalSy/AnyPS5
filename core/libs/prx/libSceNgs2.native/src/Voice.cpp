@@ -18,6 +18,7 @@ static constexpr std::uint8_t COMMAND_TYPE_FLOAT = 1;
 static constexpr std::uint8_t COMMAND_TYPE_INT = 3;
 static constexpr std::uint8_t COMMAND_TYPE_UINT = 4;
 static constexpr std::uint8_t COMMAND_TYPE_FLOAT_ARRAY = 0x11;
+static constexpr float MAX_MATRIX_LEVEL = 4.0f;
 
 void Ngs2Voice::SetEvent(std::uint32_t eventId) {
     switch (eventId) {
@@ -92,10 +93,12 @@ static Ngs2Port& PortAt(Ngs2Voice& voice, std::uint32_t port) {
 }
 
 static void SetMatrixLevels(Ngs2Voice& voice, std::uint32_t matrixId, const float* levels, std::uint32_t numLevels) {
-    if (matrixId >= voice.matrices.size() || numLevels > NGS2_MAX_CHANNELS * NGS2_MAX_CHANNELS || (levels == nullptr && numLevels != 0)) {
+    if (matrixId >= voice.matrices.size() || numLevels == 0 || numLevels > NGS2_MAX_CHANNELS * NGS2_MAX_CHANNELS || levels == nullptr) {
         APS5_INVALID_ARG_EX;
     }
-    voice.matrices[matrixId].assign(levels, levels + numLevels);
+    auto& matrix = voice.matrices[matrixId];
+    matrix.resize(numLevels);
+    for (std::uint32_t i = 0; i < numLevels; i++) matrix[i] = std::clamp(levels[i], -MAX_MATRIX_LEVEL, MAX_MATRIX_LEVEL);
 }
 
 static void SetPortMatrix(Ngs2Voice& voice, std::uint32_t port, std::int32_t matrixId) {

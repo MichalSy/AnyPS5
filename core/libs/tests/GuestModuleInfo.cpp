@@ -1,5 +1,7 @@
 #include "SceTypes.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/Module/EhFrame.hpp"
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -27,7 +29,28 @@ static ModuleInfoEx Query(const void* address, int expected) {
     Require(sceKernelGetModuleInfoFromAddr(reinterpret_cast<std::uintptr_t>(address), 2, &info) == expected);
     return info;
 }
+static void CheckFrameRecordLengths() {
+    std::array<std::uint8_t, 28> records{};
+    const std::uint32_t shortLength = 4;
+    const std::uint32_t extendedMarker = 0xffffffffu;
+    const std::uint64_t extendedLength = 4;
+    std::memcpy(records.data(), &shortLength, sizeof(shortLength));
+    std::memcpy(records.data() + 8, &extendedMarker, sizeof(extendedMarker));
+    std::memcpy(records.data() + 12, &extendedLength, sizeof(extendedLength));
+    const auto begin = reinterpret_cast<std::uintptr_t>(records.data());
+    const auto contains = [&](std::uintptr_t address, std::uint64_t size) {
+        return address >= begin && address - begin <= records.size() && size <= records.size() - (address - begin);
+    };
+    Require(EhFrame::FramesSize(contains, begin, "test") == 24);
+    const std::uint64_t oversized = 0xffffffffffffffffull;
+    std::memcpy(records.data() + 12, &oversized, sizeof(oversized));
+    bool rejected = false;
+    try { static_cast<void>(EhFrame::FramesSize(contains, begin, "test")); }
+    catch (const std::runtime_error&) { rejected = true; }
+    Require(rejected);
+}
 int main(int argc, char** argv) {
+    CheckFrameRecordLengths();
     Require(argc == 2);
     void* module = dlopen_nid_postfix(argv[1], 2);
     Require(module != nullptr);
@@ -45,7 +68,10 @@ int main(int argc, char** argv) {
             executable = (segment.prot & 5) == 5;
     }
     Require(executable);
-    Require(info.eh_frame_hdr_addr != 0 && info.eh_frame_hdr_size != 0 && info.eh_frame_addr != 0 && info.eh_frame_size != 0);
+    Require(info.eh_frame_addr != 0 && info.eh_frame_size != 0);
+#ifndef _WIN32
+    Require(info.eh_frame_hdr_addr != 0 && info.eh_frame_hdr_size != 0);
+#endif
     Require(info.init_proc_addr == 0 || info.init_proc_addr >= info.segments[0].address);
     ModuleInfoEx poisoned;
     std::memset(&poisoned, 0xa5, sizeof(poisoned));

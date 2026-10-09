@@ -201,6 +201,49 @@ static void TestSubmixerMatrix() {
     Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
 }
 
+static std::vector<float> MatrixLevelFrame(const std::vector<float>& levels, bool command) {
+    const auto system = CreateSystem();
+    const auto master = Mastering(system, 2);
+    const std::vector<std::int16_t> pcm(Grain, 16384);
+    const auto sampler = Sampler(system, pcm, 0);
+    Patch(sampler, master);
+    if (command) {
+        const Ngs2VoiceCommand set{5, 0, 0x11, static_cast<std::uint16_t>(levels.size()), {.levels = levels.data()}};
+        Require(sceNgs2VoiceRunCommands(sampler, &set, 1) == SCE_NGS2_OK);
+    } else {
+        Control(sampler, SCE_NGS2_VOICE_PARAM_MATRIX_LEVELS, Ngs2VoiceMatrixLevelsParam{{}, 0, static_cast<std::uint32_t>(levels.size()), levels.data()});
+    }
+    Control(sampler, SCE_NGS2_VOICE_PARAM_PORT_MATRIX, Ngs2VoicePortMatrixParam{{}, 0, 0});
+    Event(sampler, SCE_NGS2_VOICE_EVENT_PLAY);
+    std::vector<float> out(Grain * 2, -1.0f);
+    const Ngs2RenderBufferInfo info{out.data(), out.size() * sizeof(float), SCE_NGS2_WAVEFORM_TYPE_PCM_F32L, 2};
+    Require(sceNgs2SystemRender(system, &info, 1) == SCE_NGS2_OK);
+    Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
+    return {out[0], out[1]};
+}
+
+static void TestMatrixLevelClamp() {
+    const float inf = INFINITY;
+    for (bool command : {false, true}) {
+        Require(MatrixLevelFrame({4.0f, -4.0f}, command) == (std::vector<float>{2.0f, -2.0f}));
+        Require(MatrixLevelFrame({4.0001f, -4.5f}, command) == (std::vector<float>{2.0f, -2.0f}));
+        Require(MatrixLevelFrame({100.0f, -100.0f}, command) == (std::vector<float>{2.0f, -2.0f}));
+        Require(MatrixLevelFrame({inf, -inf}, command) == (std::vector<float>{2.0f, -2.0f}));
+        Require(MatrixLevelFrame({3.5f, -0.25f}, command) == (std::vector<float>{1.75f, -0.125f}));
+        const auto nan = MatrixLevelFrame({NAN, 0.5f}, command);
+        Require(std::isnan(nan[0]) && nan[1] == 0.25f);
+    }
+
+    const auto system = CreateSystem();
+    const std::vector<std::int16_t> silence(Grain, 0);
+    const auto sampler = Sampler(system, silence, 0);
+    const float levels[2] = {1.0f, 1.0f};
+    bool empty = false;
+    try { Control(sampler, SCE_NGS2_VOICE_PARAM_MATRIX_LEVELS, Ngs2VoiceMatrixLevelsParam{{}, 0, 0, levels}); } catch (const std::invalid_argument&) { empty = true; }
+    Require(empty);
+    Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
+}
+
 static int allocations = 0;
 static std::int32_t APS5_VABI Allocate(Ngs2ContextBufferInfo* info) {
     Require(info->host_buffer == nullptr && info->host_buffer_size != 0 && info->user_data == 9);
@@ -453,6 +496,7 @@ int main() {
     TestSampleRate();
     TestUserData();
     TestMasteringGain();
+    TestMatrixLevelClamp();
     TestStereoIntoSurround();
     TestLock();
     TestAllocator();

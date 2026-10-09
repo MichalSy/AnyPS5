@@ -1521,14 +1521,19 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
         mutation.Add(block, bytes, true, true);
     }
     struct Unregister {
+        const Context& context;
         void* block;
+        std::uint64_t address;
         bool armed = true;
         ~Unregister() {
             if (!armed) return;
-            GuestAllocations::Mutation mutation;
-            mutation.Remove(block);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
         }
-    } unregister{block};
+    } unregister{context, block, address};
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr) {
         std::cout << "host import of the shadow test block refused: unit shadows not tested\n";

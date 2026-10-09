@@ -518,6 +518,14 @@ int APS5_VABI sceKernelGetdents(int fd, char* buf, int nbytes) {
 
 #endif
 
+int APS5_VABI getdirentries_nid_postfix(int fd, char* buf, int nbytes, int64_t* basep) {
+    return PosixResult(sceKernelGetdirentries(fd, buf, nbytes, basep));
+}
+
+int APS5_VABI getdents_nid_postfix(int fd, char* buf, int nbytes) {
+    return PosixResult(sceKernelGetdents(fd, buf, nbytes));
+}
+
 int APS5_VABI sceKernelMkdir(const char* path, uint16_t mode) {
     (void)mode;
     if (path == nullptr) throw std::invalid_argument("sceKernelMkdir: path is null");

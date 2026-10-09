@@ -318,4 +318,16 @@ int APS5_VABI sceKernelGetOperationMode(int* mode, int* submode) {
     return 0;
 }
 
+int APS5_VABI seteuid_nid_postfix(std::uint32_t euid) {
+    if (euid != 0)
+        throw std::runtime_error("seteuid: unsupported user id " + std::to_string(euid));
+    return 0;
+}
+
+int APS5_VABI setegid_nid_postfix(std::uint32_t egid) {
+    if (egid != 0)
+        throw std::runtime_error("setegid: unsupported group id " + std::to_string(egid));
+    return 0;
+}
+
 }

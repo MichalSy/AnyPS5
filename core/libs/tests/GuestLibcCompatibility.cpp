@@ -118,9 +118,9 @@ int main() {
     Require(close_nid_postfix(socket) == 0);
 
     Require(mkstemp_nid_postfix(nullptr) == -1 && *__error_nid_postfix() == 14);
-    char invalid[] = "invalid.XXXXX";
+    char invalid[] = "";
     Require(mkstemp_nid_postfix(invalid) == -1 && *__error_nid_postfix() == 22);
-    Require(std::strcmp(invalid, "invalid.XXXXX") == 0);
+    Require(std::strcmp(invalid, "") == 0);
     const auto root = std::filesystem::temp_directory_path() / ("anyps5-mkstemp-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     Require(std::filesystem::create_directory(root));

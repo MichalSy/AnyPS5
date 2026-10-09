@@ -77,7 +77,7 @@ int main() {
     Require(sysctl_nid_postfix(nullptr, 2, &cpus, &size, nullptr, 0) == -1 && *__error_nid_postfix() == 14, "null MIB rejected");
     Require(sysctl_nid_postfix(ncpu, 0, &cpus, &size, nullptr, 0) == -1 && *__error_nid_postfix() == 22, "empty MIB rejected");
     const int replacement = 1;
-    Require(sysctl_nid_postfix(ncpu, 2, &cpus, &size, &replacement, sizeof(replacement)) == -1 && *__error_nid_postfix() == 45 && cpus == namedCpus, "write cannot change hardware or copy output");
+    Require(sysctl_nid_postfix(ncpu, 2, &cpus, &size, &replacement, sizeof(replacement)) == -1 && *__error_nid_postfix() == 1 && cpus == namedCpus, "write cannot change hardware or copy output");
 
     int pageSize = 0;
     size = sizeof(pageSize);
