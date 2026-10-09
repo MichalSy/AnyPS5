@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -43,7 +44,7 @@ Registry& registry() {
 
 std::atomic<std::uint64_t> generation{1};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> invalidator{nullptr};
-std::atomic<bool (*)()> pinWaiter{nullptr};
+std::atomic<bool (*)(std::uintptr_t, std::size_t)> pinWaiter{nullptr};
 
 std::chrono::milliseconds pinWait() {
     static const std::chrono::milliseconds value{[] {
@@ -129,7 +130,7 @@ void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t 
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
 }
 
-void GuestAllocationsSetPinWaiter_nid_postfix(bool (*callback)()) {
+void GuestAllocationsSetPinWaiter_nid_postfix(bool (*callback)(std::uintptr_t, std::size_t)) {
     pinWaiter.store(callback, std::memory_order_release);
 }
 
@@ -269,7 +270,7 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         bool progressed = false;
         if (state != nullptr && state->lock.owns_lock()) {
             state->lock.unlock();
-            if (waiter != nullptr) progressed = waiter();
+            if (waiter != nullptr) progressed = waiter(address, bytes);
             else std::this_thread::yield();
             state->lock.lock();
         } else {
@@ -431,6 +432,28 @@ Lease GuestAllocationsAcquire_nid_postfix() {
     for (const auto& [address, range] : registry().ranges) {
         if (range->readable && range->bytes != 0) result.push_back(range);
     }
+    return result;
+}
+
+Lease GuestAllocationsAcquireRange_nid_postfix(const void* pointer, std::size_t bytes, bool writable) {
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    require(address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest allocation lease range");
+    const auto end = address + bytes;
+    std::lock_guard lock(registry().mutex);
+    const auto& ranges = registry().ranges;
+    auto next = ranges.upper_bound(address);
+    if (next != ranges.begin()) --next;
+    auto cursor = address;
+    Lease result;
+    for (; next != ranges.end() && cursor < end; ++next) {
+        const auto& [base, range] = *next;
+        const auto finish = base + range->bytes;
+        if (finish <= cursor) continue;
+        if (base > cursor || !range->readable || (writable && !range->writable)) return {};
+        result.push_back(range);
+        cursor = std::min(end, finish);
+    }
+    if (cursor != end) return {};
     return result;
 }
 

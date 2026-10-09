@@ -3,6 +3,8 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleColorLayout.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -16,7 +18,7 @@ public:
     MultisampleColorSurface& operator=(const MultisampleColorSurface&) = delete;
 
     VkImage Image() const { return image; }
-    VkImageView AttachmentView() const { return attachmentView; }
+    VkImageView AttachmentView(VkFormat format);
     const ColorTarget& Target() const { return target; }
     void Refresh();
     void MarkDirty();
@@ -24,17 +26,20 @@ public:
     bool Dirty() const { return dirty; }
 
 private:
+    friend bool FinishMultisampleColorLeases(std::uint64_t address, std::size_t bytes);
     void release() noexcept;
+    void acquireBacking();
     void transfer(bool store);
     void upload();
     Context context;
     ColorTarget target;
     MultisampleColorLayout geometry;
     std::vector<std::byte> snapshot;
+    GuestAllocations::Lease backing;
     std::unique_ptr<Buffer> linear;
     VkImage image = VK_NULL_HANDLE;
     VkImageView storageView = VK_NULL_HANDLE;
-    VkImageView attachmentView = VK_NULL_HANDLE;
+    std::map<VkFormat, VkImageView> attachmentViews;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
@@ -50,6 +55,7 @@ private:
 std::shared_ptr<MultisampleColorSurface> CachedMultisampleColorSurface(const Context& context, const ColorTarget& target);
 bool AnyPendingMultisampleColors(std::uint64_t address, std::size_t bytes);
 bool FlushMultisampleColors(std::uint64_t address, std::size_t bytes);
+bool FinishMultisampleColorLeases(std::uint64_t address, std::size_t bytes);
 void ClearMultisampleColors(VkDevice device);
 
 }

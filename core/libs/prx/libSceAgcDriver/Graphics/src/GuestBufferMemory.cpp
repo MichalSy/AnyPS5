@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleColorSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -973,10 +974,11 @@ SnapshotStats& Snapshots() {
     return stats;
 }
 
-bool WaitForLeases() noexcept {
+bool WaitForLeases(std::uintptr_t address, std::size_t bytes) noexcept {
     const auto start = std::chrono::steady_clock::now();
     bool synced = false;
     bool drained = false;
+    bool finishedMultisample = false;
     // A range pinned only by the cached address space is released by dropping the cache's
     // reference: no GPU wait, no device lock (the mutating thread may be a driver thread holding
     // it). The registry rescans; a range still pinned by a build or a batch holding the space comes
@@ -993,7 +995,12 @@ bool WaitForLeases() noexcept {
         return true;
     }
     if (GuestMemory::GpuMutex().HeldByThisThread()) {
-        std::this_thread::yield();
+        try {
+            finishedMultisample = FinishMultisampleColorLeases(address, bytes);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[gpu] multisample lease wait failed: %s\n", error.what());
+        }
+        if (!finishedMultisample) std::this_thread::yield();
     } else {
         try {
             std::lock_guard lock(GuestMemory::GpuMutex());
@@ -1017,6 +1024,7 @@ bool WaitForLeases() noexcept {
                 // yet to record (a test's, or a build whose worker gave up the lock); give it time.
                 std::this_thread::yield();
             }
+            finishedMultisample = FinishMultisampleColorLeases(address, bytes);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] lease wait failed: %s\n", error.what());
         }
@@ -1027,7 +1035,7 @@ bool WaitForLeases() noexcept {
     if (synced) ++state.stats.contentionSyncs;
     if (drained) ++state.stats.contentionDrains;
     state.stats.contentionMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    return synced;
+    return synced || finishedMultisample;
 }
 
 void ensurePinWaiter() {
@@ -1039,6 +1047,8 @@ void ensurePinWaiter() {
 }
 
 }
+
+void EnsureGuestAllocationPinWaiter() { ensurePinWaiter(); }
 
 bool SyncLeaseWork() {
     static const bool sync = std::getenv("APS5_SYNC_LEASE_DISPATCH") != nullptr;

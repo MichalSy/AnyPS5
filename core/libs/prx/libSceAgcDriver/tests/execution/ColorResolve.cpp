@@ -26,11 +26,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -57,6 +61,11 @@ alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{
 alignas(256) constexpr std::array<std::uint32_t, 11> PixelCode{
     0x7e0802ff, 0x3f800000, 0x7e0a02ff, 0x3f800000,
     0x7e0c02ff, 0x3f800000, 0x7e0e02ff, 0x3f800000,
+    0xf800180f, 0x07060504, 0xbf810000
+};
+alignas(256) constexpr std::array<std::uint32_t, 11> FractionalPixelCode{
+    0x7e0802ff, 0x3f400000, 0x7e0a02ff, 0x3f400000,
+    0x7e0c02ff, 0x3e800000, 0x7e0e02ff, 0x3f400000,
     0xf800180f, 0x07060504, 0xbf810000
 };
 alignas(256) constexpr std::array<std::array<float, 4>, 3> Vertices{{
@@ -89,51 +98,54 @@ std::size_t Oracle(std::uint32_t x, std::uint32_t y, std::uint32_t sample) {
 
 class Block {
 public:
-    Block() {
+    explicit Block(std::size_t extraBytes = 0) : allocationBytes(StorageBytes + extraBytes) {
         Require(AgcDriver::GuestMemory::WriteWatched(), "color resolve conflict coverage requires actual guest write watching");
 #ifdef _WIN32
-        data = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(StorageBytes, 65536u));
+        data = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(allocationBytes, 65536u));
         Require(data != nullptr, "cannot allocate a watched guest color surface");
-        GuestArena::GuestArenaCommit_nid_postfix(data, StorageBytes, PAGE_READWRITE, StorageBytes);
+        GuestArena::GuestArenaCommit_nid_postfix(data, allocationBytes, PAGE_READWRITE, allocationBytes);
 #else
-        void* raw = mmap(nullptr, StorageBytes + 65536u, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* raw = mmap(nullptr, allocationBytes + 65536u, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         Require(raw != MAP_FAILED, "cannot map a watched guest color surface");
         const auto begin = reinterpret_cast<std::uintptr_t>(raw);
         const auto aligned = (begin + 65535u) & ~std::uintptr_t{65535u};
         if (aligned != begin) munmap(raw, aligned - begin);
-        const auto end = begin + StorageBytes + 65536u;
-        if (aligned + StorageBytes != end) munmap(reinterpret_cast<void*>(aligned + StorageBytes), end - aligned - StorageBytes);
+        const auto end = begin + allocationBytes + 65536u;
+        if (aligned + allocationBytes != end) munmap(reinterpret_cast<void*>(aligned + allocationBytes), end - aligned - allocationBytes);
         data = reinterpret_cast<std::byte*>(aligned);
-        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(data, StorageBytes);
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(data, allocationBytes);
 #endif
         Require(Address() % 65536u == 0 && AgcDriver::GuestMemory::Watched(Address(), StorageBytes), "the color surface must be aligned and genuinely write-watched");
         {
             GuestAllocations::Mutation mutation;
-            mutation.Add(data, StorageBytes, true, true);
+            mutation.Add(data, allocationBytes, true, true);
         }
         Require(AgcDriver::GuestMemory::CollectWritesUncached(Address(), StorageBytes) != 0, "the watched color surface must have a nonzero tracker generation");
     }
     ~Block() {
         {
             GuestAllocations::Mutation mutation;
-            mutation.Remove(data);
+            mutation.Unmap(data, allocationBytes, [](const void*, std::size_t, const void*, bool) {});
         }
 #ifdef _WIN32
-        GuestArena::GuestArenaReset_nid_postfix(data, StorageBytes);
-        GuestArena::GuestArenaRelease_nid_postfix(data, StorageBytes);
+        GuestArena::GuestArenaReset_nid_postfix(data, allocationBytes);
+        GuestArena::GuestArenaRelease_nid_postfix(data, allocationBytes);
 #else
-        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(data, StorageBytes);
-        munmap(data, StorageBytes);
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(data, allocationBytes);
+        munmap(data, allocationBytes);
 #endif
     }
     Block(const Block&) = delete;
     Block& operator=(const Block&) = delete;
     std::uint64_t Address() const { return reinterpret_cast<std::uintptr_t>(data); }
+    std::size_t Size() const { return allocationBytes; }
     void Store(std::size_t offset, std::byte value) {
         data[offset] = value;
         AgcDriver::GuestMemory::MarkWritten(Address() + offset, 1);
     }
     std::byte* data = nullptr;
+private:
+    std::size_t allocationBytes;
 };
 
 std::vector<std::byte> SeedSamples(Block& block) {
@@ -190,7 +202,7 @@ void ExpectWrite(std::vector<std::byte>& expected, VkFormat format, VkRect2D reg
 }
 
 void Draw(AgcDriver::VulkanDevice& device, const ColorTarget& color, VkRect2D region, VkColorComponentFlags mask,
-    std::uint32_t sampleMask = 0xffffffffu, bool keepBlend = false) {
+    std::uint32_t sampleMask = 0xffffffffu, bool keepBlend = false, std::span<const std::uint32_t> pixelCode = PixelCode) {
     const auto target = device.Target();
     const auto address = reinterpret_cast<std::uintptr_t>(Vertices.data());
     const std::array<std::uint32_t, 4> buffer{
@@ -209,9 +221,9 @@ void Draw(AgcDriver::VulkanDevice& device, const ColorTarget& color, VkRect2D re
     pixel.targetOutputMode[0] = 9;
     pixel.targetExportMapping.fill(0xe4u);
     const std::vector<std::uint32_t> pixelUser(8, 0);
-    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(PixelCode.data()), std::as_bytes(std::span(PixelCode))}}};
+    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(pixelCode.data()), std::as_bytes(pixelCode)}}};
     ShaderRecompiler::RecompileRequest fragment{
-        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(PixelCode.data()), PixelCode, 0, {}},
+        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(pixelCode.data()), pixelCode, 0, {}},
         {WaveSize, 0, pixelUser, std::nullopt, pixel, std::nullopt, pixelMemory}, target, {0, 0, vertexPush, 128 - vertexPush}
     };
     fragment.useCache = false;
@@ -439,6 +451,288 @@ void AliasTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Block& dest
     Check(destinationBlock, expected, name + " returning to a cached destination alias preserves resolved bytes");
 }
 
+using QuantizedBytes = std::map<std::size_t, std::array<std::byte, 2>>;
+
+void ExpectFractionalWrite(std::vector<std::byte>& expected, QuantizedBytes& quantized, VkFormat format, VkRect2D region, VkColorComponentFlags mask, std::uint32_t sampleMask) {
+    const bool srgb = format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_SRGB;
+    const std::array<std::byte, 4> encoded = srgb ? std::array{std::byte{225}, std::byte{225}, std::byte{137}, std::byte{191}} :
+        std::array{std::byte{191}, std::byte{191}, std::byte{64}, std::byte{191}};
+    const std::array<std::byte, 4> lower = srgb ? std::array{std::byte{224}, std::byte{224}, std::byte{136}, std::byte{191}} :
+        std::array{std::byte{191}, std::byte{191}, std::byte{63}, std::byte{191}};
+    for (std::uint32_t y = 0; y < region.extent.height; ++y) {
+        for (std::uint32_t x = 0; x < region.extent.width; ++x) {
+            for (std::uint32_t sample = 0; sample < 8; ++sample) {
+                if ((sampleMask & (1u << sample)) == 0) continue;
+                const auto offset = Oracle(static_cast<std::uint32_t>(region.offset.x) + x, static_cast<std::uint32_t>(region.offset.y) + y, sample);
+                for (std::uint32_t channel = 0; channel < 4; ++channel) {
+                    if ((mask & (1u << channel)) == 0) continue;
+                    const auto byte = offset + ByteChannel(format, channel);
+                    expected[byte] = encoded[channel];
+                    quantized[byte] = {lower[channel], static_cast<std::byte>(std::to_integer<unsigned>(lower[channel]) + 1u)};
+                }
+            }
+        }
+    }
+}
+
+void CheckQuantized(const Block& block, const std::vector<std::byte>& expected, const QuantizedBytes& quantized, const std::string& name) {
+    Require(expected.size() == StorageBytes, "expected quantized storage must cover visible samples and padding");
+    auto limit = quantized.begin();
+    for (std::size_t offset = 0; offset < expected.size(); ++offset) {
+        const auto actual = std::to_integer<unsigned>(block.data[offset]);
+        auto lower = std::to_integer<unsigned>(expected[offset]);
+        auto upper = lower;
+        if (limit != quantized.end() && limit->first == offset) {
+            lower = std::to_integer<unsigned>(limit->second[0]);
+            upper = std::to_integer<unsigned>(limit->second[1]);
+            ++limit;
+        }
+        if (actual >= lower && actual <= upper) continue;
+        throw std::runtime_error(name + ": guest byte " + std::to_string(offset) + " is " + std::to_string(actual) +
+            ", expected " + std::to_string(lower) + ".." + std::to_string(upper));
+    }
+    Require(limit == quantized.end(), "quantized byte limits escape guest storage");
+}
+
+void ExpectQuantizedResolve(std::vector<std::byte>& expected, QuantizedBytes& destinationLimits, const std::vector<std::byte>& source, const QuantizedBytes& sourceLimits, VkRect2D region) {
+    const AgcDriver::Graphics::ColorTargetLayout layout(Width, Height, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4);
+    for (std::uint32_t y = 0; y < region.extent.height; ++y) {
+        for (std::uint32_t x = 0; x < region.extent.width; ++x) {
+            const auto px = static_cast<std::uint32_t>(region.offset.x) + x;
+            const auto py = static_cast<std::uint32_t>(region.offset.y) + y;
+            const auto offset = layout.Offset(px, py);
+            for (std::uint32_t channel = 0; channel < 4; ++channel) {
+                std::uint32_t lower = 0;
+                std::uint32_t upper = 0;
+                for (std::uint32_t sample = 0; sample < 8; ++sample) {
+                    const auto byte = Oracle(px, py, sample) + channel;
+                    if (const auto found = sourceLimits.find(byte); found != sourceLimits.end()) {
+                        lower += std::to_integer<unsigned>(found->second[0]);
+                        upper += std::to_integer<unsigned>(found->second[1]);
+                    } else {
+                        const auto value = std::to_integer<unsigned>(source[byte]);
+                        lower += value;
+                        upper += value;
+                    }
+                }
+                if (lower == upper) Require(lower % 8u == 0, "an exact resolve component must have an integer average");
+                const auto first = static_cast<std::byte>(lower / 8u);
+                const auto last = static_cast<std::byte>((upper + 7u) / 8u);
+                expected[offset + channel] = first;
+                if (first == last) destinationLimits.erase(offset + channel);
+                else destinationLimits[offset + channel] = {first, last};
+            }
+        }
+    }
+}
+
+void ExpectExactWrite(std::vector<std::byte>& expected, QuantizedBytes& quantized, VkFormat format, VkRect2D region, VkColorComponentFlags mask, std::uint32_t sampleMask) {
+    ExpectWrite(expected, format, region, mask, sampleMask);
+    for (std::uint32_t y = 0; y < region.extent.height; ++y) {
+        for (std::uint32_t x = 0; x < region.extent.width; ++x) {
+            for (std::uint32_t sample = 0; sample < 8; ++sample) {
+                if ((sampleMask & (1u << sample)) == 0) continue;
+                const auto offset = Oracle(static_cast<std::uint32_t>(region.offset.x) + x, static_cast<std::uint32_t>(region.offset.y) + y, sample);
+                for (std::uint32_t channel = 0; channel < 4; ++channel)
+                    if ((mask & (1u << channel)) != 0) quantized.erase(offset + ByteChannel(format, channel));
+            }
+        }
+    }
+}
+
+void SharedFormatTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Block& destinationBlock, VkFormat format, const std::string& name) {
+    auto source = SeedSamples(sourceBlock);
+    QuantizedBytes sourceLimits;
+    QuantizedBytes destinationLimits;
+    const auto baseline = source;
+    auto expected = SeedDestination(destinationBlock);
+    const auto sourceTarget = Target(sourceBlock, format);
+    const auto destinationTarget = Target(destinationBlock, format, VK_SAMPLE_COUNT_1_BIT);
+    const auto srgbFormat = format == VK_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_B8G8R8A8_SRGB;
+    const auto srgbAlias = Target(sourceBlock, srgbFormat);
+    const auto swapped = Target(sourceBlock, format == VK_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM);
+    Draw(device, srgbAlias, Partial, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_B_BIT, 0x55u, false, FractionalPixelCode);
+    ExpectFractionalWrite(source, sourceLimits, srgbFormat, Partial, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_B_BIT, 0x55u);
+    const auto reject = [&](const ColorTarget& invalid, std::string_view reason) {
+        AgcDriver::Graphics::Context lookup{};
+        lookup.device = device.Device();
+        bool rejected = false;
+        try {
+            AgcDriver::Graphics::CachedMultisampleColorSurface(lookup, invalid);
+        } catch (const std::runtime_error& error) {
+            rejected = std::string_view(error.what()).find(reason) != std::string_view::npos;
+        }
+        Require(rejected, name + " invalid shared target must be rejected: " + std::string(reason));
+        Check(sourceBlock, baseline, name + " rejecting an invalid shared target preserves pending source samples");
+    };
+    auto invalid = sourceTarget;
+    invalid.format = VK_FORMAT_R32_UINT;
+    reject(invalid, "format is unsupported");
+    invalid = sourceTarget;
+    invalid.elementBytes = 8;
+    reject(invalid, "unsupported multisample color geometry");
+    invalid = sourceTarget;
+    invalid.depth = 2;
+    reject(invalid, "arrays, volumes and mipmaps are unsupported");
+    invalid = sourceTarget;
+    invalid.bytes -= 65536u;
+    reject(invalid, "byte range disagrees with its layout");
+    Resolve(device, sourceTarget, destinationTarget, Partial);
+    ExpectQuantizedResolve(expected, destinationLimits, source, sourceLimits, Partial);
+    Check(sourceBlock, baseline, name + " sRGB-to-UNORM resolve keeps the source resident without a guest write-back");
+    Flush(device, destinationBlock);
+    CheckQuantized(destinationBlock, expected, destinationLimits, name + " sRGB attachment encoding survives raw UNORM resolve");
+    Draw(device, swapped, Partial, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_A_BIT, 0xaau, false, FractionalPixelCode);
+    ExpectFractionalWrite(source, sourceLimits, swapped.format, Partial, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_A_BIT, 0xaau);
+    Resolve(device, sourceTarget, destinationTarget, Partial);
+    ExpectQuantizedResolve(expected, destinationLimits, source, sourceLimits, Partial);
+    Check(sourceBlock, baseline, name + " channel-order view changes preserve all pending source samples");
+    Flush(device, destinationBlock);
+    CheckQuantized(destinationBlock, expected, destinationLimits, name + " UNORM view restores linear attachment encoding");
+    Draw(device, srgbAlias, OnePixel, 0xfu, 0xffffffffu, false, FractionalPixelCode);
+    ExpectFractionalWrite(source, sourceLimits, srgbFormat, OnePixel, 0xfu, 0xffffffffu);
+    Resolve(device, sourceTarget, destinationTarget, OnePixel);
+    ExpectQuantizedResolve(expected, destinationLimits, source, sourceLimits, OnePixel);
+    Check(sourceBlock, baseline, name + " returning to the cached sRGB view still avoids source publication");
+    Flush(device, destinationBlock);
+    CheckQuantized(destinationBlock, expected, destinationLimits, name + " cached sRGB view preserves color conversion and alpha");
+    const auto conflict = Oracle(4, 5, 0) + ByteChannel(srgbFormat, 0);
+    sourceBlock.Store(conflict, std::byte{41});
+    source[conflict] = std::byte{41};
+    sourceLimits.erase(conflict);
+    Draw(device, sourceTarget, OnePixel, VK_COLOR_COMPONENT_A_BIT, 0x55u);
+    ExpectExactWrite(source, sourceLimits, format, OnePixel, VK_COLOR_COMPONENT_A_BIT, 0x55u);
+    Resolve(device, sourceTarget, destinationTarget, Partial);
+    ExpectQuantizedResolve(expected, destinationLimits, source, sourceLimits, Partial);
+    Flush(device, destinationBlock);
+    Flush(device, sourceBlock);
+    CheckQuantized(destinationBlock, expected, destinationLimits, name + " CPU source conflict is refreshed before resolving across format views");
+    CheckQuantized(sourceBlock, source, sourceLimits, name + " every source sample, CPU conflict, and padding survives shared format views");
+}
+
+void GeometryAliasTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, VkFormat format, const std::string& name) {
+    auto expected = SeedSamples(sourceBlock);
+    const auto baseline = expected;
+    const auto original = Target(sourceBlock, format);
+    auto wider = original;
+    ++wider.extent.width;
+    wider.surfaceExtent = wider.extent;
+    const AgcDriver::Graphics::MultisampleColorLayout resized(wider.extent.width, wider.extent.height, wider.elementBytes, 8u);
+    Require(resized.Bytes() == original.bytes, "the geometry alias must retain the same padded guest byte range");
+    Draw(device, original, Partial, VK_COLOR_COMPONENT_R_BIT, 0x55u);
+    ExpectWrite(expected, format, Partial, VK_COLOR_COMPONENT_R_BIT, 0x55u);
+    Check(sourceBlock, baseline, name + " original geometry draw remains pending before the valid extent change");
+    Draw(device, wider, Whole, 0);
+    Check(sourceBlock, expected, name + " a valid extent change publishes the original geometry despite identical padded bytes");
+    Draw(device, original, Partial, VK_COLOR_COMPONENT_G_BIT, 0xaau);
+    ExpectWrite(expected, format, Partial, VK_COLOR_COMPONENT_G_BIT, 0xaau);
+    Flush(device, sourceBlock);
+    Check(sourceBlock, expected, name + " returning to the original geometry preserves sample masks and padding");
+}
+
+void LifetimeTests(AgcDriver::VulkanDevice& device, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpuLock) {
+    constexpr std::size_t pieceBytes = 65536u;
+    {
+        Block clean(pieceBytes);
+        const auto baseline = SeedSamples(clean);
+        Draw(device, Target(clean, VK_FORMAT_R8G8B8A8_UNORM), Whole, 0);
+        Flush(device, clean);
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(clean.data + StorageBytes, pieceBytes, true, false, [&] {
+            Check(clean, baseline, "a clean multisample lease releases for a mutation outside its target in the same backing range");
+#ifdef _WIN32
+            GuestArena::GuestArenaSetProtection_nid_postfix(clean.Address() + StorageBytes, pieceBytes, PAGE_READONLY);
+#else
+            Require(mprotect(clean.data + StorageBytes, pieceBytes, PROT_READ) == 0, "cannot protect the clean multisample backing fragment");
+#endif
+        });
+    }
+    Block block(pieceBytes);
+    auto expected = SeedSamples(block);
+    const auto target = Target(block, VK_FORMAT_B8G8R8A8_SRGB);
+    const auto protect = [&](std::size_t offset, bool writable) {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(block.data + offset, pieceBytes, true, writable, [&] {
+            Check(block, expected, "pending multisample samples are published before backing protection changes");
+            Require(!AgcDriver::Graphics::AnyPendingMultisampleColors(block.Address(), StorageBytes), "backing protection must release the pending multisample lease after publication");
+#ifdef _WIN32
+            GuestArena::GuestArenaSetProtection_nid_postfix(block.Address() + offset, pieceBytes, writable ? PAGE_READWRITE : PAGE_READONLY);
+#else
+            Require(mprotect(block.data + offset, pieceBytes, PROT_READ | (writable ? PROT_WRITE : 0)) == 0, "cannot change the multisample backing protection");
+#endif
+        });
+    };
+    Draw(device, target, Partial, VK_COLOR_COMPONENT_R_BIT, 0x55u);
+    ExpectWrite(expected, target.format, Partial, VK_COLOR_COMPONENT_R_BIT, 0x55u);
+    protect(StorageBytes, false);
+    protect(StorageBytes, true);
+    Draw(device, target, OnePixel, VK_COLOR_COMPONENT_B_BIT, 0xaau);
+    ExpectWrite(expected, target.format, OnePixel, VK_COLOR_COMPONENT_B_BIT, 0xaau);
+    protect(0, false);
+    protect(0, true);
+
+    const auto unmap = [&](std::size_t offset, std::size_t bytes) {
+        GuestAllocations::Mutation mutation;
+        mutation.Unmap(block.data + offset, bytes, [&](const void* piece, std::size_t count, const void*, bool) {
+            Check(block, expected, "pending multisample samples are published before host unmap");
+            Require(!AgcDriver::Graphics::AnyPendingMultisampleColors(block.Address(), StorageBytes), "host unmap must not retain pending multisample results for the old backing");
+#ifdef _WIN32
+            GuestArena::GuestArenaReset_nid_postfix(const_cast<void*>(piece), count);
+#else
+            GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(piece, count);
+            Require(mmap(const_cast<void*>(piece), count, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == piece, "cannot reset the unmapped multisample backing");
+#endif
+        });
+    };
+    const auto remap = [&](std::size_t offset, std::size_t bytes) {
+        auto* pointer = block.data + offset;
+#ifdef _WIN32
+        GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, PAGE_READWRITE, bytes);
+#else
+        Require(mmap(pointer, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == pointer, "cannot replace the multisample backing");
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(pointer, bytes);
+#endif
+        GuestAllocations::Mutation mutation;
+        mutation.Add(pointer, bytes, true, true);
+    };
+    Draw(device, target, Partial, VK_COLOR_COMPONENT_G_BIT, 0x55u);
+    ExpectWrite(expected, target.format, Partial, VK_COLOR_COMPONENT_G_BIT, 0x55u);
+    unmap(pieceBytes, pieceBytes);
+    Require(!AgcDriver::GuestMemory::Accessible(block.data + pieceBytes, pieceBytes), "the removed multisample fragment must actually be inaccessible");
+    AgcDriver::Graphics::FlushMultisampleColors(0, std::numeric_limits<std::size_t>::max());
+    remap(pieceBytes, pieceBytes);
+    std::fill_n(block.data + pieceBytes, pieceBytes, std::byte{0xc3});
+    std::fill_n(expected.begin() + pieceBytes, pieceBytes, std::byte{0xc3});
+    AgcDriver::GuestMemory::MarkWritten(block.Address() + pieceBytes, pieceBytes);
+    AgcDriver::Graphics::FlushMultisampleColors(0, std::numeric_limits<std::size_t>::max());
+    Check(block, expected, "a general flush cannot overwrite a replacement fragment with old multisample results");
+
+    Draw(device, target, OnePixel, VK_COLOR_COMPONENT_A_BIT, 0xaau);
+    ExpectWrite(expected, target.format, OnePixel, VK_COLOR_COMPONENT_A_BIT, 0xaau);
+    std::exception_ptr mutationFailure;
+    gpuLock.unlock();
+    {
+        std::jthread mutator([&] {
+            try { unmap(0, block.Size()); }
+            catch (...) { mutationFailure = std::current_exception(); }
+        });
+    }
+    gpuLock.lock();
+    if (mutationFailure) std::rethrow_exception(mutationFailure);
+    Require(!AgcDriver::GuestMemory::Accessible(block.data, StorageBytes), "the old multisample backing must actually be inaccessible");
+    AgcDriver::Graphics::FlushMultisampleColors(0, std::numeric_limits<std::size_t>::max());
+    remap(0, block.Size());
+    expected.assign(StorageBytes, std::byte{0x6b});
+    std::memcpy(block.data, expected.data(), expected.size());
+    AgcDriver::GuestMemory::MarkWritten(block.Address(), StorageBytes);
+    AgcDriver::Graphics::FlushMultisampleColors(0, std::numeric_limits<std::size_t>::max());
+    Check(block, expected, "a general flush cannot write an old multisample allocation into a new mapping at the same address");
+    Draw(device, target, Partial, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT, 0x55u);
+    ExpectWrite(expected, target.format, Partial, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT, 0x55u);
+    Flush(device, block);
+    Check(block, expected, "a cached multisample image refreshes from replacement backing before a new draw");
+}
+
 }
 
 int main() {
@@ -446,7 +740,7 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Require(device->ProgrammableSampleLocations(VK_SAMPLE_COUNT_8_BIT), "the actual device must enable programmable eight-sample locations");
-        std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+        std::unique_lock gpuLock(AgcDriver::GuestMemory::GpuMutex());
         Block source;
         Block destination;
         for (const auto format : {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM}) {
@@ -455,9 +749,12 @@ int main() {
             PendingTests(*device, source, destination, format, name);
             ConflictTests(*device, source, destination, format, name);
             AliasTests(*device, source, destination, format, name);
+            SharedFormatTests(*device, source, destination, format, name);
+            GeometryAliasTests(*device, source, format, name);
         }
         Flush(*device, source);
         Flush(*device, destination);
+        LifetimeTests(*device, gpuLock);
         std::puts("real eight-to-one color averages, partial regions, pending draws, CPU units, padding and aliases passed");
         return 0;
     } catch (const std::exception& error) {

@@ -1,10 +1,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleColorSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MultisampleColorTransfer_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -35,8 +39,24 @@ bool overlaps(std::uint64_t address, std::size_t bytes, const ColorTarget& targe
     return target.address < end && address < target.address + target.bytes;
 }
 
+bool supportedFormat(VkFormat format) {
+    return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+void validateTarget(const ColorTarget& target) {
+    Require(target.samples == VK_SAMPLE_COUNT_8_BIT && target.elementBytes == 4 && target.tileMode == ColorTileMode::RenderTarget, "unsupported multisample color geometry");
+    Require(target.depth == 1 && target.depthSlice == 0 && target.mipCount == 1 && target.mip == 0 && !target.mipTail, "multisample color arrays, volumes and mipmaps are unsupported");
+    Require(target.dccAddress == 0 && target.cmaskAddress == 0, "multisample color metadata is unsupported");
+    Require(supportedFormat(target.format), "multisample color format is unsupported");
+    const MultisampleColorLayout geometry(target.extent.width, target.extent.height, target.elementBytes, static_cast<std::uint32_t>(target.samples));
+    Require(target.bytes == geometry.Bytes(), "multisample color byte range disagrees with its layout");
+}
+
 bool sameTarget(const ColorTarget& first, const ColorTarget& second) {
-    return first.address == second.address && first.extent.width == second.extent.width && first.extent.height == second.extent.height && first.format == second.format && first.bytes == second.bytes && first.samples == second.samples;
+    return first.address == second.address && first.extent.width == second.extent.width && first.extent.height == second.extent.height && first.bytes == second.bytes &&
+        first.samples == second.samples && first.elementBytes == second.elementBytes && first.tileMode == second.tileMode && first.depth == second.depth &&
+        first.depthSlice == second.depthSlice && first.mipCount == second.mipCount && first.mip == second.mip && first.mipTail == second.mipTail &&
+        first.dccAddress == second.dccAddress && first.cmaskAddress == second.cmaskAddress;
 }
 
 }
@@ -45,18 +65,12 @@ MultisampleColorSurface::MultisampleColorSurface(const Context& context, const C
     : context(context), target(target), geometry(target.extent.width, target.extent.height, target.elementBytes, static_cast<std::uint32_t>(target.samples)) {
     this->context.bufferPool.reset();
     Require(context.shaderStorageImageMultisample, "multisample color transfers require shaderStorageImageMultisample");
-    Require(target.samples == VK_SAMPLE_COUNT_8_BIT && target.elementBytes == 4 && target.tileMode == ColorTileMode::RenderTarget, "unsupported multisample color geometry");
-    Require(target.depth == 1 && target.depthSlice == 0 && target.mipCount == 1 && target.mip == 0 && !target.mipTail, "multisample color arrays, volumes and mipmaps are unsupported");
-    Require(target.dccAddress == 0 && target.cmaskAddress == 0, "multisample color metadata is unsupported");
-    Require(target.format == VK_FORMAT_R8G8B8A8_UNORM || target.format == VK_FORMAT_R8G8B8A8_SRGB || target.format == VK_FORMAT_B8G8R8A8_UNORM || target.format == VK_FORMAT_B8G8R8A8_SRGB, "multisample color format is unsupported");
-    Require(target.bytes == geometry.Bytes(), "multisample color byte range disagrees with its layout");
+    validateTarget(target);
     Require(geometry.LinearBytes() <= context.limits.maxStorageBufferRange, "multisample color transfer exceeds storage buffer limits");
     Require(target.extent.width <= context.limits.maxFramebufferWidth && target.extent.height <= context.limits.maxFramebufferHeight, "multisample color exceeds framebuffer limits");
     Require((target.extent.width + 7) / 8 <= context.limits.maxComputeWorkGroupCount[0] && (target.extent.height + 7) / 8 <= context.limits.maxComputeWorkGroupCount[1] && static_cast<std::uint32_t>(target.samples) <= context.limits.maxComputeWorkGroupCount[2], "multisample color transfer exceeds compute limits");
+    acquireBacking();
     GuestMemory::CheckRange(reinterpret_cast<const void*>(target.address), target.bytes, geometry.Alignment(), true);
-    VkFormatProperties attachmentProperties{};
-    context.formatProperties(context.physical, target.format, &attachmentProperties);
-    Require((attachmentProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0, "multisample color format cannot be an attachment");
     constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     constexpr VkImageCreateFlags flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     VkImageFormatProperties supported{};
@@ -92,9 +106,7 @@ MultisampleColorSurface::MultisampleColorSurface(const Context& context, const C
         VkImageViewUsageCreateInfo viewUsage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr, VK_IMAGE_USAGE_STORAGE_BIT};
         viewInfo.pNext = &viewUsage;
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &storageView), "vkCreateImageView multisample storage");
-        viewInfo.format = target.format;
-        viewUsage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &attachmentView), "vkCreateImageView multisample attachment");
+        AttachmentView(target.format);
         linear = std::make_unique<Buffer>(context, geometry.LinearBytes(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         const std::array<VkDescriptorSetLayoutBinding, 2> bindings{{
             {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -168,19 +180,52 @@ void MultisampleColorSurface::release() noexcept {
     if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
     if (pipelineLayout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, pipelineLayout, nullptr);
     if (descriptorLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, descriptorLayout, nullptr);
-    if (attachmentView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, attachmentView, nullptr);
+    for (const auto& [format, view] : attachmentViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (storageView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, storageView, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
     linear.reset();
+    backing.clear();
     descriptorPool = VK_NULL_HANDLE;
     pipeline = VK_NULL_HANDLE;
     pipelineLayout = VK_NULL_HANDLE;
     descriptorLayout = VK_NULL_HANDLE;
-    attachmentView = VK_NULL_HANDLE;
+    attachmentViews.clear();
     storageView = VK_NULL_HANDLE;
     image = VK_NULL_HANDLE;
     memory = VK_NULL_HANDLE;
+}
+
+void MultisampleColorSurface::acquireBacking() {
+    GuestMemory::AssertGpuLockHeld("MultisampleColorSurface::acquireBacking");
+    if (!backing.empty()) return;
+    EnsureGuestAllocationPinWaiter();
+    backing = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(reinterpret_cast<const void*>(target.address), target.bytes, true);
+    Require(!backing.empty(), "multisample color guest backing is not registered and writable");
+}
+
+VkImageView MultisampleColorSurface::AttachmentView(VkFormat format) {
+    GuestMemory::AssertGpuLockHeld("MultisampleColorSurface::AttachmentView");
+    Require(supportedFormat(format), "multisample color attachment format is unsupported");
+    if (const auto found = attachmentViews.find(format); found != attachmentViews.end()) return found->second;
+    VkFormatProperties properties{};
+    context.formatProperties(context.physical, format, &properties);
+    Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0, "multisample color format cannot be an attachment");
+    const auto entry = attachmentViews.emplace(format, VK_NULL_HANDLE).first;
+    try {
+        VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        info.pNext = &usage;
+        info.image = image;
+        info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        info.format = format;
+        info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &entry->second), "vkCreateImageView multisample attachment");
+    } catch (...) {
+        attachmentViews.erase(entry);
+        throw;
+    }
+    return entry->second;
 }
 
 void MultisampleColorSurface::transfer(bool store) {
@@ -222,6 +267,7 @@ void MultisampleColorSurface::upload() {
 }
 
 void MultisampleColorSurface::Refresh() {
+    acquireBacking();
     GuestMemory::CollectWrites(target.address, target.bytes);
     if (!needsUpload && ((generation != 0 && GuestMemory::UnchangedSinceCollected(target.address, target.bytes, generation)) || GuestMemory::EqualsCommittedUnsynced(target.address, snapshot))) return;
     Flush();
@@ -232,14 +278,21 @@ void MultisampleColorSurface::Refresh() {
 }
 
 void MultisampleColorSurface::MarkDirty() {
+    GuestMemory::AssertGpuLockHeld("MultisampleColorSurface::MarkDirty");
     std::lock_guard lock(surfaceMutex());
+    Require(!backing.empty(), "multisample color draw lost its guest backing lease");
     dirty = true;
     StorageTexture::BumpPendingSerial();
 }
 
 bool MultisampleColorSurface::Flush() {
     if (!dirty) return false;
-    GuestMemory::CheckRange(reinterpret_cast<const void*>(target.address), target.bytes, geometry.Alignment(), true);
+    Require(!backing.empty(), "multisample color writeback lost its guest backing lease");
+    try {
+        GuestMemory::CheckRange(reinterpret_cast<const void*>(target.address), target.bytes, geometry.Alignment(), true);
+    } catch (const std::runtime_error& error) {
+        throw std::runtime_error(std::string("multisample color writeback: ") + error.what());
+    }
     transfer(true);
     std::vector<std::byte> current(snapshot.size());
     Require(GuestMemory::CopyMapped(target.address, current) == GuestMemory::Compare::Equal, "multisample color became unmapped during writeback");
@@ -268,6 +321,7 @@ bool MultisampleColorSurface::Flush() {
 
 std::shared_ptr<MultisampleColorSurface> CachedMultisampleColorSurface(const Context& context, const ColorTarget& target) {
     GuestMemory::AssertGpuLockHeld("CachedMultisampleColorSurface");
+    validateTarget(target);
     std::lock_guard lock(surfaceMutex());
     auto& list = surfaces();
     const auto found = std::find_if(list.begin(), list.end(), [&](const auto& entry) { return entry.device == context.device && sameTarget(entry.surface->Target(), target); });
@@ -276,6 +330,19 @@ std::shared_ptr<MultisampleColorSurface> CachedMultisampleColorSurface(const Con
         explicit RefreshExemption(const MultisampleColorSurface* surface) : previous(refreshingSurface) { refreshingSurface = surface; }
         ~RefreshExemption() { refreshingSurface = previous; }
     } exemption(found == list.end() ? nullptr : found->surface.get());
+    static const bool traceAliases = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_TRACE_MSAA_ALIASES") != nullptr;
+    bool pendingAlias = false;
+    if (traceAliases) {
+        for (const auto& entry : list) {
+            const auto& previous = entry.surface->Target();
+            if (entry.device != context.device || sameTarget(previous, target) || !entry.surface->Dirty() || !overlaps(target.address, target.bytes, previous)) continue;
+            pendingAlias = true;
+            AgcDriver::ProfilePrint_nid_no_patch("[msaa-alias] pending overlap: old 0x%llx+0x%llx %ux%u samples=%u vk=%d; requested 0x%llx+0x%llx %ux%u samples=%u vk=%d\n",
+                static_cast<unsigned long long>(previous.address), static_cast<unsigned long long>(previous.bytes), previous.extent.width, previous.extent.height, static_cast<unsigned>(previous.samples), static_cast<int>(previous.format),
+                static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.bytes), target.extent.width, target.extent.height, static_cast<unsigned>(target.samples), static_cast<int>(target.format));
+        }
+    }
+    const auto aliasStarted = pendingAlias ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     bool published = false;
     const bool flushed = StorageTexture::FlushPending(target.address, target.bytes, nullptr, "multisample color refresh", PublishScope::Whole, &published);
     if (flushed || published) {
@@ -284,6 +351,8 @@ std::shared_ptr<MultisampleColorSurface> CachedMultisampleColorSurface(const Con
     for (auto& entry : list) {
         if (entry.device == context.device && !sameTarget(entry.surface->Target(), target) && overlaps(target.address, target.bytes, entry.surface->Target())) entry.surface->Flush();
     }
+    if (pendingAlias) AgcDriver::ProfilePrint_nid_no_patch("[msaa-alias] overlap publication %.3f ms: requested 0x%llx vk=%d, flushed=%u published=%u\n",
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - aliasStarted).count(), static_cast<unsigned long long>(target.address), static_cast<int>(target.format), static_cast<unsigned>(flushed), static_cast<unsigned>(published));
     for (auto& entry : list) {
         if (entry.device != context.device || !sameTarget(entry.surface->Target(), target)) continue;
         entry.surface->Refresh();
@@ -308,6 +377,21 @@ bool FlushMultisampleColors(std::uint64_t address, std::size_t bytes) {
         if (entry.surface.get() != refreshingSurface && overlaps(address, bytes, entry.surface->Target())) flushed = entry.surface->Flush() || flushed;
     }
     return flushed;
+}
+
+bool FinishMultisampleColorLeases(std::uint64_t address, std::size_t bytes) {
+    GuestMemory::AssertGpuLockHeld("FinishMultisampleColorLeases");
+    std::lock_guard lock(surfaceMutex());
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    bool finished = false;
+    for (auto& entry : surfaces()) {
+        auto& surface = *entry.surface;
+        if (!std::any_of(surface.backing.begin(), surface.backing.end(), [&](const auto& range) { return range->address < end && address < range->address + range->bytes; })) continue;
+        surface.Flush();
+        surface.backing.clear();
+        finished = true;
+    }
+    return finished;
 }
 
 void ClearMultisampleColors(VkDevice device) {

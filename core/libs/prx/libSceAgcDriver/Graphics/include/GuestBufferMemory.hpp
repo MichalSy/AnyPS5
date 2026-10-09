@@ -107,6 +107,7 @@ std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, s
 // when synced, and the waiter targets the newest of them. Under APS5_PROFILE_DRAW CountLeaseOutcome
 // prints the [address-sync] leases line every 10 s from LeaseCounters (cumulative).
 bool SyncLeaseWork();
+void EnsureGuestAllocationPinWaiter();
 void CountLeaseOutcome(bool synced, std::uint64_t batchSerial);
 struct LeaseStats {
     std::uint64_t deferred = 0;

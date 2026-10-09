@@ -28,6 +28,50 @@ void reject(TAction action) {
     throw std::runtime_error("expected guest allocation ownership rejection");
 }
 
+void TargetedLeaseTests() {
+    std::array<std::byte, 256> memory{};
+    const auto address = reinterpret_cast<std::uintptr_t>(memory.data());
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(memory.data(), 64, true, true);
+        mutation.Add(memory.data() + 64, 32, true, false);
+        mutation.Add(memory.data() + 96, 32, true, true);
+        mutation.Add(memory.data() + 192, 64, true, true);
+    }
+    auto targeted = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(memory.data() + 8, 16, true);
+    Require(targeted.size() == 1 && targeted.front()->address == address && targeted.front()->bytes == 64, "a targeted lease must retain the existing containing range only");
+    {
+        const auto readable = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(memory.data() + 32, 80, false);
+        Require(readable.size() == 3 && readable.front() == targeted.front() && !readable[1]->writable, "a targeted readable lease must cover contiguous registry ranges without replacing their identities");
+    }
+    Require(GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(memory.data() + 32, 80, true).empty(), "a writable lease must reject a read-only fragment");
+    Require(GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(memory.data() + 96, 112, false).empty(), "a targeted lease must reject a registry hole");
+    reject([&] { GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(memory.data(), 0, false); });
+    reject([&] { GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(reinterpret_cast<const void*>(std::uintptr_t(-8)), 16, false); });
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(memory.data() + 64);
+        mutation.Remove(memory.data() + 192);
+    }
+    std::weak_ptr<const GuestAllocations::Range> previous = targeted.front();
+    targeted.clear();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(memory.data());
+        mutation.Add(memory.data(), 64, true, true);
+    }
+    Require(previous.expired(), "re-registering a released mapping must end the old targeted lease identity");
+    {
+        const auto replacement = GuestAllocations::GuestAllocationsAcquireRange_nid_postfix(memory.data(), 64, true);
+        Require(replacement.size() == 1 && replacement.front()->address == address, "a targeted lease must acquire a replacement mapping at the same address");
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(memory.data());
+        mutation.Remove(memory.data() + 96);
+    }
+}
+
 }
 
 void RunGuestLeaseWaitTests() {
@@ -130,6 +174,7 @@ void RunGuestAllocationTests() {
         });
     }
     Require(GuestAllocations::GuestAllocationsAcquire_nid_postfix().empty(), "unmapped fragments remain registered");
+    TargetedLeaseTests();
 #ifdef _WIN32
     static std::byte imageProbe{};
     {

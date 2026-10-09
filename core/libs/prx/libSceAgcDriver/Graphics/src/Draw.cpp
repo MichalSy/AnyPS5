@@ -1550,7 +1550,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const auto& color = binding.color;
         if (color.samples != VK_SAMPLE_COUNT_1_BIT) {
             binding.multisample = CachedMultisampleColorSurface(context, color);
-            targetViews.push_back(binding.multisample->AttachmentView());
+            targetViews.push_back(binding.multisample->AttachmentView(color.format));
             continue;
         }
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
