@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdint>
 #include <mutex>
+#include <stdexcept>
 #ifndef _WIN32
 #include <pthread.h>
 #endif
@@ -38,9 +39,10 @@ constexpr int guestOnStack = 0x01;
 constexpr int guestSigInfo = 0x40;
 constexpr int guestActionFlags = 0x7f;
 
-std::atomic<GuestHandler> handlers[32]{};
+std::atomic<GuestHandler> handlers[129]{};
 static_assert(std::atomic<GuestHandler>::is_always_lock_free);
 #ifdef _WIN32
+GuestSignalAction dispositions[129]{};
 std::atomic<std::uint32_t> blockedMask{0};
 static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
 #endif
@@ -107,6 +109,24 @@ void Dispatch(int native) {
     const auto callback = handlers[guest].load();
     if (reinterpret_cast<std::uintptr_t>(callback) > 1) callback(guest);
 }
+
+#ifdef _WIN32
+bool Delivered(const GuestSignalAction& action) {
+    return reinterpret_cast<std::uintptr_t>(action.handler) > 1 && !(action.flags & guestSigInfo);
+}
+bool Install(int guest, const GuestSignalAction& action) {
+    const int native = NativeSignal(guest);
+    if (!native) return true;
+    const auto previous = handlers[guest].exchange(Delivered(action) ? action.handler : nullptr);
+    const auto address = reinterpret_cast<std::uintptr_t>(action.handler);
+    auto hostHandler = address == 1 ? SIG_IGN : Delivered(action) ? Dispatch : SIG_DFL;
+    if (std::signal(native, hostHandler) == SIG_ERR) {
+        handlers[guest].store(previous);
+        return false;
+    }
+    return true;
+}
+#endif
 
 #ifndef _WIN32
 int GuestError(int native) {
@@ -253,10 +273,18 @@ thread_local GuestStack alternateStack{nullptr, 0, SsDisable};
 extern "C" {
 int APS5_VABI sigaction_nid_postfix(int guest, const GuestSignalAction* action, GuestSignalAction* previous) {
 #ifdef _WIN32
-    (void)guest;
-    (void)action;
-    (void)previous;
-    return Fail(guestNotSupported);
+    if (!ValidSetSignal(guest)) return Fail(guestInvalid);
+    if (action && reinterpret_cast<std::uintptr_t>(action->handler) == static_cast<std::uintptr_t>(-1))
+        return Fail(guestInvalid);
+    if (action && (guest == 9 || guest == 17) && action->handler) return Fail(guestInvalid);
+    std::lock_guard lock(registration);
+    const auto old = dispositions[guest];
+    if (action) {
+        if (!Install(guest, *action)) return Fail(guestInvalid);
+        dispositions[guest] = *action;
+    }
+    if (previous) *previous = old;
+    return 0;
 #else
     const int savedError = *__error_nid_postfix();
     const int error = ChangeAction(guest, action, previous);
@@ -283,14 +311,10 @@ GuestHandler APS5_VABI signal_nid_postfix(int guest, GuestHandler handler) {
     if (!NativeSignal(guest) || handler == invalid) { Fail(guestInvalid); return invalid; }
 #ifdef _WIN32
     std::lock_guard lock(registration);
-    const auto previous = handlers[guest].exchange(handler);
-    const auto address = reinterpret_cast<std::uintptr_t>(handler);
-    auto hostHandler = address == 0 ? SIG_DFL : address == 1 ? SIG_IGN : Dispatch;
-    if (std::signal(NativeSignal(guest), hostHandler) == SIG_ERR) {
-        handlers[guest].store(previous);
-        Fail(guestInvalid);
-        return invalid;
-    }
+    const GuestSignalAction action{handler, guestRestart, {}};
+    if (!Install(guest, action)) { Fail(guestInvalid); return invalid; }
+    const auto previous = dispositions[guest].handler;
+    dispositions[guest] = action;
     return previous;
 #else
     const GuestSignalAction action{handler, guestRestart, {}};
@@ -302,6 +326,13 @@ GuestHandler APS5_VABI signal_nid_postfix(int guest, GuestHandler handler) {
 int APS5_VABI raise_nid_postfix(int guest) {
     const int native = NativeSignal(guest);
     if (!native) return Fail(guestInvalid);
+#ifdef _WIN32
+    {
+        std::lock_guard lock(registration);
+        if (reinterpret_cast<std::uintptr_t>(dispositions[guest].handler) > 1 && !Delivered(dispositions[guest]))
+            throw std::runtime_error("raise: SA_SIGINFO handlers are not delivered");
+    }
+#endif
     const int result = std::raise(native);
     if (result) return Fail(guestInvalid);
     return 0;

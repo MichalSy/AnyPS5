@@ -2,6 +2,8 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <stdexcept>
 #include <initializer_list>
 #ifndef _WIN32
 #include <pthread.h>
@@ -166,6 +168,62 @@ static void TestPosixSignals() {
 }
 #endif
 
+#ifdef _WIN32
+static bool Same(const GuestSignalAction& left, const GuestSignalAction& right) {
+    return left.handler == right.handler && left.flags == right.flags && std::memcmp(&left.mask, &right.mask, sizeof(left.mask)) == 0;
+}
+void APS5_VABI InfoCallback(int, void*, void*) {}
+static void TestWindowsSigaction() {
+    const auto callback = Callback;
+    const auto infoCallback = reinterpret_cast<Handler>(InfoCallback);
+    GuestSignalAction current{};
+    std::memset(&current, 0xa5, sizeof(current));
+    Require(sigaction_nid_postfix(15, nullptr, &current) == 0);
+    Require(current.handler == nullptr && current.flags == 0x2 && current.mask.bits[0] == 0 && current.mask.bits[3] == 0);
+    const GuestSignalAction term{callback, 0, {{0x4000, 0, 0, 0x80000000u}}};
+    Require(sigaction_nid_postfix(15, &term, &current) == 0 && current.handler == nullptr);
+    received = 0;
+    Require(raise_nid_postfix(15) == 0 && received == 15);
+    Require(sigaction_nid_postfix(15, nullptr, &current) == 0);
+    Require(Same(current, term));
+    const GuestSignalAction defaults{0, 0, {}};
+    Require(sigaction_nid_postfix(15, &defaults, nullptr) == 0);
+    Require(signal_nid_postfix(15, Callback) == nullptr);
+    Require(sigaction_nid_postfix(15, nullptr, &current) == 0 && current.handler == callback && current.flags == 0x2);
+    Require(signal_nid_postfix(15, nullptr) == Callback);
+
+    const GuestSignalAction crash{infoCallback, 0x40 | 0x10, {}};
+    for (int recorded : {10, 1, 64, 128}) {
+        Require(sigaction_nid_postfix(recorded, &crash, nullptr) == 0);
+        Require(sigaction_nid_postfix(recorded, nullptr, &current) == 0);
+        Require(Same(current, crash));
+        Require(sigaction_nid_postfix(recorded, &defaults, nullptr) == 0);
+    }
+    Require(sigaction_nid_postfix(6, &crash, nullptr) == 0);
+    bool rejected = false;
+    try {
+        raise_nid_postfix(6);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    Require(rejected);
+    Require(sigaction_nid_postfix(6, &defaults, &current) == 0 && current.handler == infoCallback && current.flags == 0x50);
+
+    *__error_nid_postfix() = 0;
+    Require(sigaction_nid_postfix(0, nullptr, &current) == -1 && *__error_nid_postfix() == 22);
+    *__error_nid_postfix() = 0;
+    Require(sigaction_nid_postfix(129, nullptr, &current) == -1 && *__error_nid_postfix() == 22);
+    for (int fixed : {9, 17}) {
+        *__error_nid_postfix() = 0;
+        Require(sigaction_nid_postfix(fixed, &term, &current) == -1 && *__error_nid_postfix() == 22);
+        Require(sigaction_nid_postfix(fixed, &defaults, &current) == 0 && current.handler == nullptr);
+    }
+    const GuestSignalAction invalidAction{reinterpret_cast<Handler>(static_cast<std::uintptr_t>(-1)), 0, {}};
+    Require(sigaction_nid_postfix(15, &invalidAction, nullptr) == -1 && *__error_nid_postfix() == 22);
+    Require(sigaction_nid_postfix(15, nullptr, nullptr) == 0);
+}
+#endif
+
 int main() {
     TestSets();
 #ifndef _WIN32
@@ -205,6 +263,6 @@ int main() {
     *__error_nid_postfix() = 13;
     Require(pthread_sigmask_nid_postfix(1, &blocked, nullptr) == 45);
     Require(*__error_nid_postfix() == 13);
-    Require(sigaction_nid_postfix(15, nullptr, nullptr) == -1 && *__error_nid_postfix() == 45);
+    TestWindowsSigaction();
 #endif
 }
