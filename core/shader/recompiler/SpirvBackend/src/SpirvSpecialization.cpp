@@ -272,6 +272,40 @@ public:
     }
 
 private:
+    std::uint32_t switchSelector() {
+        if (switchSelectorId != 0u) return switchSelectorId;
+        for (const auto& [id, bits] : values) {
+            const auto resultType = resultTypes.find(id);
+            if (bits != 0u || resultType == resultTypes.end()) continue;
+            const auto type = types.find(resultType->second);
+            if (type != types.end() && !type->second.boolean && type->second.width == 32u) {
+                switchSelectorId = id;
+                return id;
+            }
+        }
+        std::uint32_t typeId = 0u;
+        for (const auto& [id, type] : types) {
+            if (!type.boolean && type.width == 32u) {
+                typeId = id;
+                break;
+            }
+        }
+        const auto allocateId = [&]() {
+            if (header[3] == UINT32_MAX) throw std::runtime_error("prepared SPIR-V id bound overflow");
+            return header[3]++;
+        };
+        if (typeId == 0u) {
+            typeId = allocateId();
+            constants.push_back(Make(spv::OpTypeInt, {typeId, 32u, 0u}));
+            types.emplace(typeId, ScalarType{32u, false});
+        }
+        switchSelectorId = allocateId();
+        constants.push_back(Make(spv::OpConstant, {typeId, switchSelectorId, 0u}));
+        resultTypes.emplace(switchSelectorId, typeId);
+        values.emplace(switchSelectorId, 0u);
+        return switchSelectorId;
+    }
+
     std::optional<std::uint32_t> value(std::uint32_t id) const {
         const auto found = values.find(id);
         return found != values.end() ? std::optional(found->second) : std::nullopt;
@@ -441,7 +475,7 @@ private:
                     if (!retainMerge) instruction.clear();
                 }
                 const auto replacement = !retainMerge ? Make(spv::OpBranch, {target}) : op == spv::OpSwitch ?
-                    Make(spv::OpSwitch, {terminal.at(1), target}) : Make(spv::OpBranchConditional, {terminal.at(1), target, target});
+                    Make(spv::OpSwitch, {terminal.at(1), target}) : Make(spv::OpSwitch, {switchSelector(), target});
                 if (terminal != replacement) {
                     terminal = replacement;
                     changed = true;
@@ -608,6 +642,7 @@ private:
         }
     }
 
+    std::uint32_t switchSelectorId = 0u;
     std::vector<std::uint32_t> header;
     std::vector<Instruction> instructions;
     std::vector<Instruction> constants;

@@ -71,7 +71,7 @@ void Run(SDL_Window* window, const std::filesystem::path& directory, bool verify
     state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
-    const std::array<std::uint16_t, 3> indices{0, 1, 2};
+    static constexpr std::array<std::uint16_t, 3> indices{0, 1, 2};
     const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(indices.data()), 3, 2, 1, 0};
     device.Draw(state, draw, shaders);
     device.WaitIdle();

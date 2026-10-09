@@ -351,6 +351,19 @@ if(ANYPS5_ENABLE_SPIRV_TOOLS)
     configure_windows_unwind(agc_spirv_optimizer_tests)
 endif()
 
+add_test_executable(agc_float16_conversion_tests EXCLUDE_FROM_ALL tests/Float16Conversion.cpp)
+target_link_libraries(agc_float16_conversion_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_float16_conversion_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_float16_conversion_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_float16_conversion_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_float16_conversion COMMAND agc_float16_conversion_tests)
+    set_tests_properties(agc_float16_conversion PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1")
+    if(WIN32)
+        set_tests_properties(agc_float16_conversion PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_dpp_write_tests EXCLUDE_FROM_ALL tests/DppWrite.cpp)
 target_link_libraries(agc_dpp_write_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_dpp_write_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -856,41 +869,7 @@ if(AGC_BUILD_VISUAL_TEST)
 
     add_test_executable(agc_driver_visual_test EXCLUDE_FROM_ALL
             tests/Visual.cpp
-            Execution/src/VulkanDevice.cpp
-            Execution/src/DisplayFormat.cpp
-            Execution/src/AspectFit.cpp
-            Execution/src/PresentationScaler.cpp
-            Execution/src/GuestMemory.cpp
-            Execution/src/BdaFeatures.cpp
-            Execution/src/SubgroupClock.cpp
-            Execution/src/ShaderDeviceProfile.cpp
-            Graphics/src/Draw.cpp
-            Graphics/src/DepthSurface.cpp
-            Graphics/src/ColorTargetLayout.cpp
-            Graphics/src/MultisampleColorLayout.cpp
-            Graphics/src/ColorTargetTransfer.cpp
-            Graphics/src/Pipeline.cpp
-            Graphics/src/PipelineCache.cpp
-            Graphics/src/Resources.cpp
-            Graphics/src/ShaderResources.cpp
-            Graphics/src/ShaderAddressResources.cpp
-            Graphics/src/GuestBufferMemory.cpp
-            Graphics/src/BdaResources.cpp
-            Graphics/src/BufferAddress.cpp
-            Graphics/src/ShaderValidation.cpp
-            Graphics/src/GuestTextureResource.cpp
-            Graphics/src/GuestSamplerResource.cpp
-            Graphics/src/TextureFormat.cpp
-            Graphics/src/DccMetadata.cpp
-            Graphics/src/TextureTiling.cpp
-            Graphics/src/TextureDetiler.cpp
-            Graphics/src/Texture.cpp
-            Graphics/src/MultisampleColorSurface.cpp
-            Graphics/src/ColorResolve.cpp
-            Graphics/src/UnitShadow.cpp
-            Graphics/src/Sampler.cpp
-            ${agcTextureDetileShaderHeader}
-            ${agcMultisampleColorShaderHeader}
+            ${agcDriverSources}
             ${visualShaders}
     )
 
@@ -906,9 +885,10 @@ if(AGC_BUILD_VISUAL_TEST)
     )
 
     target_link_libraries(agc_driver_visual_test PRIVATE
-            libSceAgcDriver
+            shader_recompiler_agc_driver
             SDL2-static
             libc
+            libkernel
     )
 
     set_target_properties(agc_driver_visual_test PROPERTIES CXX_EXTENSIONS OFF)
@@ -926,11 +906,7 @@ if(AGC_BUILD_VISUAL_TEST)
     endif()
 
     if(WIN32)
-        set(visualRuntimeFiles
-                "$<TARGET_FILE:libSceAgcDriver>"
-                "$<TARGET_FILE:libkernel>"
-                "$<TARGET_FILE:libc>"
-        )
+        set(visualRuntimeFiles "$<TARGET_FILE:libc>" "$<TARGET_FILE:libkernel>")
 
         if(MINGW)
             get_filename_component(visualCompilerDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
@@ -954,7 +930,7 @@ if(AGC_BUILD_VISUAL_TEST)
                 COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 ${visualRuntimeFiles}
                 "$<TARGET_FILE_DIR:agc_driver_visual_test>"
-                DEPENDS libSceAgcDriver libkernel libc
+                DEPENDS libc libkernel
                 COMMAND_EXPAND_LISTS
                 VERBATIM
         )
