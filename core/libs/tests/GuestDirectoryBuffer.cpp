@@ -57,6 +57,14 @@ int main() {
     Require(sceKernelGetdents(directory, buffer.data(), 8) == 0);
     Require(sceKernelGetdents(directory, buffer.data(), 256) == 0);
     Require(sceKernelClose(directory) == 0);
-    Require(sceKernelGetdents(-1, buffer.data(), 256) == SCE_KERNEL_ERROR_ENOTDIR);
+    buffer.fill('x');
+    Require(sceKernelGetdents(directory, buffer.data(), 256) == SCE_KERNEL_ERROR_EBADF);
+    Require(sceKernelGetdents(-1, buffer.data(), 256) == SCE_KERNEL_ERROR_EBADF);
+    Require(std::all_of(buffer.begin(), buffer.end(), [](char byte) { return byte == 'x'; }));
+    const int regular = sceKernelOpen((root / name).string().c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Require(regular >= 0);
+    Require(sceKernelGetdents(regular, buffer.data(), 256) == SCE_KERNEL_ERROR_ENOTDIR);
+    Require(std::all_of(buffer.begin(), buffer.end(), [](char byte) { return byte == 'x'; }));
+    Require(sceKernelClose(regular) == 0);
     std::filesystem::remove_all(root);
 }

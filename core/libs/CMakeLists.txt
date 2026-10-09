@@ -131,6 +131,22 @@ endforeach()
 add_custom_target(libs DEPENDS ${PATCHED_OUTPUTS})
 
 if(BUILD_TESTING)
+    add_custom_target(guest_file_patched_runtime_artifacts DEPENDS
+            "${LIBC_PATCHED}" "${PATCHED_DIR}/libkernel.prx")
+    add_test_executable(guest_patched_file_runtime_tests tests/GuestFileIsolation.cpp
+            nid/src/NidCompute.cpp nid/src/Sha1.cpp)
+    target_include_directories(guest_patched_file_runtime_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/nid/include)
+    target_compile_definitions(guest_patched_file_runtime_tests PRIVATE ANYPS5_PATCHED_FILE_TEST=1)
+    target_link_libraries(guest_patched_file_runtime_tests PRIVATE ${CMAKE_DL_LIBS})
+    if(MINGW)
+        target_compile_options(guest_patched_file_runtime_tests PRIVATE -fasynchronous-unwind-tables)
+        target_link_options(guest_patched_file_runtime_tests PRIVATE -static -static-libgcc -static-libstdc++)
+    endif()
+    add_dependencies(guest_patched_file_runtime_tests guest_file_patched_runtime_artifacts)
+    add_test(NAME guest_patched_file_runtime COMMAND guest_patched_file_runtime_tests
+            "${LIBC_PATCHED}" "${PATCHED_DIR}/libkernel.prx")
+    set_tests_properties(guest_patched_file_runtime PROPERTIES TIMEOUT 20)
     add_test_executable(patched_libraries_tests tests/PatchedLibraries.cpp)
     add_dependencies(patched_libraries_tests libs)
     if(MINGW)

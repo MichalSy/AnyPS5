@@ -1,4 +1,5 @@
 #include "SceTypes.hpp"
+#include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <chrono>
 #include <cstdlib>
@@ -125,12 +126,8 @@ int main() {
     Require(sceKernelUtimes_nid_postfix(sized.string().c_str(), nullptr) == 0);
     std::FILE* native = std::fopen(sized.string().c_str(), "r+b");
     Require(native != nullptr);
-#ifdef _WIN32
-    const int descriptor = _fileno(native);
-#else
-    const int descriptor = ::fileno(native);
-#endif
-    Require(descriptor >= 0 && sceKernelFsync(descriptor) == 0);
+    const int descriptor = sceKernelOpen(sized.string().c_str(), SCE_KERNEL_O_RDWR, 0);
+    Require(descriptor >= 3 && descriptor <= 32767 && sceKernelFsync(descriptor) == 0);
     const auto ownerWrite = [&] {
         return (std::filesystem::status(sized).permissions() & std::filesystem::perms::owner_write) != std::filesystem::perms::none;
     };
@@ -147,6 +144,12 @@ int main() {
     Require(futimes_nid_postfix(descriptor, overflow) == -1 && *__error_nid_postfix() == 22);
     const KernelTimeval negative[2]{{0, -1}, {0, 0}};
     Require(futimes_nid_postfix(descriptor, negative) == -1 && *__error_nid_postfix() == 22);
+    Require(sceKernelClose(descriptor) == 0);
+    char nativeContents[8]{};
+    Require(std::fread(nativeContents, 1, sizeof(nativeContents), native) == 3);
+    Require(std::memcmp(nativeContents, "012", 3) == 0 && std::ferror(native) == 0);
+    std::rewind(native);
+    Require(std::fgetc(native) == '0');
     Require(std::fclose(native) == 0);
     Require(std::filesystem::file_size(sized) == 3);
 #ifndef _WIN32
