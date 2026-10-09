@@ -112,13 +112,20 @@ public:
     DepthSurface& operator=(const DepthSurface&) = delete;
 
     std::shared_ptr<Texture> Sampled(std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
-        Require(target.samples == VK_SAMPLE_COUNT_1_BIT, "sampling a multisampled depth/stencil surface requires multisampled texture materialization");
         std::array<std::uint32_t, 12> key{};
         std::copy_n(words.begin(), std::min<std::size_t>(words.size(), 8), key.begin());
         key[8] = components.r;
         key[9] = components.g;
         key[10] = components.b;
         key[11] = components.a;
+        if (target.samples != VK_SAMPLE_COUNT_1_BIT) {
+            char text[768];
+            std::snprintf(text, sizeof(text), "AGC graphics: sampling a multisampled depth/stencil surface requires multisampled texture materialization: cached depth=0x%llx stencil=0x%llx %ux%u samples=%u vk=%d; texture=0x%llx %ux%u guest format=%u tile=%u dimension=%u levels=%u-%u slice=%u (T# %08x %08x %08x %08x %08x %08x %08x %08x)",
+                static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.stencilAddress), target.extent.width, target.extent.height, static_cast<unsigned>(target.samples), static_cast<int>(target.format),
+                static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned>(resource.tileMode), static_cast<unsigned>(resource.dimension), resource.baseLevel, resource.lastLevel, resource.baseArray,
+                key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
+            throw std::runtime_error(text);
+        }
         if (const auto found = textures.find(key); found != textures.end()) return found->second;
         const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
