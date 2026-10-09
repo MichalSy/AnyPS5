@@ -451,9 +451,24 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
     return true;
 }
 
+#if defined(__linux__)
+bool ArenaAvailable() { return GuestArena::GuestArenaAvailable_nid_postfix(); }
+
+void* ArenaCommit(void* addr, size_t len, int prot) {
+    return mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+}
+
+void ArenaForget(void* addr, size_t len) {
+    if (GuestArena::GuestArenaContains_nid_postfix(addr, len)) GuestArena::GuestArenaRelease_nid_postfix(addr, len);
+}
+#endif
+
 void Unmap(void* addr, size_t len) {
 #if defined(__linux__)
-    if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
+    if (ArenaAvailable() && GuestArena::GuestArenaContains_nid_postfix(addr, len))
+        GuestArena::GuestArenaReset_nid_postfix(addr, len);
+    else if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
+    ArenaForget(addr, len);
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(addr, len);
 #else
     if (KernelArena::Get().Contains(addr, len)) munmap(addr, len);
@@ -502,6 +517,20 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
         }
 #endif
 #if defined(__linux__)
+        if (ArenaAvailable() && GuestArena::GuestArenaContains_nid_postfix(addr, len)) {
+            GuestArena::GuestArenaMarkUsed_nid_postfix(addr, len);
+            if (void* placed = ArenaCommit(addr, len, prot); placed != MAP_FAILED) return placed;
+            GuestArena::GuestArenaRelease_nid_postfix(addr, len);
+            throw std::system_error(errno, std::generic_category(), "Arena mapping failed");
+        }
+        if (ArenaAvailable()) {
+            std::uintptr_t base = 0;
+            std::size_t size = 0;
+            GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+            const auto start = reinterpret_cast<std::uintptr_t>(addr);
+            if (start < base + size && base < start + len)
+                throw std::invalid_argument("fixed mapping partially overlaps the guest address space arena");
+        }
         const int placement = (flags & GuestMapNoOverwrite) != 0 ? MAP_FIXED_NOREPLACE : MAP_FIXED;
 #else
         const int placement = MAP_FIXED;
@@ -515,6 +544,16 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     }
     if (addr) {
 #if defined(__linux__)
+        std::uintptr_t base = 0;
+        std::size_t size = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+        if (ArenaAvailable() && reinterpret_cast<std::uintptr_t>(addr) < base + size) {
+            void* placed = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(
+                reinterpret_cast<std::uintptr_t>(addr), len, alignment);
+            if (void* committed = ArenaCommit(placed, len, prot); committed != MAP_FAILED) return committed;
+            ArenaForget(placed, len);
+            throw std::system_error(errno, std::generic_category(), "Arena mapping failed");
+        }
         return MapAtOrAbove(reinterpret_cast<std::uintptr_t>(addr), len, prot, alignment);
 #else
         return mmap_aligned(len, prot, alignment, reinterpret_cast<std::uintptr_t>(addr));
@@ -522,7 +561,13 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     }
 #ifdef _WIN32
     return mmap_aligned(len, prot, alignment);
-#else
+#elif defined(__linux__)
+    if (ArenaAvailable()) {
+        void* placed = GuestArena::GuestArenaAllocate_nid_postfix(len, alignment);
+        if (void* committed = ArenaCommit(placed, len, prot); committed != MAP_FAILED) return committed;
+        ArenaForget(placed, len);
+        throw std::system_error(errno, std::generic_category(), "Arena mapping failed");
+    }
     constexpr std::uintptr_t GuestStart = 0x200000000ull;
     constexpr std::uintptr_t GuestEnd = 0xfc00000000ull;
     return MapAtOrAbove(GuestStart, len, prot, alignment, GuestEnd, true);

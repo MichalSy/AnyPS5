@@ -494,13 +494,18 @@ static void CheckNoOverwriteRefusesLiveMapping() {
 }
 
 #ifdef _WIN32
+constexpr std::uint32_t ReadWriteProtection = PAGE_READWRITE;
+#else
+constexpr std::uint32_t ReadWriteProtection = 0x04;
+#endif
+
 static void CheckNoOverwriteRejectsHostOccupiedMapping() {
     constexpr std::size_t page = 0x4000;
     void* reservation = nullptr;
     Require(sceKernelReserveVirtualRange(&reservation, page * 4, 0, 0) == 0);
     Require(sceKernelMunmap(reservation, page * 4) == 0);
     void* target = static_cast<unsigned char*>(reservation) + page;
-    GuestArena::GuestArenaCommit_nid_postfix(target, page, PAGE_READWRITE, page);
+    GuestArena::GuestArenaCommit_nid_postfix(target, page, ReadWriteProtection, page);
     std::int64_t phys = 0;
     Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &phys) == 0);
     void* fixed = target;
@@ -512,7 +517,103 @@ static void CheckNoOverwriteRejectsHostOccupiedMapping() {
     }
     Require(rejected);
     GuestArena::GuestArenaReset_nid_postfix(target, page);
+    GuestArena::GuestArenaRelease_nid_postfix(target, page);
     Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+}
+
+static void CheckUnhintedKernelMappingsLandInTheWindow() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::uintptr_t windowStart = 0x200000000ull;
+    constexpr std::uintptr_t windowEnd = 0xFC00000000ull;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &phys) == 0);
+    void* direct = nullptr;
+    Require(sceKernelMapDirectMemory(&direct, page, 3, 0, phys, 0) == 0);
+    Require(direct != nullptr);
+    const auto directAddress = reinterpret_cast<std::uintptr_t>(direct);
+    Require(directAddress >= windowStart);
+    Require(directAddress + page <= windowEnd);
+    void* flexible = nullptr;
+    Require(sceKernelMapNamedFlexibleMemory(&flexible, page, 3, 0, "arena-window-test") == 0);
+    Require(flexible != nullptr);
+    const auto flexibleAddress = reinterpret_cast<std::uintptr_t>(flexible);
+    Require(flexibleAddress >= windowStart);
+    Require(flexibleAddress + page <= windowEnd);
+    Require(sceKernelMunmap(direct, page) == 0);
+    Require(sceKernelMunmap(flexible, page) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+}
+
+#if defined(__linux__)
+static void CheckArenaProtectsSystemReservedRange() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::uintptr_t systemStart = 0x7ffffc000ull;
+    constexpr std::uintptr_t systemEnd = 0x1000000000ull;
+    void* const start = reinterpret_cast<void*>(systemStart);
+    void* const middle = reinterpret_cast<void*>(systemStart + page);
+    const auto reject = [&](auto&& operation) {
+        bool rejected = false;
+        try { operation(); } catch (const std::runtime_error&) { rejected = true; }
+        Require(rejected);
+    };
+    reject([&] { GuestArena::GuestArenaCommit_nid_postfix(start, page, ReadWriteProtection, page); });
+    reject([&] { GuestArena::GuestArenaRelease_nid_postfix(middle, page); });
+    reject([&] { GuestArena::GuestArenaMarkUsed_nid_postfix(middle, page); });
+    void* const placed = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(systemStart + page, page, page);
+    Require(reinterpret_cast<std::uintptr_t>(placed) >= systemEnd);
+    GuestArena::GuestArenaRelease_nid_postfix(placed, page);
+}
+
+static void CheckUnmappedArenaRangeStaysReserved() {
+    constexpr std::size_t page = 0x4000;
+    void* address = nullptr;
+    Require(sceKernelMapNamedFlexibleMemory(&address, page, 3, 0, "reserved-after-unmap") == 0);
+    Require(address != nullptr);
+    Require(sceKernelMunmap(address, page) == 0);
+    void* hostile = mmap(address, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    Require(hostile == MAP_FAILED && errno == EEXIST);
+    void* again = nullptr;
+    Require(sceKernelMapNamedFlexibleMemory(&again, page, 3, 0, "reserved-after-unmap-2") == 0);
+    Require(again != nullptr);
+    Require(sceKernelMunmap(again, page) == 0);
+}
+#endif
+
+static void CheckArenaPlacesUnhintedMappingsInsideTheWindow() {
+    constexpr std::size_t page = 0x4000;
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    Require(size != 0);
+    auto* placed = GuestArena::GuestArenaAllocate_nid_postfix(page, page);
+    Require(placed != nullptr);
+    const auto address = reinterpret_cast<std::uintptr_t>(placed);
+    Require(address >= base);
+    Require(address + page <= base + size);
+    GuestArena::GuestArenaRelease_nid_postfix(placed, page);
+}
+
+static void CheckArenaReusesAFreedRange() {
+    constexpr std::size_t page = 0x4000;
+    auto* first = GuestArena::GuestArenaAllocate_nid_postfix(page, page);
+    Require(first != nullptr);
+    GuestArena::GuestArenaRelease_nid_postfix(first, page);
+    auto* second = GuestArena::GuestArenaAllocate_nid_postfix(page, page);
+    Require(second == first);
+    GuestArena::GuestArenaRelease_nid_postfix(second, page);
+}
+
+static void CheckArenaHonoursHintsWithoutGoingBelowThem() {
+    constexpr std::size_t page = 0x4000;
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    const auto hint = base + page;
+    auto* placed = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(hint, page, page);
+    Require(placed != nullptr);
+    Require(reinterpret_cast<std::uintptr_t>(placed) >= hint);
+    Require(GuestArena::GuestArenaContains_nid_postfix(placed, page));
+    GuestArena::GuestArenaRelease_nid_postfix(placed, page);
 }
 
 static void CheckFixedMappingsReachTheApplicationAreaEnd() {
@@ -535,6 +636,7 @@ static void CheckFixedMappingsReachTheApplicationAreaEnd() {
     VirtualQueryInfo info{};
     Require(sceKernelVirtualQuery(mapped, 0, &info, sizeof(info)) == 0 && info.is_direct && info.end == applicationAreaEnd);
     void* beyond = reinterpret_cast<void*>(applicationAreaEnd);
+#ifdef _WIN32
     bool refused = false;
     try {
         refused = sceKernelMapDirectMemory(&beyond, page, 3, 0x10, phys, 0) != 0;
@@ -542,11 +644,31 @@ static void CheckFixedMappingsReachTheApplicationAreaEnd() {
         refused = true;
     }
     Require(refused && beyond == reinterpret_cast<void*>(applicationAreaEnd));
+#elif defined(__linux__)
+    Require(sceKernelMapDirectMemory(&beyond, page, 3, 0x90, phys, 0) == 0);
+    Require(beyond == reinterpret_cast<void*>(applicationAreaEnd));
+    Require(!GuestArena::GuestArenaContains_nid_postfix(beyond, page));
+    static_cast<volatile unsigned char*>(beyond)[17] = 0x6e;
+    Require(static_cast<volatile unsigned char*>(mapped)[17] == 0x6e);
+    void* beyondAlias = nullptr;
+    Require(sceKernelMapDirectMemory(&beyondAlias, page, 3, 0, phys, 0) == 0);
+    Require(static_cast<volatile unsigned char*>(beyondAlias)[17] == 0x6e);
+    static_cast<volatile unsigned char*>(beyondAlias)[18] = 0x53;
+    Require(static_cast<volatile unsigned char*>(beyond)[18] == 0x53);
+    Require(sceKernelVirtualQuery(beyond, 0, &info, sizeof(info)) == 0 && info.is_direct && info.start == applicationAreaEnd && info.end == applicationAreaEnd + page && info.offset == static_cast<std::uint64_t>(phys));
+    void* conflict = beyond;
+    Require(sceKernelMapDirectMemory(&conflict, page, 3, 0x90, phys + page, 0) == static_cast<int>(0x8002000cu));
+    Require(conflict == beyond && static_cast<volatile unsigned char*>(beyond)[17] == 0x6e);
+    Require(sceKernelMunmap(beyondAlias, page) == 0);
+    Require(sceKernelMunmap(beyond, page) == 0);
+    Require(sceKernelMapDirectMemory(&beyond, page, 3, 0x90, phys + page, 0) == 0);
+    Require(beyond == reinterpret_cast<void*>(applicationAreaEnd) && static_cast<volatile unsigned char*>(beyond)[page - 1] == 7);
+    Require(sceKernelMunmap(beyond, page) == 0);
+#endif
     Require(sceKernelMunmap(alias, page) == 0);
     Require(sceKernelMunmap(mapped, page * 2) == 0);
     Require(sceKernelReleaseDirectMemory(phys, page * 2) == 0);
 }
-#endif
 
 #if defined(__linux__)
 static std::size_t LockedKilobytes() {
@@ -956,18 +1078,9 @@ static void CheckAutomaticGuestMappingPlacement() {
     constexpr std::uintptr_t systemReservedEnd = 0x1000000000ull;
     constexpr std::size_t page = 0x4000;
     constexpr std::size_t alignment = 0x200000;
-    void* occupied = MAP_FAILED;
-    for (std::uintptr_t index = 0; index < 64; ++index) {
-        void* const candidate = reinterpret_cast<void*>(guestStart + index * alignment);
-        occupied = mmap(candidate, page, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (occupied != MAP_FAILED) {
-            Require(occupied == candidate);
-            break;
-        }
-        Require(errno == EEXIST);
-    }
-    Require(occupied != MAP_FAILED);
+    void* occupied = GuestArena::GuestArenaAllocate_nid_postfix(page, alignment);
+    Require(occupied != nullptr);
+    GuestArena::GuestArenaCommit_nid_postfix(occupied, page, ReadWriteProtection, page);
     auto* sentinel = static_cast<volatile unsigned char*>(occupied);
     sentinel[0] = 0x6d;
     sentinel[page - 1] = 0xa7;
@@ -1030,7 +1143,8 @@ static void CheckAutomaticGuestMappingPlacement() {
     Require(sceKernelMunmap(alias, page * 2) == 0);
     Require(sceKernelMunmap(direct, page * 2) == 0);
     Require(sceKernelReleaseDirectMemory(physical, page * 2) == 0);
-    Require(munmap(occupied, page) == 0);
+    GuestArena::GuestArenaReset_nid_postfix(occupied, page);
+    GuestArena::GuestArenaRelease_nid_postfix(occupied, page);
 }
 
 static void CheckDirectMemoryBackingNeedsNoFilesystem() {
@@ -1162,10 +1276,16 @@ int main() {
     CheckGetDirectMemoryType();
     CheckMtypeprotect();
     CheckHeapAfterMappingReuse();
-#ifdef _WIN32
     CheckNoOverwriteRejectsHostOccupiedMapping();
     CheckFixedMappingsReachTheApplicationAreaEnd();
+    CheckUnhintedKernelMappingsLandInTheWindow();
+#if defined(__linux__)
+    CheckArenaProtectsSystemReservedRange();
+    CheckUnmappedArenaRangeStaysReserved();
 #endif
+    CheckArenaPlacesUnhintedMappingsInsideTheWindow();
+    CheckArenaReusesAFreedRange();
+    CheckArenaHonoursHintsWithoutGoingBelowThem();
     CheckSharedWriteTracking();
     CheckReadsIntoSharedWriteTracking();
     CheckPinnedSharedPages();
