@@ -203,8 +203,6 @@ bool FillModuleUnwindInfo_nid_no_patch(std::uint64_t address, ModuleInfoForUnwin
 int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, ModuleInfoEx* info) {
     if (!info) return SCE_KERNEL_ERROR_EFAULT;
     if (flags != 2) throw std::invalid_argument("sceKernelGetModuleInfoFromAddr: unsupported flags " + std::to_string(flags));
-    if (info->st_size != sizeof(ModuleInfoEx))
-        throw std::invalid_argument("sceKernelGetModuleInfoFromAddr: unsupported st_size " + std::to_string(info->st_size));
 #ifdef _WIN32
     (void)address;
     NotImplemented_nid_no_patch(__func__);

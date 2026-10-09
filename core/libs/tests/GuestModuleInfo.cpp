@@ -47,6 +47,10 @@ int main(int argc, char** argv) {
     Require(executable);
     Require(info.eh_frame_hdr_addr != 0 && info.eh_frame_hdr_size != 0 && info.eh_frame_addr != 0 && info.eh_frame_size != 0);
     Require(info.init_proc_addr == 0 || info.init_proc_addr >= info.segments[0].address);
+    ModuleInfoEx poisoned;
+    std::memset(&poisoned, 0xa5, sizeof(poisoned));
+    Require(sceKernelGetModuleInfoFromAddr(reinterpret_cast<std::uintptr_t>(add), 2, &poisoned) == 0);
+    Require(std::memcmp(&poisoned, &info, sizeof(info)) == 0);
     const auto self = Query(reinterpret_cast<const void*>(&Require), 0);
     Require(self.id != info.id && Query(reinterpret_cast<const void*>(&Query), 0).id == self.id);
     void* second = dlopen_nid_postfix(argv[1], 2);
@@ -54,11 +58,15 @@ int main(int argc, char** argv) {
     Require(dlclose_nid_postfix(second) == 0);
     int local = 0;
     Query(&local, SCE_KERNEL_ERROR_ESRCH);
+    ModuleInfoEx missing;
+    std::memset(&missing, 0xa5, sizeof(missing));
+    ModuleInfoEx unchanged;
+    std::memcpy(&unchanged, &missing, sizeof(missing));
+    Require(sceKernelGetModuleInfoFromAddr(reinterpret_cast<std::uintptr_t>(&local), 2, &missing) == SCE_KERNEL_ERROR_ESRCH);
+    Require(std::memcmp(&missing, &unchanged, sizeof(missing)) == 0);
     Require(sceKernelGetModuleInfoFromAddr(reinterpret_cast<std::uintptr_t>(add), 2, nullptr) == SCE_KERNEL_ERROR_EFAULT);
     ModuleInfoEx invalid{};
     invalid.st_size = sizeof(ModuleInfoEx);
     Require(ThrowsInvalidArgument([&] { sceKernelGetModuleInfoFromAddr(reinterpret_cast<std::uintptr_t>(add), 1, &invalid); }));
-    invalid.st_size = sizeof(ModuleInfoEx) - 8;
-    Require(ThrowsInvalidArgument([&] { sceKernelGetModuleInfoFromAddr(reinterpret_cast<std::uintptr_t>(add), 2, &invalid); }));
     Require(dlclose_nid_postfix(module) == 0);
 }
