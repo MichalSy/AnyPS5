@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -111,6 +112,15 @@ public:
     DepthSurface(const DepthSurface&) = delete;
     DepthSurface& operator=(const DepthSurface&) = delete;
 
+    bool SampledAccepts(std::span<const std::uint32_t> words, const GuestTextureResource& resource) const {
+        const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
+        const auto format = ResolveTextureFormat(resource.format);
+        const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
+        return (format == expected || depthBits) && resource.dimension == TextureDimension::k2D && resource.width == target.extent.width && resource.height == target.extent.height && resource.baseLevel == 0 && resource.lastLevel == 0 && resource.baseArray == 0;
+    }
+
     std::shared_ptr<Texture> Sampled(std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
         std::array<std::uint32_t, 12> key{};
         std::copy_n(words.begin(), std::min<std::size_t>(words.size(), 8), key.begin());
@@ -128,14 +138,10 @@ public:
         }
         if (const auto found = textures.find(key); found != textures.end()) return found->second;
         const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
-        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
-        const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
-        const auto format = ResolveTextureFormat(resource.format);
-        const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
-        if ((format != expected && !depthBits) || resource.dimension != TextureDimension::k2D || resource.width != target.extent.width || resource.height != target.extent.height || resource.baseLevel != 0 || resource.lastLevel != 0 || resource.baseArray != 0) {
+        if (!SampledAccepts(words, resource)) {
             char text[448];
             std::snprintf(text, sizeof(text), "AGC graphics: sampling the %s plane of depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u texture of guest format %u (vk %d), tile mode %u, dimension %d, levels %u-%u, slice %u is not implemented (T# %08x %08x %08x %08x %08x %08x %08x %08x)",
-                          stencil ? "stencil" : "depth", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), resource.width, resource.height, resource.format, static_cast<int>(format),
+                          stencil ? "stencil" : "depth", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), resource.width, resource.height, resource.format, static_cast<int>(ResolveTextureFormat(resource.format)),
                           static_cast<unsigned>(resource.tileMode), static_cast<int>(resource.dimension), resource.baseLevel, resource.lastLevel, resource.baseArray, key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
             throw std::runtime_error(text);
         }
@@ -144,14 +150,56 @@ public:
         return texture;
     }
 
+    bool Overlaps(std::uint64_t address, std::uint64_t bytes) const {
+        const auto overlaps = [&](std::uint64_t plane, std::uint64_t planeBytes) {
+            return plane != 0 && bytes != 0 && (address >= plane ? address - plane < planeBytes : plane - address < bytes);
+        };
+        return overlaps(target.address, target.samples == VK_SAMPLE_COUNT_1_BIT ? depthBytes() : 1u) ||
+            overlaps(target.stencilAddress, target.samples == VK_SAMPLE_COUNT_1_BIT ? stencilBytes() : 1u);
+    }
+
+    bool Overlaps(const DepthSurface& other) const {
+        return (other.target.address != 0 && Overlaps(other.target.address, other.target.samples == VK_SAMPLE_COUNT_1_BIT ? other.depthBytes() : 1u)) ||
+            (other.target.stencilAddress != 0 && Overlaps(other.target.stencilAddress, other.target.samples == VK_SAMPLE_COUNT_1_BIT ? other.stencilBytes() : 1u));
+    }
+
+    void NoteWritten() {
+        if (target.samples != VK_SAMPLE_COUNT_1_BIT) return;
+        depthWritten = target.address != 0 ? GuestMemory::CollectWrites(target.address, depthBytes()) : 0;
+        stencilWritten = target.stencilAddress != 0 ? GuestMemory::CollectWrites(target.stencilAddress, stencilBytes()) : 0;
+    }
+
+    bool OverwrittenInMemory() const {
+        if (target.samples != VK_SAMPLE_COUNT_1_BIT) return false;
+        if (target.address != 0) {
+            GuestMemory::CollectWrites(target.address, depthBytes());
+            if (GuestMemory::WrittenSince(target.address, depthBytes(), depthWritten)) return true;
+        }
+        if (target.stencilAddress == 0) return false;
+        GuestMemory::CollectWrites(target.stencilAddress, stencilBytes());
+        return GuestMemory::WrittenSince(target.stencilAddress, stencilBytes(), stencilWritten);
+    }
+
     const Context context;
     const DepthTarget target;
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    bool retired = false;
 
 private:
     std::map<std::array<std::uint32_t, 12>, std::shared_ptr<Texture>> textures;
+    std::uint64_t depthWritten = 0;
+    std::uint64_t stencilWritten = 0;
+
+    std::uint64_t depthBytes() const {
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        return DepthSliceBytes(target.extent, d16 ? 2u : 4u);
+    }
+
+    std::uint64_t stencilBytes() const {
+        return DepthSliceBytes(target.extent, 1u);
+    }
 
     void release() noexcept {
         textures.clear();
@@ -189,17 +237,28 @@ std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
+    DepthSurface* bound = nullptr;
     for (const auto& surface : surfaces()) {
         if (surface->context.device == context.device && sameSurface(surface->target, target)) {
             Require(surface->target.sampleLocationsGrid.width == target.sampleLocationsGrid.width && surface->target.sampleLocationsGrid.height == target.sampleLocationsGrid.height &&
                 surface->target.sampleLocations.size() == target.sampleLocations.size() && std::equal(surface->target.sampleLocations.begin(), surface->target.sampleLocations.end(), target.sampleLocations.begin(),
                     [](const auto& a, const auto& b) { return a.x == b.x && a.y == b.y; }), "changing sample locations for an existing depth/stencil surface is unsupported");
-            return surface->view;
+            bound = surface.get();
+            break;
         }
     }
-    surfaces().push_back(std::make_unique<DepthSurface>(context, target));
-    return surfaces().back()->view;
+    if (bound == nullptr) {
+        surfaces().push_back(std::make_unique<DepthSurface>(context, target));
+        bound = surfaces().back().get();
+    }
+    bound->retired = false;
+    for (const auto& surface : surfaces()) {
+        if (surface.get() != bound && surface->context.device == context.device && surface->Overlaps(*bound)) surface->retired = true;
+    }
+    bound->NoteWritten();
+    return bound->view;
 }
 
 void ClearDepthSurfaces(VkDevice device) {
@@ -207,18 +266,36 @@ void ClearDepthSurfaces(VkDevice device) {
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
 }
 
+void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device == device && surface->Overlaps(address, bytes)) surface->retired = true;
+    }
+}
+
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
+    const auto matches = [&](const auto& surface) {
+        return !surface->retired && surface->context.device == context.device && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
+    };
+    {
+        std::lock_guard lock(surfacesMutex());
+        if (std::none_of(surfaces().begin(), surfaces().end(), matches)) return nullptr;
+    }
+    std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     const auto& list = surfaces();
-    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
-        return surface->context.device == context.device && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
-    });
-    return found == list.rend() ? nullptr : (*found)->Sampled(words, resource, components);
+    const auto found = std::find_if(list.rbegin(), list.rend(), matches);
+    if (found == list.rend()) return nullptr;
+    if ((*found)->target.samples == VK_SAMPLE_COUNT_1_BIT && !(*found)->SampledAccepts(words, resource) && (*found)->OverwrittenInMemory()) {
+        (*found)->retired = true;
+        return nullptr;
+    }
+    return (*found)->Sampled(words, resource, components);
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {
     std::lock_guard lock(surfacesMutex());
-    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.address == address || surface->target.stencilAddress == address; });
+    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return !surface->retired && (surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address)); });
 }
 
 }
