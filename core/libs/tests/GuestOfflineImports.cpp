@@ -100,7 +100,6 @@ int main() {
         Require(std::memcmp(&output, original.data(), sizeof(output)) == 0);
     }
 
-    constexpr int signedOut = static_cast<int>(0x80550006);
     Require(sceNpEntitlementAccessRequestUnifiedEntitlementInfoList() == signedOut);
     Require(sceNpEntitlementAccessPollUnifiedEntitlementInfoList() == signedOut);
     Require(sceNpEntitlementAccessRequestServiceEntitlementInfoList() == signedOut);

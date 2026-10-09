@@ -14,7 +14,7 @@ if(BUILD_TESTING)
 
     add_test_executable(guest_sysmodule_initial_cleanup_tests ${LIBS_INCLUDE_DIR}/tests/SysmoduleInitialCleanup.cpp)
     target_include_directories(guest_sysmodule_initial_cleanup_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(guest_sysmodule_initial_cleanup_tests PRIVATE libSceSysmodule)
+    target_link_libraries(guest_sysmodule_initial_cleanup_tests PRIVATE libSceSysmodule libc)
     configure_windows_unwind(guest_sysmodule_initial_cleanup_tests)
     add_test(NAME guest_sysmodule_initial_cleanup_strict COMMAND guest_sysmodule_initial_cleanup_tests --strict)
     set_tests_properties(guest_sysmodule_initial_cleanup_strict PROPERTIES ENVIRONMENT_MODIFICATION

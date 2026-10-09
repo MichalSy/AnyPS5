@@ -13,7 +13,7 @@ int APS5_VABI sceHttp2CreateCookieBox(int);
 int APS5_VABI sceHttp2SetCookieBox(int, int);
 int APS5_VABI sceHttp2CookieFlush(int);
 int APS5_VABI sceHttp2SetRequestNoContentLength(int);
-int APS5_VABI sceHttp2SetResolveRetry(int, int);
+int APS5_VABI sceHttp2SetResolveRetry(int, std::int32_t);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceHttp2WebSocketCreateRequest(int, const char*, uintptr_t, uintptr_t, uintptr_t, uintptr_t, void*, std::size_t, void*, uintptr_t);
 int APS5_VABI sceHttp2WebSocketSendTextMessageAsync(int, const char*, uintptr_t, uintptr_t, uintptr_t);
@@ -42,7 +42,6 @@ struct Http2MemoryPoolStats {
 
 extern "C" {
 int APS5_VABI sceHttp2GetMemoryPoolStats(int, Http2MemoryPoolStats*);
-int APS5_VABI sceHttp2SetResolveRetry(int, std::int32_t);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -115,7 +114,7 @@ int main() {
         for (int id : {request, tmpl, context, 0, -1, 0x7fffffff}) {
             for (int retries : {0, 1, 4, -1, 0x7fffffff}) {
                 const int result = sceHttp2SetResolveRetry(id, retries);
-                Require(result == static_cast<int>(0x80436063) && result < 0);
+                Require(result == 0);
                 Require(*__error_nid_postfix() == savedError);
             }
         }

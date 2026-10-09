@@ -1,4 +1,5 @@
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/tests/AlignedByteArray.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -21,9 +22,12 @@ using namespace ShaderRecompiler;
 
 constexpr std::uint32_t Width = 64;
 constexpr std::uint32_t Height = 16;
-alignas(16384) std::array<std::byte, 16384> Pixels{};
-alignas(16384) std::array<std::byte, 65536> Depth{};
-alignas(16384) std::array<std::byte, 65536> Stencil{};
+const auto PixelStorage = MakeAlignedByteArray<16384, 16384>();
+const auto DepthStorage = MakeAlignedByteArray<65536, 16384>();
+const auto StencilStorage = MakeAlignedByteArray<65536, 16384>();
+auto& Pixels = *PixelStorage;
+auto& Depth = *DepthStorage;
+auto& Stencil = *StencilStorage;
 alignas(256) std::array<std::array<float, 4>, 3> Vertices{{{-1, -1, 0.25f, 1}, {3, -1, 0.25f, 1}, {-1, 3, 0.25f, 1}}};
 alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{0xe0382000u, 0x80020005u, 0xbf8c3f70u, 0xf80008cfu, 0x03020100u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 4> PixelCode{0x7e0e02f2u, 0xf800180fu, 0x07070707u, 0xbf810000u};

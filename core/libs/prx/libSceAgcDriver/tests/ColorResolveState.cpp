@@ -1,4 +1,5 @@
 #include "GraphicsTests.hpp"
+#include "AlignedByteArray.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <array>
@@ -15,8 +16,10 @@ namespace {
 using namespace AgcDriver::Graphics;
 constexpr std::uint32_t Width = 37u;
 constexpr std::uint32_t Height = 69u;
-alignas(65536) std::array<std::byte, 262144> sourceMemory{};
-alignas(65536) std::array<std::byte, 65536> destinationMemory{};
+const auto sourceStorage = MakeAlignedByteArray<262144, 65536>();
+const auto destinationStorage = MakeAlignedByteArray<65536, 65536>();
+auto& sourceMemory = *sourceStorage;
+auto& destinationMemory = *destinationStorage;
 
 class Memory {
 public:

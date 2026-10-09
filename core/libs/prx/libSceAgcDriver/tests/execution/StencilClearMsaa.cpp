@@ -6,6 +6,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/tests/AlignedByteArray.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -29,9 +30,12 @@ constexpr std::byte Kept{0x40};
 constexpr std::uint64_t TotalPixels = Width * Height;
 constexpr std::uint64_t ClearedPixels = 32u * Height;
 constexpr std::uint64_t NestedPixels = 8u * 4u;
-alignas(16384) std::array<std::byte, 16384> Pixels{};
-alignas(16384) std::array<std::byte, 65536 * 8> Depth{};
-alignas(16384) std::array<std::byte, 65536 * 8> Stencil{};
+const auto PixelStorage = MakeAlignedByteArray<16384, 16384>();
+const auto DepthStorage = MakeAlignedByteArray<65536 * 8, 16384>();
+const auto StencilStorage = MakeAlignedByteArray<65536 * 8, 16384>();
+auto& Pixels = *PixelStorage;
+auto& Depth = *DepthStorage;
+auto& Stencil = *StencilStorage;
 alignas(256) std::array<std::array<float, 4>, 3> Vertices{};
 
 alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{

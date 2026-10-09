@@ -1,4 +1,5 @@
 #include "GraphicsTests.hpp"
+#include "AlignedByteArray.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -16,9 +17,12 @@ namespace {
 
 using namespace AgcDriver::Graphics;
 
-alignas(65536) std::array<std::byte, 262144> colorMemory{};
-alignas(65536) std::array<std::byte, 262144> depthMemory{};
-alignas(65536) std::array<std::byte, 262144> stencilMemory{};
+const auto colorStorage = MakeAlignedByteArray<262144, 65536>();
+const auto depthStorage = MakeAlignedByteArray<262144, 65536>();
+const auto stencilStorage = MakeAlignedByteArray<262144, 65536>();
+auto& colorMemory = *colorStorage;
+auto& depthMemory = *depthStorage;
+auto& stencilMemory = *stencilStorage;
 alignas(256) std::array<std::uint32_t, 4> pixelProgram{0xbf810000u};
 
 class RegisteredMemory {
