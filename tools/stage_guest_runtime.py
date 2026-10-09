@@ -59,7 +59,8 @@ def prepare(game, executable):
             plugins = game / "prepare_dynamic_plugins.py"
             if plugins.exists():
                 subprocess.run(["python", "-B", str(plugins)], check=True)
-            atomic_copy(output.with_suffix(".registry.json"), runtime / output.with_suffix(".registry.json").name)
+            for registry in sorted(staging.glob("*.registry.json")):
+                atomic_copy(registry, runtime / registry.name)
             atomic_copy(output, runtime / executable)
 
 
