@@ -3333,7 +3333,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         writes.push_back(write);
     }
     update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    recorder.Keep(result);
+    std::size_t snapshotBytes = 0;
+    for (const auto& snapshot : result->snapshots) snapshotBytes += snapshot.buffer->Bytes().size();
+    recorder.Keep(result, snapshotBytes);
     return result;
 }
 
