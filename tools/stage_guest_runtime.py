@@ -36,6 +36,11 @@ def prepare(game, executable):
     libraries = sorted((project / "build/core/libs/libs").glob("*.prx"))
     if not libraries:
         raise RuntimeError("Build the PRX libraries before preparing a game")
+    for library in libraries:
+        unpatched = library.parent / "unpatched" / library.name
+        if unpatched.is_file() and unpatched.stat().st_mtime_ns > library.stat().st_mtime_ns:
+            raise RuntimeError("Patched library is older than its linked build: " + library.name +
+                               ". Run cmake --build build --target libs before preparing a game")
     with (runtime / ".prepare.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         with tempfile.TemporaryDirectory(prefix=".prepare-", dir=runtime) as directory:
