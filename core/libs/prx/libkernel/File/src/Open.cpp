@@ -16,11 +16,20 @@
 #include <fcntl.h>
 #include <io.h>
 #include <sys/stat.h>
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+static void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
 static int NativeOpen(const std::filesystem::path& p, int nativeFlags, std::uint16_t mode) {
     return ::_wopen(p.wstring().c_str(), nativeFlags, static_cast<int>(mode));
 }
 static std::int64_t NativeLseek(int fd, std::int64_t offset, int whence) {
-    return ::_lseeki64(fd, offset, whence);
+    const int initialError = errno;
+    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
+    errno = initialError;
+    const auto result = ::_lseeki64(fd, offset, whence);
+    const int error = errno;
+    _set_thread_local_invalid_parameter_handler(previous);
+    errno = error;
+    return result;
 }
 static int NativeRead(int fd, void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
@@ -34,8 +43,6 @@ static int NativeWrite(int fd, const void* buf, std::size_t n) {
     }
     return ::_write(fd, buf, static_cast<unsigned int>(n));
 }
-extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
-static void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
 static int NativeClose(int fd) {
     const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
     const int result = ::_close(fd);
@@ -158,11 +165,11 @@ std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes
 
 std::int64_t APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
     if (whence < 0 || whence > 2) {
-        throw std::invalid_argument(std::string(__func__) + ": invalid whence=" + std::to_string(whence));
+        return SCE_KERNEL_ERROR_EINVAL;
     }
-    std::int64_t result = NativeLseek(d, offset, whence);
+    const std::int64_t result = NativeLseek(d, offset, whence);
     if (result < 0) {
-        throw std::runtime_error(std::string(__func__) + ": lseek failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
+        return errno == EOVERFLOW ? SCE_KERNEL_ERROR_EOVERFLOW : SceErrorFromErrno(errno);
     }
     return result;
 }

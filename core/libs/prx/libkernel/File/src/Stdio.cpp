@@ -309,7 +309,8 @@ int APS5_VABI sceKernelFtruncate(int d, int64_t length) {
 }
 
 int64_t APS5_VABI lseek_nid_postfix(int d, int64_t offset, int whence) {
-    return static_cast<int64_t>(sceKernelLseek(d, offset, whence));
+    const auto result = sceKernelLseek(d, offset, whence);
+    return result < 0 ? PosixFailure(static_cast<int>(result & 0xffff)) : result;
 }
 
 int APS5_VABI mkdir_nid_postfix(const char* path, uint16_t mode) {

@@ -15,7 +15,7 @@ extern "C" {
 int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
 int APS5_VABI sceKernelClose(int);
 std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
-int APS5_VABI sceKernelLseek(int, std::int64_t, int);
+std::int64_t APS5_VABI sceKernelLseek(int, std::int64_t, int);
 int APS5_VABI sceKernelGetdents(int, char*, int);
 int APS5_VABI sceKernelGetdirentries(int, char*, int, std::int64_t*);
 std::int64_t APS5_VABI sceKernelPread(int, void*, std::size_t, std::int64_t);
