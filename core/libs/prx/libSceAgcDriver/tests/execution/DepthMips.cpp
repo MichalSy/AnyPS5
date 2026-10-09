@@ -32,6 +32,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -399,6 +400,79 @@ void ExpectValue(SampleProgram& sampler, const Texture& texture, float lod, floa
     Require(std::isfinite(value) && std::abs(value - expected) <= 0.000001f, step + ": sampled " + std::to_string(value) + ", expected " + std::to_string(expected));
 }
 
+void HtileClearTests(const Device& device, SampleProgram& sampler) {
+    using namespace AgcDriver::GuestMemory;
+    Require(WriteWatched(), "HTILE clear oracle requires write watching");
+    constexpr VkExtent2D extent{64, 64};
+    constexpr std::size_t metadataBytes = 32768;
+    GuestBlock memory(3u * Block);
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearDepthSurfaces(device); }
+    } cleanup{device.GetContext().device};
+    auto target = Target(memory.Address(), extent, 0);
+    target.mipCount = 1;
+    target.clearDepth = 0.5f;
+    target.htileAddress = memory.Address() + Block;
+    const auto originalMetadata = target.htileAddress;
+    const auto fill = [&](std::uint64_t address, std::size_t bytes, std::uint32_t pattern, bool note = true) {
+        Require(bytes % 4u == 0, "fixture fill has partial words");
+        std::vector<std::uint32_t> words(bytes / 4u, pattern);
+        Write(address, std::as_bytes(std::span(words)), 4);
+        if (note) NoteDepthMetadataFill(device.GetContext().device, address, bytes, pattern);
+    };
+    Require(DepthSurfaceView(device.GetContext(), target) != VK_NULL_HANDLE, "HTILE target has no view");
+    fill(originalMetadata, metadataBytes, 0x0003fff0u);
+    auto sampled = Sample(device.GetContext(), target, 0, 0);
+    Require(sampled != nullptr, "HTILE target cannot be sampled");
+    ExpectValue(sampler, *sampled, 0, 0.5f, "initial clear value, sampled after fill before another bind");
+    DrawDepth(device, target, 0.25f);
+    ExpectValue(sampler, *sampled, 0, 0.25f, "actual depth draw before HTILE clear");
+    target.clearDepth = 0.875f;
+    DepthSurfaceView(device.GetContext(), target);
+    ExpectValue(sampler, *sampled, 0, 0.25f, "register-only clear value change");
+    fill(originalMetadata, 256, 0x0003fff0u);
+    DepthSurfaceView(device.GetContext(), target);
+    ExpectValue(sampler, *sampled, 0, 0.25f, "old ceil8 unpadded fill");
+    fill(originalMetadata, metadataBytes - 4u, 0x0003fff0u);
+    ExpectValue(sampler, *Sample(device.GetContext(), target, 0, 0), 0, 0.25f, "whole metadata minus last word");
+    fill(originalMetadata, metadataBytes, 0x0003fff0u, false);
+    ExpectValue(sampler, *Sample(device.GetContext(), target, 0, 0), 0, 0.25f, "guest contents alone are not a clear trigger");
+    fill(originalMetadata, metadataBytes, 0x0003fff0u);
+    fill(originalMetadata + metadataBytes - 4u, 4, 0xffffffffu, false);
+    DepthSurfaceView(device.GetContext(), target);
+    ExpectValue(sampler, *sampled, 0, 0.25f, "tracked later writer invalidates a whole clear");
+    fill(originalMetadata, metadataBytes, 0x0003fff0u);
+    ExpectValue(sampler, *Sample(device.GetContext(), target, 0, 0), 0, 0.875f, "whole uniform fill applies before sampling");
+    fill(originalMetadata, metadataBytes, 0xffffffffu);
+    DepthSurfaceView(device.GetContext(), target);
+    ExpectValue(sampler, *sampled, 0, 0.875f, "expanded metadata does not clear");
+    fill(originalMetadata, metadataBytes, 0x0003fff0u);
+    target.clearDepth = 0.625f;
+    DepthSurfaceView(device.GetContext(), target);
+    ExpectValue(sampler, *sampled, 0, 0.625f, "pending clear uses the newest bind value");
+    fill(originalMetadata, metadataBytes, 0x0003fff0u);
+    target.htileAddress = memory.Address() + 2u * Block;
+    target.clearDepth = 0.125f;
+    DepthSurfaceView(device.GetContext(), target);
+    ExpectValue(sampler, *sampled, 0, 0.625f, "changed metadata base discards the old clear");
+    target.htileAddress = originalMetadata;
+    DepthSurfaceView(device.GetContext(), target);
+    fill(originalMetadata, metadataBytes, 0x0003fff0u);
+    RetireDepthSurfaces(device.GetContext().device, target.address, Block);
+    DepthSurfaceView(device.GetContext(), target);
+    ExpectValue(sampler, *sampled, 0, 0.625f, "retired surface does not revive an old clear");
+    fill(originalMetadata, metadataBytes, 0x0003fff0u);
+    { GuestAllocations::Mutation mutation; }
+    DepthSurfaceView(device.GetContext(), target);
+    ExpectValue(sampler, *sampled, 0, 0.625f, "registry epoch invalidates an old clear");
+    target.htileStencil = true;
+    DepthSurfaceView(device.GetContext(), target);
+    fill(originalMetadata, metadataBytes, 0x000000f0u);
+    DepthSurfaceView(device.GetContext(), target);
+    ExpectValue(sampler, *sampled, 0, 0.625f, "stencil-in-HTILE is excluded from the depth-only clear");
+}
+
 void RenderAndSample(const Device& device, SampleProgram& sampler, VkExtent2D extent, std::size_t bytes, const std::string& name) {
     GuestBlock memory(bytes);
     std::memset(memory.data, 0x12, bytes);
@@ -494,7 +568,7 @@ void MultisampleMipRefusal(const Context& context) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         std::unique_ptr<Device> device;
         try {
@@ -506,6 +580,11 @@ int main() {
         }
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         SampleProgram sampler(device->GetContext());
+        if (argc == 2 && std::string_view(argv[1]) == "--htile-only") {
+            HtileClearTests(*device, sampler);
+            std::puts("HTILE padded uniform clear and no-false-clear tests passed");
+            return 0;
+        }
         RenderAndSample(*device, sampler, {512, 256}, 0xb0000, "macro mip chain");
         RenderAndSample(*device, sampler, {64, 64}, 0x10000, "shared mip tail");
         FootprintTests(device->GetContext());

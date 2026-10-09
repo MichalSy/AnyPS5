@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include <limits>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -131,6 +133,54 @@ public:
     DepthSurface(const DepthSurface&) = delete;
     DepthSurface& operator=(const DepthSurface&) = delete;
 
+    void Bind(const DepthTarget& bound) {
+        const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        if (retired || htileAddress != bound.htileAddress || htileStencil != bound.htileStencil || registry != htileRegistry) pendingClear = false;
+        htileAddress = bound.htileAddress;
+        htileStencil = bound.htileStencil;
+        htileRegistry = registry;
+        clearDepth = bound.clearDepth;
+        clearStencil = bound.clearStencil;
+    }
+
+    bool AcceptsHtileFill() const {
+        return !retired && htileAddress != 0 && !htileStencil && target.address != 0 && target.samples == VK_SAMPLE_COUNT_1_BIT &&
+            target.mipCount == 1u && target.mip == 0u && htileRegistry == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    }
+
+    void NoteHtileFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
+        const auto footprint = HtileSliceBytes(surfaceExtent(target));
+        if (htileAddress == 0 || footprint == 0 || bytes == 0 ||
+            (address >= htileAddress ? address - htileAddress >= footprint : htileAddress - address >= bytes)) return;
+        pendingClear = false;
+        if (!AcceptsHtileFill() || !HtileFillCovers(htileAddress, surfaceExtent(target), address, bytes) || (pattern & 0xfu) != 0) return;
+        const auto generation = GuestMemory::CollectWritesUncached(htileAddress, static_cast<std::size_t>(footprint));
+        if (generation == 0 || !GuestMemory::Watched(htileAddress, static_cast<std::size_t>(footprint))) return;
+        pendingGeneration = generation;
+        pendingClear = true;
+    }
+
+    void ApplyFastClear() {
+        if (!pendingClear) return;
+        pendingClear = false;
+        const auto footprint = static_cast<std::size_t>(HtileSliceBytes(surfaceExtent(target)));
+        if (!AcceptsHtileFill() || GuestMemory::CollectWritesUncached(htileAddress, footprint) == 0 ||
+            GuestMemory::StoredOver(htileAddress, footprint, pendingGeneration)) return;
+        auto* recorder = Recorder::Active();
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearDepthStencilValue clear{clearDepth, clearStencil};
+        context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, access);
+        if (batch) batch->SubmitAndWait();
+        else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+    }
+
     VkImageView View(std::uint32_t mip) const {
         Require(mip < views.size(), "depth attachment mip is outside its surface");
         return views[mip];
@@ -223,6 +273,13 @@ public:
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     bool retired = false;
+    bool pendingClear = false;
+    std::uint64_t htileAddress = 0;
+    bool htileStencil = false;
+    std::uint64_t htileRegistry = 0;
+    std::uint64_t pendingGeneration = 0;
+    float clearDepth = 0.0f;
+    std::uint8_t clearStencil = 0;
 
 private:
     std::vector<VkImageView> views;
@@ -301,12 +358,40 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         surfaces().push_back(std::make_unique<DepthSurface>(context, target));
         bound = surfaces().back().get();
     }
+    bound->Bind(target);
     bound->retired = false;
     for (const auto& surface : surfaces()) {
         if (surface.get() != bound && surface->context.device == context.device && surface->Overlaps(*bound)) surface->retired = true;
     }
+    bound->ApplyFastClear();
     bound->NoteWritten();
     return bound->View(target.mip);
+}
+
+std::uint64_t HtileSliceBytes(VkExtent2D extent) {
+    if (extent.width == 0 || extent.height == 0) return 0;
+    const auto blocksWide = (static_cast<std::uint64_t>(extent.width) + 1023u) / 1024u;
+    const auto blocksHigh = (static_cast<std::uint64_t>(extent.height) + 511u) / 512u;
+    return blocksWide * blocksHigh * 32768u;
+}
+
+bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t address, std::size_t bytes) {
+    const auto footprint = HtileSliceBytes(extent);
+    return htile != 0 && (htile & 0x7fffu) == 0 && footprint != 0 && address <= htile &&
+        bytes <= std::numeric_limits<std::uint64_t>::max() - address && htile - address <= bytes && footprint <= bytes - (htile - address);
+}
+
+void NoteDepthMetadataFill(VkDevice device, std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::lock_guard lock(surfacesMutex());
+    std::size_t candidates = 0;
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device == device && surface->AcceptsHtileFill() && HtileFillCovers(surface->htileAddress, surfaceExtent(surface->target), address, bytes)) ++candidates;
+    }
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device != device) continue;
+        surface->NoteHtileFill(address, bytes, candidates == 1u ? pattern : 0xffffffffu);
+    }
 }
 
 void ClearDepthSurfaces(VkDevice device) {
@@ -338,7 +423,9 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         (*found)->retired = true;
         return nullptr;
     }
-    return (*found)->Sampled(words, resource, components);
+    auto texture = (*found)->Sampled(words, resource, components);
+    (*found)->ApplyFastClear();
+    return texture;
 }
 
 bool DepthSurfaceHolds(const Context& context, std::span<const std::uint32_t> words, VkComponentMapping components, const Texture* texture) {
@@ -351,7 +438,9 @@ bool DepthSurfaceHolds(const Context& context, std::span<const std::uint32_t> wo
         return !surface->retired && surface->context.device == context.device && (surface->target.address == resource.baseAddress ||
             (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
     });
-    return found != list.rend() && (*found)->Holds(words, resource, components, texture);
+    if (found == list.rend() || !(*found)->Holds(words, resource, components, texture)) return false;
+    (*found)->ApplyFastClear();
+    return true;
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {

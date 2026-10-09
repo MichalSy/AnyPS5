@@ -87,6 +87,8 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
         return x->inputControlPoints == y->inputControlPoints && x->outputControlPoints == y->outputControlPoints && x->domain == y->domain && x->partitioning == y->partitioning && x->outputTopology == y->outputTopology;
     };
     if (s.stages.path != t.stages.path || s.stages.registerValue != t.stages.registerValue || s.stages.vertexWaveSize != t.stages.vertexWaveSize || s.stages.fragmentWaveSize != t.stages.fragmentWaveSize || !sameMesh(s.stages.mesh, t.stages.mesh) || !sameTess(s.stages.tessellation, t.stages.tessellation)) return false;
+    if (s.depth.has_value() != t.depth.has_value()) return false;
+    if (s.depth && (s.depth->htileAddress != t.depth->htileAddress || s.depth->htileStencil != t.depth->htileStencil)) return false;
     if (!sameColor(s.color, t.color) || s.colors.size() != t.colors.size() || s.blends.size() != t.blends.size()) return false;
     for (std::size_t i = 0; i < s.colors.size(); ++i) {
         if (!sameColor(s.colors[i], t.colors[i])) return false;

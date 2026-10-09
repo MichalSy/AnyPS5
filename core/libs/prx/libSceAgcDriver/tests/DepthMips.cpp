@@ -156,6 +156,58 @@ void InertDepthTests() {
     }
 }
 
+void HtileTests() {
+    Require(HtileSliceBytes({1920, 1080}) == 196608u, "HTILE misses hardware padding for 1920x1080");
+    Require(HtileSliceBytes({1804, 732}) == 131072u, "HTILE misses hardware padding for 1804x732");
+    Require(HtileSliceBytes({1024, 512}) == 32768u && HtileSliceBytes({1025, 513}) == 131072u,
+        "HTILE meta-block boundary rounding changed");
+    Require(HtileSliceBytes({1, 1}) == 32768u && HtileSliceBytes({0, 512}) == 0, "HTILE invalid extent or minimum block changed");
+    constexpr std::uint64_t metadata = 0x100000;
+    Require(HtileFillCovers(metadata, {1920, 1080}, metadata, 196608), "whole padded HTILE fill rejected");
+    Require(!HtileFillCovers(metadata, {1920, 1080}, metadata, 129600), "the unpadded ceil8 estimate cleared the surface");
+    Require(!HtileFillCovers(metadata, {1920, 1080}, metadata, 196604) && !HtileFillCovers(metadata, {1920, 1080}, metadata + 4, 196608),
+        "partial HTILE prefix or suffix cleared the surface");
+    Require(!HtileFillCovers(metadata, {64, 64}, metadata, static_cast<std::size_t>(-1)), "overflowing fill range accepted");
+    auto queue = Queue(0);
+    queue.context[0x010] = 3u | (24u << 4u) | (1u << 29u);
+    queue.context[0x005] = metadata >> 8u;
+    queue.context[0x01e] = 1u;
+    queue.context[0x2af] = 1u << 18u;
+    std::vector<RegisterRead> reads;
+    RegisterReadLog() = &reads;
+    State state{};
+    try { state = DecodeState(queue); } catch (...) { RegisterReadLog() = nullptr; throw; }
+    RegisterReadLog() = nullptr;
+    Require(state.depth && state.depth->htileAddress == (1ull << 40u) + metadata && !state.depth->htileStencil,
+        "single-sample pipe-aligned depth HTILE base decode changed");
+    for (const auto read : reads) Require(DrawKeyCovers(read), "draw key misses an HTILE register");
+    for (const auto surface : {0u, 1u << 19u, (1u << 18u) | (1u << 19u), (1u << 18u) | (3u << 19u)}) {
+        auto unsupported = queue;
+        unsupported.context[0x2af] = surface;
+        Require(DecodeState(unsupported).depth->htileAddress == 0, "non pipe-aligned or VRS HTILE enabled clears");
+    }
+    auto unsupported = queue;
+    unsupported.context.erase(0x2af);
+    Require(DecodeState(unsupported).depth->htileAddress == 0, "missing DB_HTILE_SURFACE assumed pipe alignment");
+    unsupported = queue;
+    unsupported.context[0x010] &= ~(1u << 29u);
+    Require(DecodeState(unsupported).depth->htileAddress == 0, "disabled HTILE enabled clears");
+    unsupported = queue;
+    unsupported.context[0x010] |= 1u << 16u;
+    Require(DecodeState(unsupported).depth->htileAddress == 0, "mipmapped HTILE enabled clears");
+    unsupported = queue;
+    unsupported.context[0x002] = View(0, 1);
+    Require(DecodeState(unsupported).depth->htileAddress == 0, "array-slice HTILE enabled clears");
+    unsupported = queue;
+    unsupported.context[0x011] = 1u | (24u << 4u);
+    unsupported.context[0x013] = unsupported.context[0x015] = 0x2000;
+    Require(DecodeState(unsupported).depth->htileAddress == 0 && DecodeState(unsupported).depth->htileStencil,
+        "stencil-in-HTILE was silently accepted by the depth-only path");
+    unsupported.context[0x011] |= 1u << 29u;
+    Require(DecodeState(unsupported).depth->htileAddress != 0 && !DecodeState(unsupported).depth->htileStencil,
+        "TILE_STENCIL_DISABLE prevented depth-only HTILE clears");
+}
+
 void LayoutTests() {
     const auto macro = ComputeElementMipLayout(TextureTileMode::kZ64KBX, 4, 512, 256, 3);
     constexpr std::array<std::uint64_t, 3> sizes{0x80000, 0x20000, 0x10000};
@@ -186,6 +238,7 @@ int main() {
         RegisterTests();
         InertDepthTests();
         LayoutTests();
+        HtileTests();
         std::puts("depth mip register decoding, slice strides and padded chain layout tests passed");
         return 0;
     } catch (const std::exception& error) {

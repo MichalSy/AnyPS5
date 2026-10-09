@@ -346,6 +346,18 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     depth.format = zFormat == 1 ? (stencil ? VK_FORMAT_D16_UNORM_S8_UINT : VK_FORMAT_D16_UNORM) : (stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT);
     depth.clearDepth = readFloat(cx, 0x00b);
     depth.clearStencil = static_cast<std::uint8_t>(read(cx, 0x00a) & 0xffu);
+    if ((zInfo & (1u << 29u)) != 0) {
+        const auto metadata = find(cx, 0x005);
+        const auto metadataSurface = find(cx, 0x2af);
+        depth.htileStencil = stencil && (read(cx, 0x011) & (1u << 29u)) == 0;
+        const bool pipeAligned = metadataSurface != cx.end() && (metadataSurface->second & (1u << 18u)) != 0;
+        const bool vrs = metadataSurface != cx.end() && (metadataSurface->second & (3u << 19u)) != 0;
+        if (metadata != cx.end() && pipeAligned && !vrs && !depth.htileStencil && zFormat != 0 &&
+            ((zInfo >> 4u) & 0x1fu) == 24u && mipCount == 1u && mip == 0u && slice == 0u && samples == VK_SAMPLE_COUNT_1_BIT) {
+            depth.htileAddress = base(0x005, 0x01e);
+            if ((depth.htileAddress & 0x7fffu) != 0) depth.htileAddress = 0;
+        }
+    }
     result.depth = depth;
     result.depthTest = (depthControl & 2u) != 0;
     result.depthWrite = result.depthTest && (depthControl & 4u) != 0 && !depthReadOnly;
