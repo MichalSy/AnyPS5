@@ -238,6 +238,18 @@ extern "C" void CopyGuestSignalMask_nid_no_patch(const void* nativeMask, std::ui
 }
 #endif
 
+struct GuestStack {
+    void* sp;
+    std::size_t size;
+    int flags;
+};
+static_assert(sizeof(GuestStack) == 24 && offsetof(GuestStack, flags) == 16);
+namespace {
+constexpr int SsDisable = 4;
+constexpr std::size_t MinSignalStackSize = 2048;
+thread_local GuestStack alternateStack{nullptr, 0, SsDisable};
+}
+
 extern "C" {
 int APS5_VABI sigaction_nid_postfix(int guest, const GuestSignalAction* action, GuestSignalAction* previous) {
 #ifdef _WIN32
@@ -292,6 +304,18 @@ int APS5_VABI raise_nid_postfix(int guest) {
     if (!native) return Fail(guestInvalid);
     const int result = std::raise(native);
     if (result) return Fail(guestInvalid);
+    return 0;
+}
+int APS5_VABI sigaltstack_nid_postfix(const GuestStack* stack, GuestStack* previous) {
+    GuestStack replacement = alternateStack;
+    if (stack != nullptr) {
+        if ((stack->flags & ~SsDisable) != 0) { *__error_nid_postfix() = 22; return -1; }
+        if (stack->flags & SsDisable) replacement.flags = SsDisable;
+        else if (stack->size < MinSignalStackSize) { *__error_nid_postfix() = 12; return -1; }
+        else replacement = {stack->sp, stack->size, 0};
+    }
+    if (previous != nullptr) *previous = alternateStack;
+    alternateStack = replacement;
     return 0;
 }
 int APS5_VABI _sigprocmask_nid_postfix(int how, const GuestSignalSet* set, GuestSignalSet* previousSet) {

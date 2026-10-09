@@ -3,6 +3,7 @@
 
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -29,29 +30,17 @@
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 
-#ifndef _WIN32
-namespace {
-std::mutex nativeThreadClocksLock;
-std::unordered_map<int, std::int32_t> nativeThreadClocks;
+static constexpr int GUEST_EINVAL = 22;
+static constexpr int GUEST_CLOCK_THREAD_CPUTIME_ID = 14;
 
-bool NativeThreadClock(int guestClock, clockid_t* nativeClock) {
-    std::lock_guard lock(nativeThreadClocksLock);
-    const auto found = nativeThreadClocks.find(guestClock);
-    if (found == nativeThreadClocks.end()) return false;
-    *nativeClock = found->second;
+static bool IsCpuClock(int clockId) {
+    const auto bits = static_cast<std::uint32_t>(clockId);
+    if ((bits & CPU_CLOCK_BIT) == 0)
+        return false;
+    if ((bits & CPU_CLOCK_PROCESS_BIT) != 0)
+        throw std::runtime_error("clock: unsupported process CPU clock_id " + std::to_string(clockId));
     return true;
 }
-}
-
-extern "C" int RegisterNativeThreadClock_nid_no_patch(std::int32_t nativeClockId) {
-    std::lock_guard lock(nativeThreadClocksLock);
-    for (const auto& [guest, native] : nativeThreadClocks)
-        if (native == nativeClockId) return guest;
-    const auto guest = 0x10000 + static_cast<int>(nativeThreadClocks.size());
-    nativeThreadClocks.emplace(guest, nativeClockId);
-    return guest;
-}
-#endif
 
 static std::uint64_t RawMonotonicNanos() {
 #ifdef _WIN32
@@ -350,22 +339,19 @@ static std::uint64_t ProcessCpuResolutionNanos() {
 #endif
 
 int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
-#ifndef _WIN32
-    clockid_t threadClock{};
-    if (clockId >= 0x10000 && NativeThreadClock(clockId, &threadClock)) {
-        if (!tp) { *__error_nid_postfix() = 14; return -1; }
-        timespec native{};
-        if (::clock_gettime(threadClock, &native) != 0) {
-            *__error_nid_postfix() = errno == ESRCH ? 3 : 22;
+    if (tp == nullptr) {
+        if (IsCpuClock(clockId)) { *__error_nid_postfix() = 14; return -1; }
+        APS5_INVALID_ARG_EX;
+    }
+    if (IsCpuClock(clockId)) {
+        std::uint64_t nanos = 0;
+        if (!GuestThreadCpuNanos(static_cast<int>(static_cast<std::uint32_t>(clockId) & CPU_CLOCK_ID_MASK), &nanos)) {
+            *__error_nid_postfix() = GUEST_EINVAL;
             return -1;
         }
-        tp->tv_sec = native.tv_sec;
-        tp->tv_nsec = native.tv_nsec;
+        tp->tv_sec = static_cast<std::int64_t>(nanos / 1000000000ULL);
+        tp->tv_nsec = static_cast<std::int64_t>(nanos % 1000000000ULL);
         return 0;
-    }
-#endif
-    if (tp == nullptr) {
-        APS5_INVALID_ARG_EX;
     }
     if (clockId == 1 || clockId == 2) {
         const std::uint64_t nanos = ProcessCpuNanos(clockId == 2);
@@ -478,24 +464,15 @@ int APS5_VABI gettimeofday_nid_postfix(KernelTimeval* tv, KernelTimezone* tz) {
 }
 
 int APS5_VABI clock_getres_nid_postfix(int clockId, KernelTimespec* res) {
-#ifndef _WIN32
-    clockid_t threadClock{};
-    if (clockId >= 0x10000 && NativeThreadClock(clockId, &threadClock)) {
-        timespec native{};
-        if (::clock_getres(threadClock, &native) != 0) {
-            *__error_nid_postfix() = errno == ESRCH ? 3 : 22;
-            return -1;
-        }
-        if (res) {
-            res->tv_sec = native.tv_sec;
-            res->tv_nsec = native.tv_nsec;
-        }
-        return 0;
-    }
-#endif
     if (res == nullptr) {
+        if (IsCpuClock(clockId)) {
+            KernelTimespec ignored{};
+            return clock_getres_nid_postfix(clockId, &ignored);
+        }
         APS5_INVALID_ARG_EX;
     }
+    if (IsCpuClock(clockId))
+        return clock_getres_nid_postfix(GUEST_CLOCK_THREAD_CPUTIME_ID, res);
     if (clockId == 1 || clockId == 2) {
         const std::uint64_t nanos = ProcessCpuResolutionNanos();
         res->tv_sec = static_cast<std::int64_t>(nanos / 1000000000ULL);

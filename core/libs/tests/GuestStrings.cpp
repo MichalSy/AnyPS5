@@ -25,6 +25,7 @@ int APS5_VABI memset_s_nid_postfix(void*, std::size_t, int, std::size_t);
 char* APS5_VABI strnstr_nid_postfix(const char*, const char*, std::size_t);
 int APS5_VABI snprintf_s_nid_postfix(char*, std::size_t, const char*, ...);
 int APS5_VABI sscanf_s_nid_postfix(const char*, const char*, ...);
+int APS5_VABI __inet_aton_nid_postfix(const char*, void*);
 }
 
 static void Require(bool condition) {
@@ -137,6 +138,28 @@ int main() {
     Require(strpbrk_nid_postfix(buffer, "ay") == buffer + 1);
     Require(strpbrk_nid_postfix(buffer, "") == nullptr);
     Require(strcspn_nid_postfix(buffer, "y") == 1);
+    const auto inetAton = [](const char* text, const char* expected) {
+        unsigned char address[4] = {0xA5, 0xA5, 0xA5, 0xA5};
+        if (__inet_aton_nid_postfix(text, address) != 1) return false;
+        char formatted[16];
+        std::snprintf(formatted, sizeof(formatted), "%u.%u.%u.%u", address[0], address[1], address[2], address[3]);
+        return std::strcmp(formatted, expected) == 0;
+    };
+    Require(inetAton("192.0.2.42", "192.0.2.42"));
+    Require(inetAton("10.1.2", "10.1.0.2"));
+    Require(inetAton("127.1", "127.0.0.1"));
+    Require(inetAton("3232235777", "192.168.1.1"));
+    Require(inetAton("0x7f.0.0.0x1", "127.0.0.1"));
+    Require(inetAton("0377.0.0.010", "255.0.0.8"));
+    Require(inetAton("1.2.3.4 trailing", "1.2.3.4"));
+    Require(inetAton("1.2.3.4\n", "1.2.3.4"));
+    Require(__inet_aton_nid_postfix("1.2.3.4", nullptr) == 1);
+    for (const char* invalid : {"", " 1.2.3.4", "1.2.3.4.5", "256.1.1.1", "1.2.3.256", "1.2.65536", "08", "1..2", "a.b.c.d",
+             "1.2.3.4x", "0x", "1.2.3.", "-1"}) {
+        unsigned char address[4] = {0xA5, 0xA5, 0xA5, 0xA5};
+        Require(__inet_aton_nid_postfix(invalid, address) == 0);
+        Require(address[0] == 0xA5 && address[3] == 0xA5);
+    }
     char first[] = ",a,,b,";
     char second[] = "x:y";
     char* firstState = nullptr;

@@ -43,6 +43,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap.py)
         add_test(NAME progress_report COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress.py)
+        add_test(NAME progress_encoding COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress_encoding.py)
         add_test(NAME import_audit COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_import_audit.py)
         add_test(NAME conventions_function_bodies COMMAND ${Python3_EXECUTABLE}
@@ -94,6 +96,11 @@ set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
 set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
 add_subdirectory(3rdparty/freetype EXCLUDE_FROM_ALL)
 set_target_properties(freetype PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(WIN32)
+    get_target_property(freetypeSources freetype SOURCES)
+    list(FILTER freetypeSources EXCLUDE REGEX "ftver\\.rc$")
+    set_target_properties(freetype PROPERTIES SOURCES "${freetypeSources}")
+endif()
 
 add_subdirectory(core/shader/recompiler)
 add_subdirectory(core/Decoder/Jpeg)

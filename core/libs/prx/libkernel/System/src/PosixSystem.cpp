@@ -135,7 +135,21 @@ int ReadSysctl(const int* name, unsigned nameLength, void* oldValue, std::size_t
     return Failure(2);
 }
 
-#ifndef _WIN32
+#ifdef _WIN32
+std::int64_t HostMemoryLimit() {
+    constexpr auto infinity = std::numeric_limits<std::int64_t>::max();
+    BOOL inJob = FALSE;
+    if (!IsProcessInJob(GetCurrentProcess(), nullptr, &inJob))
+        throw std::system_error(GetLastError(), std::system_category(), "getrlimit: IsProcessInJob failed");
+    if (!inJob) return infinity;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    if (!QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &limits, sizeof(limits), nullptr))
+        throw std::system_error(GetLastError(), std::system_category(), "getrlimit: QueryInformationJobObject failed");
+    if ((limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) == 0 || limits.ProcessMemoryLimit > static_cast<SIZE_T>(infinity))
+        return infinity;
+    return static_cast<std::int64_t>(limits.ProcessMemoryLimit);
+}
+#else
 int NativeResource(int resource) {
     switch (resource) {
         case 0: return RLIMIT_CPU;
@@ -162,15 +176,14 @@ std::int64_t GuestLimit(rlim_t value) {
 
 extern "C" {
 
-int APS5_VABI system_nid_postfix(const char* command) {
-    return command ? Failure(45) : 0;
-}
-
 int APS5_VABI getrlimit_nid_postfix(int resource, GuestResourceLimit* limit) {
-    if (!limit) return Failure(14);
     if (resource < 0 || resource > 14) return Failure(22);
+    if (!limit) return Failure(14);
 #ifdef _WIN32
-    return Failure(45);
+    if (resource != 2) return Failure(45);
+    const auto memory = HostMemoryLimit();
+    *limit = {memory, memory};
+    return 0;
 #else
     const int nativeResource = NativeResource(resource);
     if (nativeResource < 0) return Failure(45);

@@ -28,8 +28,8 @@ int main() {
     std::filesystem::remove(marker);
     const std::string command = "echo executed > \"" + marker.string() + "\"";
     *__error_nid_postfix() = 13;
-    Require(system_nid_postfix(nullptr) == 0 && *__error_nid_postfix() == 13, "shell capability is unavailable without altering errno");
-    Require(system_nid_postfix(command.c_str()) == -1 && *__error_nid_postfix() == 45, "shell command is explicitly unsupported");
+    Require(system_nid_postfix(nullptr) == 1 && *__error_nid_postfix() == 13, "FreeBSD shell capability probe preserves errno");
+    Require(system_nid_postfix(command.c_str()) == (127 << 8) && *__error_nid_postfix() == 13, "absent shell returns exit status 127 without changing errno");
     Require(!std::filesystem::exists(marker), "unsupported command must not execute");
 
     *__error_nid_postfix() = 13;

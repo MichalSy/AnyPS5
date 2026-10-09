@@ -96,13 +96,8 @@ int main() {
     KernelClockid clock = -1;
     Require(pthread_getcpuclockid_nid_postfix(nullptr, &clock) == 22);
     Require(clock == -1);
-    Require(pthread_getcpuclockid_nid_postfix(self, nullptr) == 22);
-#ifndef _WIN32
+    Require(pthread_getcpuclockid_nid_postfix(self, nullptr) == 14);
     Require(pthread_getcpuclockid_nid_postfix(self, &clock) == 0);
-#else
-    Require(pthread_getcpuclockid_nid_postfix(self, &clock) == 45 && clock == -1);
-    clock = 14;
-#endif
     Require(Nanos(clock) >= 0);
     KernelTimespec resolution{};
     Require(clock_getres_nid_postfix(clock, &resolution) == 0);
@@ -134,7 +129,9 @@ int main() {
     Require(resolution.tv_nsec > 0);
     Require(clock_getres_nid_postfix(workerClock, nullptr) == 0);
 #else
-    Require(pthread_getcpuclockid_nid_postfix(worker, &clock) == 45);
+    KernelClockid workerClock = -1;
+    Require(pthread_getcpuclockid_nid_postfix(worker, &workerClock) == 0);
+    Require(workerClock != clock);
 #endif
     stop.store(true, std::memory_order_release);
     Require(scePthreadJoin(worker, nullptr) == 0);

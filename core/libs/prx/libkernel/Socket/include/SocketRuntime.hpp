@@ -5,4 +5,5 @@ extern "C" {
 int GuestSocketClose_nid_no_patch(int descriptor);
 bool GuestSocketIsOpen_nid_no_patch(int descriptor);
 }
+int Family(int descriptor);
 }

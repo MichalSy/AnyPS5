@@ -400,6 +400,15 @@ int APS5_VABI stat_nid_postfix(const char* path, FileStat* sb) {
     return PosixResult(sceKernelStat(path, sb));
 }
 
+int APS5_VABI lstat_nid_postfix(const char* path, FileStat* sb) {
+    if (sb == nullptr) return PosixFailure(GUEST_EFAULT);
+    if (const int error = PathError(path)) return PosixFailure(error);
+    const GuestArena::HostWrite destination(sb, sizeof(*sb));
+    if (!destination.Open()) return PosixFailure(GUEST_EFAULT);
+    if (!File::FillLinkStat(ResolvePath_nid_no_patch(path), sb)) return PosixResult(SceErrorFromErrno(errno));
+    return 0;
+}
+
 int APS5_VABI unlink_nid_postfix(const char* path) {
     if (const int error = PathError(path)) return PosixFailure(error);
     return PosixResult(sceKernelUnlink(path));
@@ -760,6 +769,19 @@ int APS5_VABI futimes_nid_postfix(int d, const KernelTimeval* times) {
 
 int APS5_VABI fsync_nid_postfix(int fd) {
     return PosixResult(sceKernelFsync(fd));
+}
+
+int APS5_VABI fdatasync_nid_postfix(int fd) {
+    if (fd >= GuestSockets::FirstDescriptor) return PosixFailure(GuestSockets::GuestSocketIsOpen_nid_no_patch(fd) ? GUEST_EINVAL : GUEST_EBADF);
+    const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(fd);
+    if (!lease) return -1;
+    const int native = GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease);
+#ifdef _WIN32
+    if (::_commit(native) != 0) return PosixResult(SceErrorFromErrno(errno));
+#else
+    if (::fdatasync(native) != 0) return PosixResult(SceErrorFromErrno(errno));
+#endif
+    return 0;
 }
 
 }

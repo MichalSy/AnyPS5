@@ -166,6 +166,11 @@ void APS5_VABI exit_nid_postfix(int code) {
     std::_Exit(status);
 }
 
+int APS5_VABI system_nid_postfix(const char* command) {
+    constexpr int shellNotExecuted = 127 << 8;
+    return command == nullptr ? 1 : shellNotExecuted;
+}
+
 int APS5_VABI sceKernelGetCurrentCpu(void) {
 #ifdef _WIN32
     PROCESSOR_NUMBER processor{};
