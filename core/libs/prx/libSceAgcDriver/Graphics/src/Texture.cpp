@@ -1271,6 +1271,26 @@ bool StorageTexture::Refresh() {
             tracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stampedBlocks, cpuBlocks);
             compared = !tracked && compareUntracked(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), stampedBlocks, true);
             if (compared) cpuBlocks = stampedBlocks;
+            if (!tracked || keysChanged || !originalValid || original.size() != guestBytes || std::find(stampedBlocks.begin(), stampedBlocks.end(), GuestMemory::BlockMaybeWritten) == stampedBlocks.end()) return;
+            const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+            GuestMemory::FlushGpuWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+            tracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stampedBlocks, cpuBlocks);
+            compared = !tracked && compareUntracked(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), stampedBlocks, true);
+            if (compared) cpuBlocks = stampedBlocks;
+            if (!tracked || keysChanged || keys != uploadedKeys || !originalValid || original.size() != guestBytes) return;
+            constexpr std::uint64_t block = 65536;
+            const auto spanBegin = descriptor.baseAddress & ~(block - 1);
+            const auto stop = descriptor.baseAddress + guestBytes;
+            for (std::size_t index = 0; index < stampedBlocks.size(); ++index) {
+                if (stampedBlocks[index] != GuestMemory::BlockMaybeWritten || generations[index] == 0) continue;
+                const auto begin = std::max(descriptor.baseAddress, spanBegin + index * block);
+                const auto end = std::min(stop, spanBegin + (index + 1) * block);
+                const auto saved = std::span<const std::byte>(original).subspan(static_cast<std::size_t>(begin - descriptor.baseAddress), static_cast<std::size_t>(end - begin));
+                if (!GuestMemory::EqualsCommittedUnsynced(begin, saved)) continue;
+                stampedBlocks[index] = GuestMemory::BlockUnchanged;
+                cpuBlocks[index] = 0;
+                stamped = false;
+            }
         };
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = ProvedKeys();
