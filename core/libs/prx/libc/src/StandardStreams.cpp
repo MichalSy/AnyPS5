@@ -21,7 +21,7 @@ int APS5_VABI fgetc_nid_postfix(FileStream* stream) {
     const int result = std::fgetc(handle);
     const int nativeError = errno;
     stream->SyncStatus();
-    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::NativeError_nid_no_patch(nativeError) : savedError;
+    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::GuestFileNativeError_nid_no_patch(nativeError) : savedError;
     return result;
 }
 std::int32_t APS5_VABI fgetwc_nid_postfix(FileStream* stream) {
@@ -43,7 +43,7 @@ std::int32_t APS5_VABI ungetwc_nid_postfix(std::int32_t value, FileStream* strea
     const int result = std::ungetc(value, handle);
     const int nativeError = errno;
     stream->SyncStatus();
-    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::NativeError_nid_no_patch(nativeError) : savedError;
+    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::GuestFileNativeError_nid_no_patch(nativeError) : savedError;
     return result;
 }
 int APS5_VABI getc_nid_postfix(FileStream* stream) { return fgetc_nid_postfix(stream); }
@@ -57,7 +57,7 @@ int APS5_VABI fputc_nid_postfix(int value, FileStream* stream) {
     const int result = std::fputc(value, handle);
     const int nativeError = errno;
     stream->SyncStatus();
-    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::NativeError_nid_no_patch(nativeError) : savedError;
+    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::GuestFileNativeError_nid_no_patch(nativeError) : savedError;
     return result;
 }
 int APS5_VABI putc_nid_postfix(int value, FileStream* stream) { return fputc_nid_postfix(value, stream); }
@@ -71,7 +71,7 @@ int APS5_VABI ungetc_nid_postfix(int value, FileStream* stream) {
     const int result = std::ungetc(value, handle);
     const int nativeError = errno;
     stream->SyncStatus();
-    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::NativeError_nid_no_patch(nativeError) : savedError;
+    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::GuestFileNativeError_nid_no_patch(nativeError) : savedError;
     return result;
 }
 char* APS5_VABI fgets_nid_postfix(char* buffer, int size, FileStream* stream) {
@@ -82,7 +82,7 @@ char* APS5_VABI fgets_nid_postfix(char* buffer, int size, FileStream* stream) {
     auto* result = std::fgets(buffer, size, handle);
     const int nativeError = errno;
     stream->SyncStatus();
-    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::NativeError_nid_no_patch(nativeError) : savedError;
+    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::GuestFileNativeError_nid_no_patch(nativeError) : savedError;
     return result;
 }
 int APS5_VABI feof_nid_postfix(FileStream* stream) {

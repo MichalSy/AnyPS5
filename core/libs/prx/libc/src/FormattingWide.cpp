@@ -259,7 +259,7 @@ int APS5_VABI fputwc_nid_postfix(char16_t value, FileStream* stream) {
         if (!native) return -1;
         if (std::fwrite(bytes.data(), 1, bytes.size(), native) != bytes.size()) {
             stream->SyncStatus();
-            errno = GuestFiles::NativeError_nid_no_patch(errno);
+            errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
             return -1;
         }
         stream->SyncStatus();
@@ -279,7 +279,7 @@ int APS5_VABI fputws_nid_postfix(const char16_t* str, FileStream* stream) {
         if (!native) return -1;
         if (std::fwrite(bytes.data(), 1, bytes.size(), native) != bytes.size()) {
             stream->SyncStatus();
-            errno = GuestFiles::NativeError_nid_no_patch(errno);
+            errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
             return -1;
         }
         stream->SyncStatus();

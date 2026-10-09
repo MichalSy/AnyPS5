@@ -44,14 +44,14 @@ FileStream* APS5_VABI fdopen_nid_postfix(int descriptor, const char* mode) {
     std::string nativeMode;
     try { nativeMode = NativeFileMode(mode); }
     catch (const std::bad_alloc&) { errno = 12; return nullptr; }
-    const auto lease = GuestFiles::Acquire_nid_no_patch(descriptor);
+    const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(descriptor);
     if (!lease) return nullptr;
-    const int access = GuestFiles::AccessMode_nid_no_patch(lease);
+    const int access = GuestFiles::GuestFileAccessMode_nid_no_patch(lease);
     const int requested = std::strchr(mode, '+') ? 2 : *mode == 'r' ? 0 : 1;
     if ((requested == 2 && access != 2) || (requested == 0 && access == 1) || (requested == 1 && access == 0)) {
         errno = 22; return nullptr;
     }
-    const int duplicate = GuestFiles::DuplicateNative_nid_no_patch(lease);
+    const int duplicate = GuestFiles::GuestFileDuplicateNative_nid_no_patch(lease);
     if (duplicate < 0) return nullptr;
 #ifdef _WIN32
     auto* native = ::_fdopen(duplicate, nativeMode.c_str());
@@ -59,7 +59,7 @@ FileStream* APS5_VABI fdopen_nid_postfix(int descriptor, const char* mode) {
     auto* native = ::fdopen(duplicate, mode);
 #endif
     if (!native) {
-        const int error = GuestFiles::NativeError_nid_no_patch(errno);
+        const int error = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
 #ifdef _WIN32
         ::_close(duplicate);
 #else
@@ -107,24 +107,24 @@ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode
         errno = error;
         return nullptr;
     } catch (const std::bad_alloc&) { return failure(12); }
-      catch (const std::filesystem::filesystem_error& error) { return failure(GuestFiles::NativeError_nid_no_patch(error.code().value())); }
+      catch (const std::filesystem::filesystem_error& error) { return failure(GuestFiles::GuestFileNativeError_nid_no_patch(error.code().value())); }
 }
 
 FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) {
     if (!filename || !mode) { errno = 22; return nullptr; }
-    if (GuestFiles::InitializeStandards_nid_no_patch() != 0) return nullptr;
+    if (GuestFiles::GuestFileInitializeStandards_nid_no_patch() != 0) return nullptr;
     try {
         const auto path = ResolvePath_nid_no_patch(filename);
         const auto nativeMode = NativeFileMode(mode);
         std::unique_ptr<std::FILE, decltype(&std::fclose)> handle(std::fopen(path.string().c_str(), nativeMode.c_str()), std::fclose);
-        if (!handle) { errno = GuestFiles::NativeError_nid_no_patch(errno); return nullptr; }
+        if (!handle) { errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno); return nullptr; }
         const int access = std::strchr(mode, '+') ? 2 : *mode == 'r' ? 0 : 1;
         auto stream = std::make_unique<FileStream>(handle.get(), access, true);
         handle.release();
         if (WritesFile(mode)) RecordWrittenPath_nid_no_patch(path);
         return stream.release();
     } catch (const std::bad_alloc&) { errno = 12; return nullptr; }
-      catch (const std::filesystem::filesystem_error& error) { errno = GuestFiles::NativeError_nid_no_patch(error.code().value()); return nullptr; }
+      catch (const std::filesystem::filesystem_error& error) { errno = GuestFiles::GuestFileNativeError_nid_no_patch(error.code().value()); return nullptr; }
       catch (const std::system_error& error) { errno = error.code().value(); return nullptr; }
 }
 
@@ -183,7 +183,7 @@ size_t APS5_VABI fread_nid_postfix(void* buffer, size_t size, size_t count, File
     const auto result = std::fread(buffer, size, count, handle);
     const int nativeError = errno;
     stream->SyncStatus();
-    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::NativeError_nid_no_patch(nativeError) : savedError;
+    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::GuestFileNativeError_nid_no_patch(nativeError) : savedError;
     return result;
 }
 
@@ -197,7 +197,7 @@ size_t APS5_VABI fwrite_nid_postfix(const void* buffer, size_t size, size_t coun
     const auto result = std::fwrite(buffer, size, count, handle);
     const int nativeError = errno;
     stream->SyncStatus();
-    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::NativeError_nid_no_patch(nativeError) : savedError;
+    errno = nativeError != 0 && std::ferror(handle) ? GuestFiles::GuestFileNativeError_nid_no_patch(nativeError) : savedError;
     return result;
 }
 
@@ -213,7 +213,7 @@ int APS5_VABI fseeko_nid_postfix(FileStream* stream, std::int64_t offset, int or
 #endif
     const int nativeError = errno;
     stream->SyncStatus();
-    if (result) errno = GuestFiles::NativeError_nid_no_patch(nativeError);
+    if (result) errno = GuestFiles::GuestFileNativeError_nid_no_patch(nativeError);
     return result;
 }
 
@@ -226,7 +226,7 @@ std::int64_t APS5_VABI ftello_nid_postfix(FileStream* stream) {
     static_assert(sizeof(off_t) == 8);
     const auto result = ::ftello(handle);
 #endif
-    if (result == -1) errno = GuestFiles::NativeError_nid_no_patch(errno);
+    if (result == -1) errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
     return result;
 }
 
@@ -255,7 +255,7 @@ int APS5_VABI fputs_nid_postfix(const char* str, FileStream* stream) {
     if (!handle) return EOF;
     const int result = std::fputs(str, handle);
     stream->SyncStatus();
-    if (result == EOF) errno = GuestFiles::NativeError_nid_no_patch(errno);
+    if (result == EOF) errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
     return result;
 }
 
@@ -264,7 +264,7 @@ int APS5_VABI fflush_nid_postfix(FileStream* stream) {
     if (stream && !handle) return EOF;
     const int result = std::fflush(handle);
     if (stream) stream->SyncStatus();
-    if (result != 0) errno = GuestFiles::NativeError_nid_no_patch(errno);
+    if (result != 0) errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
     return result;
 }
 

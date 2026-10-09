@@ -85,7 +85,7 @@ public:
         if (cleanup) cleanup(descriptor);
         const int result = NativeClose(descriptor);
         const int error = errno;
-        errno = result == 0 ? saved : NativeError_nid_no_patch(error);
+        errno = result == 0 ? saved : GuestFileNativeError_nid_no_patch(error);
         return result;
     }
 };
@@ -123,7 +123,7 @@ Lease Create(OwnedNative& owned, int descriptor, int accessMode) {
 }
 }
 
-int InitializeStandards_nid_no_patch() {
+int GuestFileInitializeStandards_nid_no_patch() {
     const int saved = errno;
     auto& table = GetTable();
     std::array<Lease, 3> standards{};
@@ -139,7 +139,7 @@ int InitializeStandards_nid_no_patch() {
             if (!table.standardsPresent[descriptor]) continue;
             OwnedNative owned{NativeDuplicate(descriptor), nullptr};
             if (owned.descriptor < 0) {
-                const int error = NativeError_nid_no_patch(errno);
+                const int error = GuestFileNativeError_nid_no_patch(errno);
                 lock.unlock();
                 standards = {};
                 errno = error;
@@ -154,9 +154,9 @@ int InitializeStandards_nid_no_patch() {
     return 0;
 }
 
-Lease Acquire_nid_no_patch(int descriptor) {
+Lease GuestFileAcquire_nid_no_patch(int descriptor) {
     if (descriptor < 0 || descriptor >= 32768) { errno = 9; return {}; }
-    if (InitializeStandards_nid_no_patch() != 0) return {};
+    if (GuestFileInitializeStandards_nid_no_patch() != 0) return {};
     auto& table = GetTable();
     std::lock_guard lock(table.mutex);
     auto result = table.entries[descriptor];
@@ -164,11 +164,11 @@ Lease Acquire_nid_no_patch(int descriptor) {
     return result;
 }
 
-Lease AdoptOwned_nid_no_patch(int nativeDescriptor, int accessMode, NativeCleanup cleanup) {
+Lease GuestFileAdoptOwned_nid_no_patch(int nativeDescriptor, int accessMode, NativeCleanup cleanup) {
     OwnedNative owned{nativeDescriptor, cleanup};
     if (nativeDescriptor < 0) { errno = 9; return {}; }
     if (accessMode < 0 || accessMode > 2) { errno = 22; return {}; }
-    if (InitializeStandards_nid_no_patch() != 0) return {};
+    if (GuestFileInitializeStandards_nid_no_patch() != 0) return {};
     auto& table = GetTable();
     std::lock_guard lock(table.mutex);
     const int descriptor = FreeDescriptor(table);
@@ -180,14 +180,14 @@ Lease AdoptOwned_nid_no_patch(int nativeDescriptor, int accessMode, NativeCleanu
     } catch (const std::bad_alloc&) { errno = 12; return {}; }
 }
 
-std::array<Lease, 2> AdoptPairOwned_nid_no_patch(int first, int second,
+std::array<Lease, 2> GuestFileAdoptPairOwned_nid_no_patch(int first, int second,
     int firstAccessMode, int secondAccessMode, NativeCleanup cleanup) {
     OwnedNative firstOwned{first, cleanup}, secondOwned{second == first ? -1 : second, cleanup};
     if (first < 0 || second < 0) { errno = 9; return {}; }
     if (first == second || firstAccessMode < 0 || firstAccessMode > 2 || secondAccessMode < 0 || secondAccessMode > 2) {
         errno = 22; return {};
     }
-    if (InitializeStandards_nid_no_patch() != 0) return {};
+    if (GuestFileInitializeStandards_nid_no_patch() != 0) return {};
     auto& table = GetTable();
     std::array<Lease, 2> result;
     std::unique_lock lock(table.mutex);
@@ -203,7 +203,7 @@ std::array<Lease, 2> AdoptPairOwned_nid_no_patch(int first, int second,
     } catch (const std::bad_alloc&) { lock.unlock(); result = {}; errno = 12; return {}; }
 }
 
-Lease ReplaceOwnedMatching_nid_no_patch(const Identity& expected, int nativeDescriptor,
+Lease GuestFileReplaceOwnedMatching_nid_no_patch(const Identity& expected, int nativeDescriptor,
     int accessMode, NativeCleanup cleanup) {
     OwnedNative owned{nativeDescriptor, cleanup};
     if (nativeDescriptor < 0) { errno = 9; return {}; }
@@ -224,9 +224,9 @@ Lease ReplaceOwnedMatching_nid_no_patch(const Identity& expected, int nativeDesc
     return replacement;
 }
 
-int Close_nid_no_patch(int descriptor) {
+int GuestFileClose_nid_no_patch(int descriptor) {
     if (descriptor < 0 || descriptor >= 32768) { errno = 9; return -1; }
-    if (InitializeStandards_nid_no_patch() != 0) return -1;
+    if (GuestFileInitializeStandards_nid_no_patch() != 0) return -1;
     auto& table = GetTable();
     Lease retired;
     {
@@ -237,7 +237,7 @@ int Close_nid_no_patch(int descriptor) {
     return CloseRetired(retired);
 }
 
-int CloseMatching_nid_no_patch(const Identity& expected) {
+int GuestFileCloseMatching_nid_no_patch(const Identity& expected) {
     auto previous = expected.lock();
     if (!previous) { errno = 9; return -1; }
     const int descriptor = previous->LogicalDescriptor();
@@ -252,7 +252,7 @@ int CloseMatching_nid_no_patch(const Identity& expected) {
     return CloseRetired(retired);
 }
 
-bool Matches_nid_no_patch(const Identity& expected) {
+bool GuestFileMatches_nid_no_patch(const Identity& expected) {
     const auto entry = expected.lock();
     if (!entry) { errno = 9; return false; }
     auto& table = GetTable();
@@ -262,18 +262,18 @@ bool Matches_nid_no_patch(const Identity& expected) {
     return false;
 }
 
-int NativeDescriptor_nid_no_patch(const Lease& lease) { return lease ? lease->NativeDescriptor() : -1; }
-int LogicalDescriptor_nid_no_patch(const Lease& lease) { return lease ? lease->LogicalDescriptor() : -1; }
-int AccessMode_nid_no_patch(const Lease& lease) { return lease ? lease->AccessMode() : -1; }
+int GuestFileNativeDescriptor_nid_no_patch(const Lease& lease) { return lease ? lease->NativeDescriptor() : -1; }
+int GuestFileLogicalDescriptor_nid_no_patch(const Lease& lease) { return lease ? lease->LogicalDescriptor() : -1; }
+int GuestFileAccessMode_nid_no_patch(const Lease& lease) { return lease ? lease->AccessMode() : -1; }
 
-int DuplicateNative_nid_no_patch(const Lease& lease) {
+int GuestFileDuplicateNative_nid_no_patch(const Lease& lease) {
     if (!lease) { errno = 9; return -1; }
     const int result = NativeDuplicate(lease->NativeDescriptor());
-    if (result < 0) errno = NativeError_nid_no_patch(errno);
+    if (result < 0) errno = GuestFileNativeError_nid_no_patch(errno);
     return result;
 }
 
-int NativeError_nid_no_patch(int nativeError) {
+int GuestFileNativeError_nid_no_patch(int nativeError) {
     if (nativeError == 0) return 0;
 #ifdef EPERM
     if (nativeError == EPERM) return 1;

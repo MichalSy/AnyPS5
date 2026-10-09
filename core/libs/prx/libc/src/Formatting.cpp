@@ -202,7 +202,7 @@ int APS5_VABI vfprintf_nid_postfix(FileStream* stream, const char* format, VaLis
     va_end(copy);
 #endif
     stream->SyncStatus();
-    if (result < 0 && std::ferror(native)) errno = GuestFiles::NativeError_nid_no_patch(errno);
+    if (result < 0 && std::ferror(native)) errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
     return result;
 }
 
@@ -238,7 +238,7 @@ int APS5_VABI fscanf_nid_postfix(FileStream* stream, const char* format, ...) {
     va_end(args);
 #endif
     stream->SyncStatus();
-    if (result < 0 && std::ferror(native)) errno = GuestFiles::NativeError_nid_no_patch(errno);
+    if (result < 0 && std::ferror(native)) errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
     return result;
 }
 
@@ -452,7 +452,7 @@ int APS5_VABI puts_nid_postfix(const char* s) {
     if (!native) return EOF;
     const int result = std::fputs(s, native) == EOF ? EOF : std::fputc('\n', native);
     _Stdout_nid_postfix.SyncStatus();
-    if (result == EOF) errno = GuestFiles::NativeError_nid_no_patch(errno);
+    if (result == EOF) errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
     return result;
 }
 

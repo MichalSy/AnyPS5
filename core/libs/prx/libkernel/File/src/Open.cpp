@@ -110,7 +110,7 @@ static int SceErrorFromGuest(int error) {
 }
 
 static int SceErrorFromErrno(int error) {
-    return SceErrorFromGuest(GuestFiles::NativeError_nid_no_patch(error));
+    return SceErrorFromGuest(GuestFiles::GuestFileNativeError_nid_no_patch(error));
 }
 
 extern "C" {
@@ -119,7 +119,7 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     if (path == nullptr) return SCE_KERNEL_ERROR_EFAULT;
     if (*path == '\0') return SCE_KERNEL_ERROR_ENOENT;
     if ((flags & SCE_KERNEL_O_ACCMODE) == SCE_KERNEL_O_ACCMODE) return SCE_KERNEL_ERROR_EINVAL;
-    if (GuestFiles::InitializeStandards_nid_no_patch() != 0) return SceErrorFromGuest(errno);
+    if (GuestFiles::GuestFileInitializeStandards_nid_no_patch() != 0) return SceErrorFromGuest(errno);
     const int nativeFlags = MapFlags(flags);
     APS5_LOG_OUT("path=%s flags=0x%X nativeFlags=0x%X mode=0%o", path, flags, nativeFlags, mode);
     auto native = ResolvePath_nid_no_patch(path);
@@ -131,42 +131,42 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     }
 #endif
     if (fd < 0) return SceErrorFromErrno(errno);
-    const auto lease = GuestFiles::AdoptOwned_nid_no_patch(fd, flags & SCE_KERNEL_O_ACCMODE, NativeCleanup);
+    const auto lease = GuestFiles::GuestFileAdoptOwned_nid_no_patch(fd, flags & SCE_KERNEL_O_ACCMODE, NativeCleanup);
     if (!lease) return SceErrorFromGuest(errno);
     if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY || (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)))
         RecordWrittenPath_nid_no_patch(native);
-    return GuestFiles::LogicalDescriptor_nid_no_patch(lease);
+    return GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(lease);
 }
 
 int APS5_VABI sceKernelClose(int d) {
-    return GuestFiles::Close_nid_no_patch(d) == 0 ? 0 : SceErrorFromGuest(errno);
+    return GuestFiles::GuestFileClose_nid_no_patch(d) == 0 ? 0 : SceErrorFromGuest(errno);
 }
 
 std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
-    const auto lease = GuestFiles::Acquire_nid_no_patch(d);
+    const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(d);
     if (!lease) return SceErrorFromGuest(errno);
-    if (GuestFiles::AccessMode_nid_no_patch(lease) == 1) return SCE_KERNEL_ERROR_EBADF;
+    if (GuestFiles::GuestFileAccessMode_nid_no_patch(lease) == 1) return SCE_KERNEL_ERROR_EBADF;
     if (buf == nullptr && nbytes != 0) return SCE_KERNEL_ERROR_EFAULT;
     const GuestArena::HostWrite destination(buf, nbytes);
     if (!destination.Open()) return SCE_KERNEL_ERROR_EFAULT;
-    const auto result = NativeRead(GuestFiles::NativeDescriptor_nid_no_patch(lease), buf, nbytes);
+    const auto result = NativeRead(GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease), buf, nbytes);
     return result < 0 ? SceErrorFromErrno(errno) : static_cast<std::int64_t>(result);
 }
 
 std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes) {
-    const auto lease = GuestFiles::Acquire_nid_no_patch(d);
+    const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(d);
     if (!lease) return SceErrorFromGuest(errno);
-    if (GuestFiles::AccessMode_nid_no_patch(lease) == 0) return SCE_KERNEL_ERROR_EBADF;
+    if (GuestFiles::GuestFileAccessMode_nid_no_patch(lease) == 0) return SCE_KERNEL_ERROR_EBADF;
     if (buf == nullptr && nbytes != 0) return SCE_KERNEL_ERROR_EFAULT;
-    const auto result = NativeWrite(GuestFiles::NativeDescriptor_nid_no_patch(lease), buf, nbytes);
+    const auto result = NativeWrite(GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease), buf, nbytes);
     return result < 0 ? SceErrorFromErrno(errno) : static_cast<std::int64_t>(result);
 }
 
 std::int64_t APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
     if (whence < 0 || whence > 2) return SCE_KERNEL_ERROR_EINVAL;
-    const auto lease = GuestFiles::Acquire_nid_no_patch(d);
+    const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(d);
     if (!lease) return SceErrorFromGuest(errno);
-    const auto result = NativeLseek(GuestFiles::NativeDescriptor_nid_no_patch(lease), offset, whence);
+    const auto result = NativeLseek(GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease), offset, whence);
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 

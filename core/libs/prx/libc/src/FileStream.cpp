@@ -63,14 +63,14 @@ int ModeAccess(const char* mode) {
 }
 
 FileStreamState* CreateState(std::FILE* handle, const GuestFiles::Lease& lease) {
-    return new FileStreamState{handle, lease, GuestFiles::LogicalDescriptor_nid_no_patch(lease)};
+    return new FileStreamState{handle, lease, GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(lease)};
 }
 
 GuestFiles::Lease AdoptStream(std::FILE* handle, int accessMode) {
-    if (GuestFiles::InitializeStandards_nid_no_patch() != 0) return {};
+    if (GuestFiles::GuestFileInitializeStandards_nid_no_patch() != 0) return {};
     const int descriptor = NativeDuplicate(NativeDescriptor(handle));
-    if (descriptor < 0) { errno = GuestFiles::NativeError_nid_no_patch(errno); return {}; }
-    return GuestFiles::AdoptOwned_nid_no_patch(descriptor, accessMode);
+    if (descriptor < 0) { errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno); return {}; }
+    return GuestFiles::GuestFileAdoptOwned_nid_no_patch(descriptor, accessMode);
 }
 }
 
@@ -80,13 +80,13 @@ FileStream::FileStream(std::FILE* handle, bool dynamic) : dynamic(dynamic) {
         const int descriptor = handle == stdin ? 0 : handle == stdout ? 1 : 2;
         _guest.flags = descriptor == 0 ? 4 : 8;
         _guest.descriptor = static_cast<std::int16_t>(descriptor);
-        const auto lease = GuestFiles::Acquire_nid_no_patch(descriptor);
+        const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(descriptor);
         if (!lease) { state = new FileStreamState{nullptr, {}, descriptor}; return; }
-        const int duplicate = GuestFiles::DuplicateNative_nid_no_patch(lease);
+        const int duplicate = GuestFiles::GuestFileDuplicateNative_nid_no_patch(lease);
         if (duplicate < 0) { state = new FileStreamState{nullptr, lease, descriptor}; return; }
         auto* native = AttachNative(duplicate, descriptor == 0 ? "rb" : "wb");
         if (!native) {
-            const int error = GuestFiles::NativeError_nid_no_patch(errno);
+            const int error = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
             NativeClose(duplicate);
             state = new FileStreamState{nullptr, lease, descriptor};
             errno = error;
@@ -100,7 +100,7 @@ FileStream::FileStream(std::FILE* handle, bool dynamic) : dynamic(dynamic) {
     const auto lease = AdoptStream(handle, AccessMode(handle));
     if (!lease) throw std::system_error(errno, std::generic_category(), "FileStream: descriptor adoption failed");
     try { state = CreateState(handle, lease); }
-    catch (...) { GuestFiles::CloseMatching_nid_no_patch(lease); throw; }
+    catch (...) { GuestFiles::GuestFileCloseMatching_nid_no_patch(lease); throw; }
     _guest.flags = 0x10;
     _guest.descriptor = static_cast<std::int16_t>(state->descriptor);
 }
@@ -110,13 +110,13 @@ FileStream::FileStream(std::FILE* handle, int accessMode, bool dynamic) : dynami
     const auto lease = AdoptStream(handle, accessMode);
     if (!lease) throw std::system_error(errno, std::generic_category(), "FileStream: descriptor adoption failed");
     try { state = CreateState(handle, lease); }
-    catch (...) { GuestFiles::CloseMatching_nid_no_patch(lease); throw; }
+    catch (...) { GuestFiles::GuestFileCloseMatching_nid_no_patch(lease); throw; }
     _guest.flags = 0x10;
     _guest.descriptor = static_cast<std::int16_t>(state->descriptor);
 }
 
 FileStream::FileStream(std::FILE* handle, const GuestFiles::Lease& lease, bool dynamic) : dynamic(dynamic) {
-    if (!handle || !lease || !GuestFiles::Matches_nid_no_patch(lease))
+    if (!handle || !lease || !GuestFiles::GuestFileMatches_nid_no_patch(lease))
         throw std::system_error(9, std::generic_category(), "FileStream: invalid descriptor identity");
     state = CreateState(handle, lease);
     _guest.flags = 0x10;
@@ -131,7 +131,7 @@ FileStream::~FileStream() {
 }
 
 std::FILE* FileStream::GetHandle() {
-    if (state && state->handle && GuestFiles::Matches_nid_no_patch(state->identity)) return state->handle;
+    if (state && state->handle && GuestFiles::GuestFileMatches_nid_no_patch(state->identity)) return state->handle;
     _guest.flags = static_cast<std::int16_t>(_guest.flags | 0x40);
     _guest.readRemaining = 0;
     _guest.writeRemaining = 0;
@@ -152,24 +152,24 @@ bool FileStream::Reopen(const char* filename, const char* mode) {
     std::unique_ptr<std::FILE, decltype(&std::fclose)> replacement(std::freopen(filename, mode, previous), std::fclose);
     const int openError = errno;
     if (!replacement) {
-        GuestFiles::CloseMatching_nid_no_patch(expected);
+        GuestFiles::GuestFileCloseMatching_nid_no_patch(expected);
         _guest = {};
-        errno = GuestFiles::NativeError_nid_no_patch(openError);
+        errno = GuestFiles::GuestFileNativeError_nid_no_patch(openError);
         return false;
     }
     const int duplicate = NativeDuplicate(NativeDescriptor(replacement.get()));
     if (duplicate < 0) {
-        const int error = GuestFiles::NativeError_nid_no_patch(errno);
-        GuestFiles::CloseMatching_nid_no_patch(expected);
+        const int error = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
+        GuestFiles::GuestFileCloseMatching_nid_no_patch(expected);
         _guest = {};
         replacement.reset();
         errno = error;
         return false;
     }
-    const auto lease = GuestFiles::ReplaceOwnedMatching_nid_no_patch(expected, duplicate, ModeAccess(mode));
+    const auto lease = GuestFiles::GuestFileReplaceOwnedMatching_nid_no_patch(expected, duplicate, ModeAccess(mode));
     if (!lease) {
         const int error = errno;
-        GuestFiles::CloseMatching_nid_no_patch(expected);
+        GuestFiles::GuestFileCloseMatching_nid_no_patch(expected);
         _guest = {};
         replacement.reset();
         errno = error;
@@ -177,7 +177,7 @@ bool FileStream::Reopen(const char* filename, const char* mode) {
     }
     state->handle = replacement.release();
     state->identity = lease;
-    state->descriptor = GuestFiles::LogicalDescriptor_nid_no_patch(lease);
+    state->descriptor = GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(lease);
     _guest = {};
     _guest.flags = 0x10;
     _guest.descriptor = static_cast<std::int16_t>(state->descriptor);
@@ -209,7 +209,7 @@ void FileStream::ClearError() {
 int FileStream::Close() {
     if (!state || !state->handle) { errno = 9; return EOF; }
     const int saved = errno;
-    const int logicalResult = GuestFiles::CloseMatching_nid_no_patch(state->identity);
+    const int logicalResult = GuestFiles::GuestFileCloseMatching_nid_no_patch(state->identity);
     const int logicalError = errno;
     const int nativeResult = std::fclose(std::exchange(state->handle, nullptr));
     const int nativeError = errno;
@@ -217,7 +217,7 @@ int FileStream::Close() {
     _guest = {};
     encodingError = false;
     if (logicalResult != 0) { errno = logicalError; return EOF; }
-    if (nativeResult != 0) { errno = GuestFiles::NativeError_nid_no_patch(nativeError); return EOF; }
+    if (nativeResult != 0) { errno = GuestFiles::GuestFileNativeError_nid_no_patch(nativeError); return EOF; }
     errno = saved;
     return 0;
 }

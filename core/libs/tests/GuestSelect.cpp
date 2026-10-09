@@ -129,9 +129,9 @@ int main() {
     int sockets[2];
     Require(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0, "create native socket pair");
     Require(::write(sockets[1], &message, 1) == 1, "write native socket");
-    auto socketLease = GuestFiles::AdoptOwned_nid_no_patch(sockets[0], 2);
+    auto socketLease = GuestFiles::GuestFileAdoptOwned_nid_no_patch(sockets[0], 2);
     Require(static_cast<bool>(socketLease), "adopt owned native socket privately");
-    sockets[0] = GuestFiles::LogicalDescriptor_nid_no_patch(socketLease);
+    sockets[0] = GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(socketLease);
     socketLease.reset();
     reads = {};
     DescriptorSet writes{};
@@ -159,9 +159,9 @@ int main() {
     const int highNative = ::fcntl(privatePipe[0], F_DUPFD_CLOEXEC, 1024);
     Require(highNative >= 1024, "native descriptor exceeds guest fd_set range");
     Require(::close(privatePipe[0]) == 0, "close original private pipe reader");
-    auto highLease = GuestFiles::AdoptOwned_nid_no_patch(highNative, 0);
+    auto highLease = GuestFiles::GuestFileAdoptOwned_nid_no_patch(highNative, 0);
     Require(static_cast<bool>(highLease), "adopt private high native descriptor");
-    const int highGuest = GuestFiles::LogicalDescriptor_nid_no_patch(highLease);
+    const int highGuest = GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(highLease);
     Require(highGuest < 1024 && highGuest != highNative, "logical descriptor remains representable independently");
     highLease.reset();
     Require(::write(privatePipe[1], &message, 1) == 1, "prepare high native descriptor readability");

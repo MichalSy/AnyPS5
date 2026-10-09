@@ -96,7 +96,7 @@ int PollNative(std::vector<KernelSocketPoll::Entry>& entries, const std::vector<
         native.push_back({descriptors[index], events, 0});
     }
     const auto started = std::chrono::steady_clock::now();
-    const auto errorResult = [] { return -GuestFiles::NativeError_nid_no_patch(errno); };
+    const auto errorResult = [] { return -GuestFiles::GuestFileNativeError_nid_no_patch(errno); };
     const int result = ::poll(native.data(), static_cast<nfds_t>(native.size()), timeoutMilliseconds);
     if (result < 0) return errorResult();
     for (std::size_t index = 0; index < entries.size(); ++index) {
@@ -178,9 +178,9 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
     nativeLeases.reserve(nativeEntries.size());
     nativeDescriptors.reserve(nativeEntries.size());
     for (const auto& entry : nativeEntries) {
-        auto lease = GuestFiles::Acquire_nid_no_patch(entry.descriptor);
+        auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(entry.descriptor);
         if (!lease) return fail(GuestEbadf);
-        nativeDescriptors.push_back(GuestFiles::NativeDescriptor_nid_no_patch(lease));
+        nativeDescriptors.push_back(GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease));
         nativeLeases.push_back(std::move(lease));
     }
     for (;;) {

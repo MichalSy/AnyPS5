@@ -32,9 +32,9 @@ void Require(bool value, const char* message) {
 }
 
 void Nonblocking(int descriptor) {
-    const auto lease = GuestFiles::Acquire_nid_no_patch(descriptor);
+    const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(descriptor);
     Require(static_cast<bool>(lease), "logical pipe lookup failed");
-    const int native = GuestFiles::NativeDescriptor_nid_no_patch(lease);
+    const int native = GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease);
     const int flags = ::fcntl(native, F_GETFL);
     Require(flags >= 0 && ::fcntl(native, F_SETFL, flags | O_NONBLOCK) == 0,
         "nonblocking native pipe configuration failed");
@@ -75,9 +75,9 @@ void WriteStickyError() {
     std::array<char, 4096> bytes{};
     std::size_t filled = 0;
     {
-        const auto lease = GuestFiles::Acquire_nid_no_patch(descriptors[1]);
+        const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(descriptors[1]);
         Require(static_cast<bool>(lease), "write pipe lease failed");
-        const int native = GuestFiles::NativeDescriptor_nid_no_patch(lease);
+        const int native = GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease);
         while (true) {
             const auto count = ::write(native, bytes.data(), bytes.size());
             if (count < 0) { Require(errno == EAGAIN || errno == EWOULDBLOCK, "pipe fill failed unexpectedly"); break; }

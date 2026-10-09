@@ -39,13 +39,13 @@ int APS5_VABI isatty_nid_postfix(int descriptor) {
     constexpr int GuestEbadf = 9, GuestEnotty = 25;
     if (descriptor < 0) { Failure(GuestEbadf); return 0; }
     if (descriptor >= GuestSockets::FirstDescriptor) {
-        Failure(GuestSockets::IsOpen(descriptor) ? GuestEnotty : GuestEbadf);
+        Failure(GuestSockets::GuestSocketIsOpen_nid_no_patch(descriptor) ? GuestEnotty : GuestEbadf);
         return 0;
     }
     const int savedError = *__error_nid_postfix();
-    const auto lease = GuestFiles::Acquire_nid_no_patch(descriptor);
+    const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(descriptor);
     if (!lease) { Failure(errno); return 0; }
-    const int nativeDescriptor = GuestFiles::NativeDescriptor_nid_no_patch(lease);
+    const int nativeDescriptor = GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease);
     errno = 0;
 #ifdef _WIN32
     const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);

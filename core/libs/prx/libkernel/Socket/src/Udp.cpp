@@ -170,12 +170,12 @@ void GuestAddress(const sockaddr_storage& native, void* output, std::uint32_t* l
 }
 }
 
-int GuestSockets::Close(int descriptor) {
+int GuestSockets::GuestSocketClose_nid_no_patch(int descriptor) {
     std::lock_guard lock(socketsMutex);
     return sockets.erase(descriptor) ? 0 : Fail(9);
 }
 
-bool GuestSockets::IsOpen(int descriptor) {
+bool GuestSockets::GuestSocketIsOpen_nid_no_patch(int descriptor) {
     std::lock_guard lock(socketsMutex);
     return sockets.contains(descriptor);
 }

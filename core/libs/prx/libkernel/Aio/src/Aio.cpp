@@ -106,8 +106,8 @@ std::int64_t NativePwrite(std::int32_t fd, const void* buf, std::size_t nbyte, s
 }
 
 bool RunRequest(KernelAioRwRequest& req, bool write) {
-    const auto lease = GuestFiles::Acquire_nid_no_patch(req.fd);
-    const auto native = lease ? GuestFiles::NativeDescriptor_nid_no_patch(lease) : -1;
+    const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(req.fd);
+    const auto native = lease ? GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease) : -1;
     const std::int64_t done = !lease ? -1 : write
         ? NativePwrite(native, req.buf, req.nbyte, req.offset)
         : NativePread(native, req.buf, req.nbyte, req.offset);

@@ -60,7 +60,7 @@ public:
 
 static int CheckNativeInode(const GuestFiles::Lease& lease, const char* path) {
     Require(lease != nullptr, "a real guest entry lease must exist");
-    const int native = GuestFiles::NativeDescriptor_nid_no_patch(lease);
+    const int native = GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease);
     struct stat expected{}, actual{};
     Require(::stat(path, &expected) == 0 && ::fstat(native, &actual) == 0, "leased native descriptor must be stat-able");
     Require(expected.st_dev == actual.st_dev && expected.st_ino == actual.st_ino, "leased native descriptor must own the intended inode");
@@ -81,7 +81,7 @@ static void CheckPrivateReuse(int native, const GuestFiles::Identity& retired) {
     }
     struct stat expected{}, actual{};
     Require(::fstat(native, &expected) == 0, "private maps inode must be recorded");
-    Require(GuestFiles::CloseMatching_nid_no_patch(retired) == -1 && *__error_nid_postfix() == 9,
+    Require(GuestFiles::GuestFileCloseMatching_nid_no_patch(retired) == -1 && *__error_nid_postfix() == 9,
         "expired identity cleanup must report EBADF");
     Require(::fstat(native, &actual) == 0 && actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino,
         "expired entry cleanup must leave reused private ownership intact");
@@ -99,9 +99,9 @@ static void CheckLeaseClose() {
     GuestFiles::Identity identity;
     std::atomic<int> phase{0};
     std::thread worker([&] {
-        auto lease = GuestFiles::Acquire_nid_no_patch(guest);
+        auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(guest);
         native = CheckNativeInode(lease, oldFile.path.c_str());
-        Require(GuestFiles::LogicalDescriptor_nid_no_patch(lease) == guest && GuestFiles::AccessMode_nid_no_patch(lease) == 0,
+        Require(GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(lease) == guest && GuestFiles::GuestFileAccessMode_nid_no_patch(lease) == 0,
             "lease metadata must preserve logical ID and read-only access");
         identity = lease;
         phase.store(1);
@@ -118,18 +118,18 @@ static void CheckLeaseClose() {
     WaitFor(phase, 1);
     Require(sceKernelClose(guest) == 0, "logical close must complete while another thread pins the native entry");
     Require(::fcntl(native, F_GETFD) >= 0, "in-flight lease must keep the old native descriptor alive");
-    Require(!GuestFiles::Acquire_nid_no_patch(guest) && *__error_nid_postfix() == 9, "new lookup must fail immediately after logical close");
+    Require(!GuestFiles::GuestFileAcquire_nid_no_patch(guest) && *__error_nid_postfix() == 9, "new lookup must fail immediately after logical close");
     const int replacement = sceKernelOpen(newFile.path.c_str(), 0, 0);
     Require(replacement == guest, "a NEW guest open must reuse the retired logical ID while old IO remains pinned");
     {
-        const auto lease = GuestFiles::Acquire_nid_no_patch(replacement);
+        const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(replacement);
         Require(CheckNativeInode(lease, newFile.path.c_str()) != native, "new logical ownership must use a different native inode and descriptor");
     }
     std::array<char, 2> prefix{};
     Require(sceKernelRead(replacement, prefix.data(), prefix.size()) == 2 && prefix[0] == 'r' && prefix[1] == 'e',
         "replacement payload and position must be real");
-    Require(!GuestFiles::Matches_nid_no_patch(identity), "old identity must not match the reused logical entry");
-    Require(GuestFiles::CloseMatching_nid_no_patch(identity) == -1 && *__error_nid_postfix() == 9,
+    Require(!GuestFiles::GuestFileMatches_nid_no_patch(identity), "old identity must not match the reused logical entry");
+    Require(GuestFiles::GuestFileCloseMatching_nid_no_patch(identity) == -1 && *__error_nid_postfix() == 9,
         "old identity close must not retire the new logical entry");
     phase.store(2);
     WaitFor(phase, 3);
@@ -145,7 +145,7 @@ static void CheckLeaseClose() {
 static void CheckCloseRace() {
     Seed file("old-payload");
     const int guest = sceKernelOpen(file.path.c_str(), 0, 0);
-    auto initial = GuestFiles::Acquire_nid_no_patch(guest);
+    auto initial = GuestFiles::GuestFileAcquire_nid_no_patch(guest);
     const int native = CheckNativeInode(initial, file.path.c_str());
     const GuestFiles::Identity identity = initial;
     initial.reset();
@@ -178,9 +178,9 @@ static void CheckBlockedRead() {
     Seed replacementFile("replacement");
     int ends[2] = {-1, -1};
     Require(pipe_nid_postfix(ends) == 0, "guest pipe must open");
-    auto initial = GuestFiles::Acquire_nid_no_patch(ends[0]);
+    auto initial = GuestFiles::GuestFileAcquire_nid_no_patch(ends[0]);
     Require(initial != nullptr, "read pipe must have a real guest entry");
-    const int native = GuestFiles::NativeDescriptor_nid_no_patch(initial);
+    const int native = GuestFiles::GuestFileNativeDescriptor_nid_no_patch(initial);
     Require(native >= 0, "read pipe must have a real native descriptor");
     initial.reset();
     std::array<char, 4> payload = {'x', 'x', 'x', 'x'};
@@ -219,7 +219,7 @@ static void CheckBlockedRead() {
     const int replacement = sceKernelOpen(replacementFile.path.c_str(), 0, 0);
     Require(replacement == ends[0], "a NEW open must reuse the retired logical read ID");
     {
-        const auto lease = GuestFiles::Acquire_nid_no_patch(replacement);
+        const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(replacement);
         Require(CheckNativeInode(lease, replacementFile.path.c_str()) != native, "new guest ownership must not reuse the still-pinned native pipe fd");
     }
     Require(sceKernelWrite(ends[1], "pipe", 4) == 4, "guest write must unblock the original pipe IO");
@@ -283,14 +283,14 @@ static void CheckPipeRollback() {
     for (int expected = 4; expected <= 32766; ++expected) {
         const int native = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
         Require(native >= 0, "fixture must own every adopted native null descriptor");
-        auto lease = GuestFiles::AdoptOwned_nid_no_patch(native, 0);
-        Require(lease != nullptr && GuestFiles::LogicalDescriptor_nid_no_patch(lease) == expected,
+        auto lease = GuestFiles::GuestFileAdoptOwned_nid_no_patch(native, 0);
+        Require(lease != nullptr && GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(lease) == expected,
             "real adoption must fill the exact supported logical-ID range");
         occupied.push_back(expected);
         if ((expected & 1023) == 0)
             Require(std::chrono::steady_clock::now() - started < std::chrono::seconds(20), "actual table capacity setup must stay bounded");
     }
-    Require(!GuestFiles::Acquire_nid_no_patch(32767) && *__error_nid_postfix() == 9, "exactly one logical pipe slot must remain empty");
+    Require(!GuestFiles::GuestFileAcquire_nid_no_patch(32767) && *__error_nid_postfix() == 9, "exactly one logical pipe slot must remain empty");
     const auto before = NativeInventory();
     int outputs[2] = {0x12345678, 0x55667788};
     Require(pipe_nid_postfix(outputs) == -1 && *__error_nid_postfix() == 24, "a pipe requiring two logical IDs must fail with guest EMFILE");
@@ -300,7 +300,7 @@ static void CheckPipeRollback() {
     Require(sceKernelRead(first, contents.data(), contents.size()) == 8 && std::memcmp(contents.data(), "sentinel", 8) == 0,
         "existing guest payload and IO must survive the failed pipe adoption");
     {
-        const auto lease = GuestFiles::Acquire_nid_no_patch(occupied.back());
+        const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(occupied.back());
         CheckNativeInode(lease, "/dev/null");
         char untouched = 'x';
         Require(sceKernelRead(occupied.back(), &untouched, 1) == 0 && untouched == 'x', "existing null-device ownership must retain real EOF behavior");
