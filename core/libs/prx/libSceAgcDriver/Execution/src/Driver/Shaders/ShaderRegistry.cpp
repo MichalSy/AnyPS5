@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <list>
+#include <sstream>
 #include <stdexcept>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
@@ -199,6 +200,89 @@ void FinishDeferredCompute(const ShaderSnapshot& snapshot, std::size_t codeOffse
     });
 }
 
+template<typename TValue>
+void WriteFirstDifference(std::ostream& output, std::span<const TValue> requested, std::span<const TValue> prepared) {
+    const auto mismatch = std::mismatch(requested.begin(), requested.end(), prepared.begin(), prepared.end());
+    if (mismatch.first == requested.end() && mismatch.second == prepared.end()) {
+        output << "none";
+        return;
+    }
+    output << std::distance(requested.begin(), mismatch.first) << ':';
+    if (mismatch.first == requested.end()) output << "missing";
+    else output << *mismatch.first;
+    output << '/';
+    if (mismatch.second == prepared.end()) output << "missing";
+    else output << *mismatch.second;
+}
+
+std::string MissingPreparedShaderMessage(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, std::span<const std::uint64_t> key) {
+    constexpr std::size_t candidateLimit = 8;
+    std::ostringstream layouts;
+    std::ostringstream candidates;
+    std::size_t count = 0;
+    for (const auto& entry : snapshot.prepared->entries) {
+        if (entry.codeOffset != codeOffset) continue;
+        const auto candidate = count++;
+        if (candidate >= candidateLimit) continue;
+        candidates << " [" << candidate;
+        if (entry.handle == nullptr || entry.handle->source == nullptr || entry.handle->artifact == nullptr) {
+            candidates << ": incomplete]";
+            continue;
+        }
+        const auto& handle = *entry.handle;
+        const auto& artifact = *handle.artifact;
+        const auto& layout = artifact.layout;
+        layouts << " [" << layout.pushConstantOffsetBytes << ',' << layout.pushConstantSizeBytes << ']';
+        candidates << ": wave=" << artifact.info.waveSize << " userBase=" << artifact.info.userDataBase
+            << " userCount=" << artifact.info.userDataCount << " keySize=" << key.size() << '/' << handle.staticKey.size() << " keyDelta=";
+        WriteFirstDifference(candidates, key, std::span<const std::uint64_t>(handle.staticKey));
+        const auto code = ShaderRecompiler::GetPreparedCode(handle);
+        candidates << " codeSize=" << request.shader.code.size() << '/' << code.size()
+            << " codeEqual=" << std::ranges::equal(request.shader.code, code) << " codeDelta=";
+        WriteFirstDifference(candidates, request.shader.code, code);
+        const auto& bindings = artifact.bindings.layout;
+        const auto words = bindings.ShaderDataDwords();
+        const bool expectedPush = bindings.runtimeImageCount == 0u && words != 0u && words <= request.layout.pushConstantSizeBytes / 4u;
+        const bool validPushRange = request.layout.pushConstantOffsetBytes % 4u == 0u && request.layout.pushConstantSizeBytes % 4u == 0u && request.layout.pushConstantOffsetBytes <= ShaderRecompiler::NativePushConstantSize && request.layout.pushConstantSizeBytes <= ShaderRecompiler::NativePushConstantSize - request.layout.pushConstantOffsetBytes;
+        candidates << " descriptorMatch=" << (request.layout.descriptorSet == layout.descriptorSet && request.layout.firstBinding == layout.firstBinding)
+            << " validPushRange=" << validPushRange << " dataWords=" << words
+            << " runtimeImages=" << bindings.runtimeImageCount << " usesPush=" << bindings.UsesPushData()
+            << " expectedPush=" << expectedPush << ']';
+    }
+    std::ostringstream message;
+    message << "AGC driver: prepared shader artifact is missing for the requested static ABI: address=" << request.shader.codeAddress
+        << " stage=" << static_cast<std::uint32_t>(request.shader.stage) << " wave=" << request.context.waveSize
+        << " pushOffset=" << request.layout.pushConstantOffsetBytes << " pushCapacity=" << request.layout.pushConstantSizeBytes
+        << " preparedLayouts=" << layouts.str() << " codeOffset=" << codeOffset
+        << " userBase=" << request.context.userDataBaseRegister << " userCount=" << request.context.userData.size()
+        << " floatMode=";
+    if (request.context.floatMode) {
+        const auto& mode = *request.context.floatMode;
+        message << '[' << mode.floatMode << ',' << mode.dx10Clamp << ',' << mode.ieeeMode << ',' << mode.fp16Overflow << ']';
+    } else message << "unset";
+    if (request.context.pixel) {
+        const auto& pixel = *request.context.pixel;
+        message << " pixel={wave32=" << pixel.wave32 << " inputAddr=" << pixel.inputAddr
+            << " interpolatorCount=" << pixel.interpolatorCount << " interpolators=[";
+        for (std::size_t i = 0; i < std::min<std::size_t>(pixel.interpolatorCount, pixel.interpolatorSettings.size()); ++i) {
+            if (i != 0) message << ',';
+            message << pixel.interpolatorSettings[i];
+        }
+        message << "] kill=" << pixel.pixelKillEnable << " depthExport=" << pixel.depthExportEnable
+            << " sampleMaskExport=" << pixel.sampleMaskExportEnable << " earlyZ=" << pixel.earlyZ
+            << " executeOnNoop=" << pixel.executeOnNoop << " conservativeZ=" << static_cast<std::uint32_t>(pixel.conservativeZExport)
+            << " ordered=" << pixel.orderedPixelShader << " outputModes=[";
+        for (std::size_t i = 0; i < pixel.targetOutputMode.size(); ++i) {
+            if (i != 0) message << ',';
+            message << static_cast<std::uint32_t>(pixel.targetOutputMode[i]);
+        }
+        message << "]}";
+    }
+    message << " preparedCandidates=" << count << " preparedMatches=" << candidates.str();
+    if (count > candidateLimit) message << " preparedOmitted=" << count - candidateLimit;
+    return message.str();
+}
+
 }
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
@@ -218,13 +302,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
         if (deferred) FinishDeferredCompute(snapshot, codeOffset, key);
         return handle;
     }
-    std::string layouts;
-    for (const auto& entry : snapshot.prepared->entries) {
-        if (entry.codeOffset != codeOffset || entry.handle == nullptr || entry.handle->artifact == nullptr) continue;
-        const auto& layout = entry.handle->artifact->layout;
-        layouts += " [" + std::to_string(layout.pushConstantOffsetBytes) + "," + std::to_string(layout.pushConstantSizeBytes) + "]";
-    }
-    throw std::runtime_error("AGC driver: prepared shader artifact is missing for the requested static ABI: address=" + std::to_string(request.shader.codeAddress) + " stage=" + std::to_string(static_cast<std::uint32_t>(request.shader.stage)) + " wave=" + std::to_string(request.context.waveSize) + " pushOffset=" + std::to_string(request.layout.pushConstantOffsetBytes) + " pushCapacity=" + std::to_string(request.layout.pushConstantSizeBytes) + " preparedLayouts=" + layouts);
+    throw std::runtime_error(MissingPreparedShaderMessage(snapshot, codeOffset, request, key));
 }
 
 ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, std::uint64_t vertexId, std::uint64_t fragmentId) {
@@ -265,13 +343,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         if (deferred) FinishDeferredCompute(snapshot, codeOffset, key);
         return std::move(*invocation);
     }
-    std::string layouts;
-    for (const auto& entry : snapshot.prepared->entries) {
-        if (entry.codeOffset != codeOffset || entry.handle == nullptr || entry.handle->artifact == nullptr) continue;
-        const auto& layout = entry.handle->artifact->layout;
-        layouts += " [" + std::to_string(layout.pushConstantOffsetBytes) + "," + std::to_string(layout.pushConstantSizeBytes) + "]";
-    }
-    throw std::runtime_error("AGC driver: prepared shader artifact is missing for the requested static ABI: address=" + std::to_string(request.shader.codeAddress) + " stage=" + std::to_string(static_cast<std::uint32_t>(request.shader.stage)) + " wave=" + std::to_string(request.context.waveSize) + " pushOffset=" + std::to_string(request.layout.pushConstantOffsetBytes) + " pushCapacity=" + std::to_string(request.layout.pushConstantSizeBytes) + " preparedLayouts=" + layouts);
+    throw std::runtime_error(MissingPreparedShaderMessage(snapshot, codeOffset, request, key));
 }
 std::optional<ShaderRecompiler::ShaderFloatMode> RegisteredFloatMode(const ShaderSnapshot& snapshot) {
     if (snapshot.registeredState == nullptr) return std::nullopt;

@@ -24,11 +24,11 @@ void Require(bool condition, const char* message) {
 }
 
 template<typename TAction>
-void Reject(TAction action, const char* expected) {
+std::string Reject(TAction action, const char* expected) {
     try { action(); }
     catch (const std::exception& error) {
         Require(std::string(error.what()).find(expected) != std::string::npos, error.what());
-        return;
+        return error.what();
     }
     throw std::runtime_error(std::string("invalid graphics ABI was accepted; expected: ") + expected);
 }
@@ -257,13 +257,34 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
         request.layout.pushConstantSizeBytes -= 4;
         static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request));
         request.layout.pushConstantOffsetBytes = 2;
-        Reject([&] { static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request)); }, "artifact is missing");
+        const auto invalidPush = Reject([&] { static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request)); }, "artifact is missing");
+        Require(invalidPush.find("validPushRange=0") != std::string::npos, "prepared mismatch diagnostic lost the invalid push range");
         request.layout = {0, 0, 0, mesh ? MeshDrawPushOffsetBytes : 128u};
         if (pixel) request.context.pixel->interpolatorSettings[0] ^= 1u;
         else if (tessellation) ++request.graphics->tessellation->outputControlPoints;
         else if (mesh) ++request.graphics->mesh->maxVertices;
         else ++request.context.userDataBaseRegister;
-        Reject([&] { static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request)); }, "artifact is missing");
+        if (pixel) {
+            const auto originalEntries = program.snapshot->prepared->entries;
+            program.snapshot->prepared->entries.assign(16, stages.back().entry);
+            const auto mismatch = Reject([&] { static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request)); }, "artifact is missing");
+            Require(mismatch.find("keyDelta=8:1026/1027") != std::string::npos, "prepared fragment diagnostic did not identify the changed interpolant");
+            Require(mismatch.find("preparedCandidates=16") != std::string::npos && mismatch.find("preparedOmitted=8") != std::string::npos && mismatch.find(" [7:") != std::string::npos && mismatch.find(" [8:") == std::string::npos, "prepared mismatch diagnostic did not bound the candidate list");
+            Require(mismatch.find("codeEqual=1 codeDelta=none") != std::string::npos && mismatch.find("pixel={") != std::string::npos && mismatch.size() < 8192, "prepared fragment diagnostic lost its context or exceeded its limit");
+            const auto sourceMismatch = Reject([&] { static_cast<void>(SourceHandleFor(*program.snapshot, program.codeOffset, request)); }, "artifact is missing");
+            Require(sourceMismatch == mismatch, "prepared source and invocation mismatch diagnostics disagree");
+            auto changedCodeRequest = request;
+            changedCodeRequest.context.pixel->interpolatorSettings[0] ^= 1u;
+            std::vector<std::uint32_t> changedCode(program.binary.code.begin(), program.binary.code.end());
+            changedCode.front() ^= 1u;
+            changedCodeRequest.shader.code = changedCode;
+            const auto codeMismatch = Reject([&] { static_cast<void>(SourceHandleFor(*program.snapshot, program.codeOffset, changedCodeRequest)); }, "artifact is missing");
+            Require(codeMismatch.find("keyDelta=none") != std::string::npos && codeMismatch.find("codeEqual=0 codeDelta=0:") != std::string::npos, "prepared fragment diagnostic confused shader bytes with the static ABI");
+            Require(program.snapshot->prepared->entries.size() == 16, "failed prepared lookup added an artifact");
+            program.snapshot->prepared->entries = originalEntries;
+        } else {
+            Reject([&] { static_cast<void>(InvocationFor(*program.snapshot, program.codeOffset, request)); }, "artifact is missing");
+        }
     }
     ShaderRegistry invalidRegistry;
     DrawDecode invalid{};
