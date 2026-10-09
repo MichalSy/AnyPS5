@@ -1,0 +1,25 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rgba8, set = 0, binding = 0) uniform image2DMS surface;
+layout(std430, set = 0, binding = 1) buffer Pixels {
+    uint data[];
+} pixels;
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint height;
+    uint samples;
+    uint store;
+} parameters;
+
+void main() {
+    uvec3 position = gl_GlobalInvocationID;
+    if (position.x >= parameters.width || position.y >= parameters.height || position.z >= parameters.samples) return;
+    uint index = (position.y * parameters.width + position.x) * parameters.samples + position.z;
+    ivec2 coordinate = ivec2(position.xy);
+    if (parameters.store != 0) {
+        pixels.data[index] = packUnorm4x8(imageLoad(surface, coordinate, int(position.z)));
+    } else {
+        imageStore(surface, coordinate, int(position.z), unpackUnorm4x8(pixels.data[index]));
+    }
+}

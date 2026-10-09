@@ -196,6 +196,10 @@ struct VulkanDevice::State {
     bool fragmentShaderBarycentric = false;
     bool geometryShader = false;
     bool sampleRateShading = false;
+    bool shaderStorageImageMultisample = false;
+    bool sampleLocations = false;
+    VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT};
+    std::array<VkExtent2D, 7> sampleLocationGridSizes{};
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
@@ -735,6 +739,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     std::vector<VkExtensionProperties> availableExtensions(extensionCount);
     check(enumerateDeviceExtensions(selected, nullptr, &extensionCount, availableExtensions.data()), "vkEnumerateDeviceExtensionProperties");
     const auto hasExtension = [&](const char* name) { return std::any_of(availableExtensions.begin(), availableExtensions.end(), [&](const auto& item) { return std::strcmp(item.extensionName, name) == 0; }); };
+    state->sampleLocations = hasExtension(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+    if (state->sampleLocations) {
+        VkPhysicalDeviceProperties2 sampleProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &state->sampleLocationProperties};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &sampleProperties);
+        const auto getMultisampleProperties = state->InstanceFunction<PFN_vkGetPhysicalDeviceMultisamplePropertiesEXT>("vkGetPhysicalDeviceMultisamplePropertiesEXT");
+        for (std::uint32_t index = 0; index < state->sampleLocationGridSizes.size(); ++index) {
+            const auto samples = static_cast<VkSampleCountFlagBits>(1u << index);
+            if ((state->sampleLocationProperties.sampleLocationSampleCounts & samples) == 0) continue;
+            VkMultisamplePropertiesEXT multisampleProperties{VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT};
+            getMultisampleProperties(selected, samples, &multisampleProperties);
+            state->sampleLocationGridSizes[index] = multisampleProperties.maxSampleLocationGridSize;
+        }
+    }
     auto byteFeatures = QueryBdaByteFeatures(selected, state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"), availableExtensions);
     auto bdaFeatures = QueryBdaFeatures(selected, state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"), availableExtensions);
     require(hasExtension(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME), "VK_KHR_shader_float_controls is unavailable");
@@ -783,6 +800,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     std::vector<const char*> deviceExtensions;
     if (window != nullptr) deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
+    if (state->sampleLocations) deviceExtensions.push_back(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
     if (state->fragmentShaderBarycentric) {
         deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentBarycentricKHR);
@@ -962,6 +980,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->occlusionQueryPrecise = enabled.occlusionQueryPrecise == VK_TRUE;
     // Recompiled storage-image access declares no format (the guest descriptor decides it).
     enabled.shaderStorageImageMultisample = available.shaderStorageImageMultisample;
+    state->shaderStorageImageMultisample = enabled.shaderStorageImageMultisample == VK_TRUE;
     if (enabled.shaderStorageImageMultisample) state->capabilities.push_back(spv::CapabilityStorageImageMultisample);
     state->capabilities.push_back(spv::CapabilityImageMSArray);
     enabled.shaderStorageImageWriteWithoutFormat = available.shaderStorageImageWriteWithoutFormat;
@@ -2480,6 +2499,18 @@ bool VulkanDevice::ConservativeRasterization() const {
     return state->conservativeRasterization;
 }
 
+bool VulkanDevice::PreciseOcclusionQueries() const {
+    return state->occlusionQueryPrecise;
+}
+
+bool VulkanDevice::ProgrammableSampleLocations(VkSampleCountFlagBits samples) const {
+    const auto count = static_cast<std::uint32_t>(samples);
+    if (!state->sampleLocations || count == 0 || count > 64 || (count & (count - 1)) != 0 || (state->sampleLocationProperties.sampleLocationSampleCounts & samples) == 0) return false;
+    std::uint32_t index = 0;
+    for (auto remaining = count; remaining > 1; remaining >>= 1) ++index;
+    return state->sampleLocationGridSizes[index].width != 0 && state->sampleLocationGridSizes[index].height != 0;
+}
+
 Graphics::Context VulkanDevice::graphicsContext() const {
     static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
     if (state->contextReady && !noCache) return state->context;
@@ -2534,6 +2565,10 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.imageInt64Atomics = state->imageInt64Atomics;
     context.geometryShader = state->geometryShader;
     context.sampleRateShading = state->sampleRateShading;
+    context.shaderStorageImageMultisample = state->shaderStorageImageMultisample;
+    context.sampleLocations = state->sampleLocations;
+    context.sampleLocationProperties = state->sampleLocationProperties;
+    context.sampleLocationGridSizes = state->sampleLocationGridSizes;
     context.nullDescriptors = state->shaderProfile != nullptr && state->shaderProfile->NullDescriptors();
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;

@@ -46,6 +46,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcMultisampleColorShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/MultisampleColorTransfer.comp)
+set(agcMultisampleColorShaderSpv ${agcTextureDetileGeneratedDir}/MultisampleColorTransfer.spv)
+set(agcMultisampleColorShaderHeader ${agcTextureDetileGeneratedDir}/MultisampleColorTransfer_spv.h)
+add_custom_command(
+        OUTPUT "${agcMultisampleColorShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcMultisampleColorShaderSpv}" "${agcMultisampleColorShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcMultisampleColorShaderSpv} -DOUTPUT=${agcMultisampleColorShaderHeader}
+        -DSYMBOL=MULTISAMPLE_COLOR_TRANSFER_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcMultisampleColorShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcMeshArgumentsShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/MeshArguments.comp)
 set(agcMeshArgumentsShaderSpv ${agcTextureDetileGeneratedDir}/MeshArguments.spv)
 set(agcMeshArgumentsShaderHeader ${agcTextureDetileGeneratedDir}/MeshArguments_spv.h)
@@ -135,6 +148,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DepthSurface.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorTargetLayout.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleColorLayout.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorTargetTransfer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Pipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
@@ -155,9 +169,11 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureTiling.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleColorSurface.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
+        ${agcMultisampleColorShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
@@ -503,6 +519,7 @@ configure_windows_unwind(agc_driver_pm4_tests)
 add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/Graphics.cpp
         tests/ColorTargetLayout.cpp
+        tests/MsaaState.cpp
         tests/BdaResources.cpp
         tests/GuestAllocations.cpp
         tests/LiveStack.cpp
@@ -516,6 +533,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/Pipeline.cpp
         Graphics/src/State.cpp
         Graphics/src/ColorTargetLayout.cpp
+        Graphics/src/MultisampleColorLayout.cpp
         Graphics/src/ColorTargetTransfer.cpp
         Graphics/src/Resources.cpp
         Graphics/src/ShaderResources.cpp
@@ -531,11 +549,13 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/TextureTiling.cpp
         Graphics/src/TextureDetiler.cpp
         Graphics/src/Texture.cpp
+        Graphics/src/MultisampleColorSurface.cpp
         Graphics/src/UnitShadow.cpp
         Graphics/src/Sampler.cpp
         Graphics/src/Recorder.cpp
         Graphics/src/ShaderInputState.cpp
         ${agcTextureDetileShaderHeader}
+        ${agcMultisampleColorShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}
         Execution/src/GuestMemory.cpp
@@ -758,6 +778,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/Draw.cpp
             Graphics/src/DepthSurface.cpp
             Graphics/src/ColorTargetLayout.cpp
+            Graphics/src/MultisampleColorLayout.cpp
             Graphics/src/ColorTargetTransfer.cpp
             Graphics/src/Pipeline.cpp
             Graphics/src/PipelineCache.cpp
@@ -775,9 +796,11 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/TextureTiling.cpp
             Graphics/src/TextureDetiler.cpp
             Graphics/src/Texture.cpp
+            Graphics/src/MultisampleColorSurface.cpp
             Graphics/src/UnitShadow.cpp
             Graphics/src/Sampler.cpp
             ${agcTextureDetileShaderHeader}
+            ${agcMultisampleColorShaderHeader}
             ${visualShaders}
     )
 
@@ -1098,3 +1121,13 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
+
+add_test_executable(agc_driver_multisample_color_layout_tests EXCLUDE_FROM_ALL
+        tests/MultisampleColorLayout.cpp
+        Graphics/src/MultisampleColorLayout.cpp
+)
+target_include_directories(agc_driver_multisample_color_layout_tests PRIVATE ${LIBS_INCLUDE_DIR})
+set_target_properties(agc_driver_multisample_color_layout_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_driver_multisample_color_layout_tests)
+add_test(NAME agc_driver_multisample_color_layout COMMAND agc_driver_multisample_color_layout_tests)
+set_tests_properties(agc_driver_multisample_color_layout PROPERTIES TIMEOUT 20)

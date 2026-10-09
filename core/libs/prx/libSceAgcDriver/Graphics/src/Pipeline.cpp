@@ -5,10 +5,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <spirv/unified1/spirv.hpp>
+#include <spirv/unified1/GLSL.std.450.h>
 #include <list>
 #include <mutex>
 #include <type_traits>
@@ -93,6 +97,74 @@ void ValidateViewport(const Context& context, const VkViewport& viewport) {
     Require(std::min(viewport.y, viewport.y + viewport.height) >= context.limits.viewportBoundsRange[0] && std::max(viewport.y, viewport.y + viewport.height) <= context.limits.viewportBoundsRange[1], "viewport Y exceeds device bounds");
 }
 
+namespace {
+
+bool sameSampleLocations(std::span<const VkSampleLocationEXT> a, std::span<const VkSampleLocationEXT> b) {
+    return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](const auto& left, const auto& right) { return left.x == right.x && left.y == right.y; });
+}
+
+void validateMultisampling(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    const auto count = static_cast<std::uint32_t>(state.rasterizationSamples);
+    Require(count != 0 && count <= 32 && (count & (count - 1)) == 0, "rasterization sample count is invalid or exceeds the 32-bit sample mask");
+    for (const auto& color : state.colors) {
+        Require(color.samples == state.rasterizationSamples, "color and rasterization sample counts do not match");
+        Require((context.limits.framebufferColorSampleCounts & color.samples) != 0, "device does not support the color attachment sample count");
+    }
+    if (state.depth) {
+        Require(state.depth->samples == state.rasterizationSamples, "depth and rasterization sample counts do not match");
+        Require((context.limits.framebufferDepthSampleCounts & state.depth->samples) != 0, "device does not support the depth attachment sample count");
+        Require(state.depth->stencilAddress == 0 || (context.limits.framebufferStencilSampleCounts & state.depth->samples) != 0, "device does not support the stencil attachment sample count");
+        Require(state.depth->sampleLocationsGrid.width == state.sampleLocationsGrid.width && state.depth->sampleLocationsGrid.height == state.sampleLocationsGrid.height && sameSampleLocations(state.depth->sampleLocations, state.sampleLocations), "depth and rasterization sample locations do not match");
+    }
+    if (state.colors.empty() && !state.depth) Require((context.limits.framebufferNoAttachmentsSampleCounts & state.rasterizationSamples) != 0, "device does not support the rasterization sample count without attachments");
+    if (state.sampleLocations.empty()) {
+        Require(count == 1 || context.limits.standardSampleLocations == VK_TRUE, "default multisample locations are not standard on this device");
+        return;
+    }
+    Require(context.sampleLocations, "custom sample locations require VK_EXT_sample_locations");
+    const auto& properties = context.sampleLocationProperties;
+    Require((properties.sampleLocationSampleCounts & state.rasterizationSamples) != 0, "device does not support custom locations for the rasterization sample count");
+    const auto grid = state.sampleLocationsGrid;
+    const auto maxGrid = context.sampleLocationGridSizes[std::countr_zero(count)];
+    Require(grid.width != 0 && grid.height != 0 && maxGrid.width != 0 && maxGrid.height != 0 && maxGrid.width % grid.width == 0 && maxGrid.height % grid.height == 0, "custom sample location grid exceeds or does not divide device limits");
+    Require(static_cast<std::uint64_t>(count) * grid.width * grid.height == state.sampleLocations.size(), "custom sample location count does not match the rasterization sample count and grid");
+    const auto scale = std::ldexp(1.0f, static_cast<int>(std::min(properties.sampleLocationSubPixelBits, 23u)));
+    for (const auto& location : state.sampleLocations) {
+        for (const auto coordinate : {location.x, location.y}) {
+            Require(std::isfinite(coordinate) && coordinate >= properties.sampleLocationCoordinateRange[0] && coordinate <= properties.sampleLocationCoordinateRange[1], "custom sample location exceeds the device coordinate range");
+            Require(std::round(coordinate * scale) == coordinate * scale, "custom sample location exceeds device subpixel precision");
+        }
+    }
+    for (const auto& shader : shaders) {
+        if (shader.stage != ShaderRecompiler::ShaderStage::Fragment) continue;
+        const auto& words = shader.program->spirv;
+        std::uint32_t glslSet = 0;
+        for (std::size_t offset = 5; offset < words.size();) {
+            const auto length = words[offset] >> 16;
+            const auto opcode = words[offset] & 0xffffu;
+            Require(length != 0 && length <= words.size() - offset, "fragment SPIR-V has an invalid instruction length");
+            if (opcode == spv::OpExtInstImport && length >= 3) {
+                const auto* name = reinterpret_cast<const char*>(words.data() + offset + 2);
+                const auto bytes = (length - 2) * sizeof(std::uint32_t);
+                if (bytes >= sizeof("GLSL.std.450") && std::memcmp(name, "GLSL.std.450", sizeof("GLSL.std.450")) == 0) glslSet = words[offset + 1];
+            }
+            if (opcode == spv::OpExtInst && length >= 5 && glslSet != 0 && words[offset + 3] == glslSet && words[offset + 4] == GLSLstd450InterpolateAtSample) throw std::runtime_error("AGC graphics: custom sample locations do not support fragment InterpolateAtSample");
+            offset += length;
+        }
+    }
+}
+
+VkSampleLocationsInfoEXT sampleLocationsInfo(VkSampleCountFlagBits samples, VkExtent2D grid, std::span<const VkSampleLocationEXT> locations) {
+    VkSampleLocationsInfoEXT info{VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT};
+    info.sampleLocationsPerPixel = samples;
+    info.sampleLocationGridSize = grid;
+    info.sampleLocationsCount = static_cast<std::uint32_t>(locations.size());
+    info.pSampleLocations = locations.data();
+    return info;
+}
+
+}
+
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias) {
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
     // A cached pipeline may outlive its device's teardown (see ClearCachedPipelines); it must not keep
@@ -100,7 +172,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
     this->context.bufferPool.reset();
     Require(state.blends.size() == (state.colors.empty() ? 0u : state.colors.back().exportIndex + 1u) && state.colors.size() <= state.blends.size(), "blend states do not match decoded color state");
     Require(state.blends.size() <= context.limits.maxColorAttachments, "color targets exceed device attachment limits");
-    Require(state.hasColorTarget || (context.limits.framebufferNoAttachmentsSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0, "device does not support single-sample rendering without attachments");
+    validateMultisampling(context, state, shaders);
     Require(!depthBounds || context.depthBounds, "device does not support the depth bounds test");
     Require(!depthBias || state.depthBiasClamp == 0.0f || context.depthBiasClamp, "device does not support depth bias clamping");
     Require(!state.negativeOneToOne || context.depthClipControl, "negative-one-to-one depth clipping requires VK_EXT_depth_clip_control with depthClipControl enabled");
@@ -152,7 +224,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         for (std::uint32_t index = 0; index < state.colors.size(); ++index) {
             VkAttachmentDescription color{};
             color.format = state.colors[index].format;
-            color.samples = VK_SAMPLE_COUNT_1_BIT;
+            color.samples = state.colors[index].samples;
             color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -170,7 +242,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         if (state.depth) {
             VkAttachmentDescription depth{};
             depth.format = state.depth->format;
-            depth.samples = VK_SAMPLE_COUNT_1_BIT;
+            depth.samples = state.depth->samples;
             depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -220,7 +292,14 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         conservative.conservativeRasterizationMode = state.conservativeRasterization;
         if (state.conservativeRasterization != VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT) raster.pNext = &conservative;
         VkPipelineMultisampleStateCreateInfo samples{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        samples.rasterizationSamples = state.rasterizationSamples;
+        samples.pSampleMask = &state.sampleMask;
+        VkPipelineSampleLocationsStateCreateInfoEXT sampleLocations{VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
+        if (!state.sampleLocations.empty()) {
+            sampleLocations.sampleLocationsEnable = VK_TRUE;
+            sampleLocations.sampleLocationsInfo = sampleLocationsInfo(state.rasterizationSamples, state.sampleLocationsGrid, state.sampleLocations);
+            samples.pNext = &sampleLocations;
+        }
         VkPipelineDepthStencilStateCreateInfo depthStencil{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         depthStencil.depthTestEnable = state.depthTest;
         depthStencil.depthWriteEnable = state.depthWrite;
@@ -340,6 +419,22 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     begin.renderPass = renderPass;
     begin.framebuffer = framebuffer.Handle();
     begin.renderArea = {{0, 0}, extent};
+    VkAttachmentSampleLocationsEXT initial{};
+    VkSubpassSampleLocationsEXT final{};
+    VkRenderPassSampleLocationsBeginInfoEXT locations{VK_STRUCTURE_TYPE_RENDER_PASS_SAMPLE_LOCATIONS_BEGIN_INFO_EXT};
+    if (!state.sampleLocations.empty()) {
+        final.subpassIndex = 0;
+        final.sampleLocationsInfo = sampleLocationsInfo(state.rasterizationSamples, state.sampleLocationsGrid, state.sampleLocations);
+        locations.postSubpassSampleLocationsCount = 1;
+        locations.pPostSubpassSampleLocations = &final;
+        if (state.depth) {
+            initial.attachmentIndex = static_cast<std::uint32_t>(state.colors.size());
+            initial.sampleLocationsInfo = sampleLocationsInfo(state.depth->samples, state.depth->sampleLocationsGrid, state.depth->sampleLocations);
+            locations.attachmentInitialSampleLocationsCount = 1;
+            locations.pAttachmentInitialSampleLocations = &initial;
+        }
+        begin.pNext = &locations;
+    }
     context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
     Continue(commands, state);
 }
@@ -402,6 +497,15 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
     }
     append(key, resources.LayoutKey().size());
     for (const auto word : resources.LayoutKey()) append(key, word);
+    append(key, state.rasterizationSamples);
+    append(key, state.sampleMask);
+    append(key, state.sampleLocationsGrid.width);
+    append(key, state.sampleLocationsGrid.height);
+    append(key, state.sampleLocations.size());
+    for (const auto& location : state.sampleLocations) {
+        append(key, location.x);
+        append(key, location.y);
+    }
     append(key, state.hasColorTarget);
     append(key, state.rectList);
     append(key, state.topology);
@@ -415,13 +519,17 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
     for (const auto& blend : state.blends) append(key, blend);
     for (const auto value : state.blendConstants) append(key, value);
     append(key, state.colors.size());
-    for (const auto& color : state.colors) append(key, color.format);
+    for (const auto& color : state.colors) {
+        append(key, color.format);
+        append(key, color.samples);
+    }
     if (state.blends.size() != state.colors.size()) {
         for (const auto& color : state.colors) append(key, color.exportIndex);
     }
     append(key, state.depth.has_value());
     if (state.depth) {
         append(key, state.depth->format);
+        append(key, state.depth->samples);
         append(key, state.depthTest);
         append(key, state.depthWrite);
         append(key, state.depthCompare);

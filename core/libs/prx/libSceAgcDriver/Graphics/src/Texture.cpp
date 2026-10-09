@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleColorSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -2322,6 +2323,7 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
     if (published != nullptr) *published = false;
+    const bool multisampleFlushed = FlushMultisampleColors(address, bytes);
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
     // another thread releases outside the GPU mutex once the batch completed.
     std::vector<std::shared_ptr<StorageTexture>> flush;
@@ -2357,7 +2359,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         // shadow, or an earlier flush's) still reach the import as the scope asks.
         const bool units = PublishShadowsOnly(address, bytes, scope, reason);
         if (published != nullptr) *published = units;
-        return false;
+        return multisampleFlushed;
     }
     struct Unregister {
         const std::vector<std::shared_ptr<StorageTexture>>& flush;
@@ -2431,6 +2433,9 @@ bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const Stor
 }
 
 bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    for (const auto& [begin, end] : ranges) {
+        if (end > begin && AnyPendingMultisampleColors(begin, static_cast<std::size_t>(end - begin))) return true;
+    }
     if (ranges.empty()) return false;
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
@@ -2615,11 +2620,15 @@ void StorageTexture::BumpPendingSerial() {
 }
 
 bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
+    std::vector<bool> multisamplePending;
+    multisamplePending.reserve(queries.size());
+    for (const auto& query : queries) multisamplePending.push_back(query.end > query.begin && AnyPendingMultisampleColors(query.begin, static_cast<std::size_t>(query.end - query.begin)));
+    std::size_t index = 0;
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     bool identities = true;
     for (auto& query : queries) {
-        query.overlaps = false;
+        query.overlaps = multisamplePending[index++];
         query.found = nullptr;
         if (query.end <= query.begin) continue;
         const auto bytes = static_cast<std::size_t>(query.end - query.begin);

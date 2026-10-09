@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleColorSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -627,6 +628,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
 void FlushCachedTextures(VkDevice device) {
     Require(device != VK_NULL_HANDLE, "cannot flush textures without a Vulkan device");
     GuestMemory::AssertGpuLockHeld("FlushCachedTextures");
+    FlushMultisampleColors(0, std::numeric_limits<std::size_t>::max());
     auto& cache = StorageTextures();
     std::lock_guard lock(cache.mutex);
     for (const auto& entry : cache.entries) {
@@ -635,6 +637,7 @@ void FlushCachedTextures(VkDevice device) {
 }
 
 void ClearCachedTextures(VkDevice device) {
+    ClearMultisampleColors(device);
     Require(device != VK_NULL_HANDLE, "cannot clear textures without a Vulkan device");
     auto& sampled = Textures();
     {

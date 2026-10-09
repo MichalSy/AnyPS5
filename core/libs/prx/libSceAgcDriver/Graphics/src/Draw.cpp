@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleColorSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -1524,6 +1525,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // Resident target: the surface's cached storage image is attached directly and marked dirty
         // afterwards, so nothing is copied in or out per draw.
         std::shared_ptr<StorageTexture> resident;
+        std::shared_ptr<MultisampleColorSurface> multisample;
         bool proxied = false;
         // Linear pixels converted on the CPU, for targets the GPU detiler does not handle.
         std::unique_ptr<Buffer> transfer;
@@ -1546,6 +1548,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         auto& binding = targets[index];
         binding.color = state.colors[index];
         const auto& color = binding.color;
+        if (color.samples != VK_SAMPLE_COUNT_1_BIT) {
+            binding.multisample = CachedMultisampleColorSurface(context, color);
+            targetViews.push_back(binding.multisample->AttachmentView());
+            continue;
+        }
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
         const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
@@ -1857,6 +1864,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         rewritten = recordIndirectArguments(context, commands, recorder, recorded, indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
     }
     for (auto& binding : targets) {
+        if (binding.multisample != nullptr) {
+            imageBarrier(context, commands, binding.multisample->Image(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+            countBarrier();
+            continue;
+        }
         if (binding.proxied) {
             binding.resident->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             countBarrier(2);
@@ -1897,6 +1909,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
     APS5_LOG_CHARS_OUT_DEBUG("Render pass ended");
     for (auto& binding : targets) {
+        if (binding.multisample != nullptr) {
+            imageBarrier(context, commands, binding.multisample->Image(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+            countBarrier();
+            continue;
+        }
         if (binding.proxied) {
             binding.resident->RecordAttachmentProxyStore(commands, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             countBarrier(2);
@@ -1989,6 +2006,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     static const bool skipTargetWrite = std::getenv("APS5_NO_TARGET_WRITEBACK") != nullptr;
     for (const auto& binding : targets) {
         if (skipTargetWrite) break;
+        if (binding.multisample != nullptr) {
+            binding.multisample->MarkDirty();
+            continue;
+        }
         if (binding.resident != nullptr) {
             // The results stay on the GPU until something reads the target's memory.
             binding.resident->MarkDirty();

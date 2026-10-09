@@ -5,6 +5,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -144,6 +145,10 @@ struct Context {
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
     std::uint32_t srgbDecodeFormats = 0;
+    bool shaderStorageImageMultisample = false;
+    bool sampleLocations = false;
+    VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT};
+    std::array<VkExtent2D, 7> sampleLocationGridSizes{};
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

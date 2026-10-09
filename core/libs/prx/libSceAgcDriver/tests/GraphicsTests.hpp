@@ -29,6 +29,7 @@ struct TextureDetilerTestAccess {
     std::function<std::array<std::uint32_t, 3>()> lastSpecialization;
 };
 
+void RunMsaaStateTests();
 void RunTextureFormatTests();
 void RunTextureTilingTests();
 void RunGuestTextureResourceTests();
