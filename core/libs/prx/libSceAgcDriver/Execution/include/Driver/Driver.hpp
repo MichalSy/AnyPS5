@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PreparationPool.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -286,6 +287,7 @@ private:
 
     std::vector<std::shared_ptr<VulkanDevice>> replacedDevices;
     std::stop_token shutdownToken = LibcShutdownToken_nid_postfix();
+    PreparationPool registeredPreparation;
     DeviceUseGate deviceReplacement;
     std::uint64_t accepted = 0;
     std::uint64_t completed = 0;

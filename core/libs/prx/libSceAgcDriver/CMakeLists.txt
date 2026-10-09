@@ -130,6 +130,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/WorkerAffinity.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Shaders/ShaderDiagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Shaders/ShaderRegistry.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Shaders/RegisteredPreparation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/DeferredLabels.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/LabelHistory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/SynchronizationStatistics.cpp
@@ -927,6 +928,21 @@ if(AGC_BUILD_VISUAL_TEST)
         )
 
         add_dependencies(agc_driver_visual_test agc_driver_visual_runtime)
+    endif()
+endif()
+
+add_test_executable(agc_driver_preparation_pool_tests EXCLUDE_FROM_ALL tests/PreparationPool.cpp)
+target_include_directories(agc_driver_preparation_pool_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_driver_preparation_pool_tests PRIVATE libc)
+set_target_properties(agc_driver_preparation_pool_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_driver_preparation_pool_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_driver_preparation_pool_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_driver_preparation_pool COMMAND agc_driver_preparation_pool_tests)
+    set_tests_properties(agc_driver_preparation_pool PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_driver_preparation_pool PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
 

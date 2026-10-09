@@ -9,6 +9,7 @@
 #include "CacheKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
+#include "prx/libSceAgcDriver/Execution/include/RegisteredPreparation.hpp"
 #include "CompiledVariant.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdlib>
@@ -443,7 +444,7 @@ struct PreparedRegistration {
     std::vector<PreparedShaders::DeferredComputeEntry> deferredCompute;
 };
 
-PreparedRegistration PrepareRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration) {
+PreparedRegistration PrepareRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, PreparationPool& pool) {
     using Stage = ShaderRecompiler::ShaderStage;
     const auto header = ReadHeader(snapshot);
     std::uint32_t programRegister;
@@ -525,11 +526,17 @@ PreparedRegistration PrepareRegistered(const ShaderSnapshot& snapshot, const Vul
         PerformanceTimer timing("Shader.PrepareArtifact");
         prepared.entries.push_back({codeOffset, ShaderRecompiler::PrepareShader(request)});
     };
-    append();
     if (compute) {
-        request.context.compute->partialThreads = {1, 1, 1};
-        append();
-    } else if (pixel) {
+        try {
+            const auto handles = PrepareComputeTemplates(pool, request, LibcShutdownToken_nid_postfix());
+            for (const auto& handle : handles) prepared.entries.push_back({codeOffset, handle});
+        } catch (const PreparationStopped&) {
+            throw ProcessShutdown{};
+        }
+        return prepared;
+    }
+    append();
+    if (pixel) {
         request.layout.pushConstantSizeBytes = 0;
         append();
         auto context = state.context;
@@ -707,7 +714,7 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         transaction.Commit();
         return;
     }
-    auto registration = PrepareRegistered(*snapshot, *localDevice, state, false);
+    auto registration = PrepareRegistered(*snapshot, *localDevice, state, false, registeredPreparation);
     auto& prepared = transaction.Edit(*snapshot);
     for (auto& entry : registration.entries) {
         const auto duplicate = std::ranges::any_of(prepared.entries, [&](const auto& existing) { return existing.handle->artifact == entry.handle->artifact; });
@@ -877,7 +884,7 @@ void Driver::RegisterShader(const Shader* shader) {
     registered.shader = snapshot.registeredState->shader;
     registered.context = snapshot.registeredState->context;
     registered.userConfig = snapshot.registeredState->userConfig;
-    auto registration = PrepareRegistered(snapshot, *localDevice, registered, true);
+    auto registration = PrepareRegistered(snapshot, *localDevice, registered, true, registeredPreparation);
     snapshot.prepared->entries = std::move(registration.entries);
     snapshot.prepared->deferredCompute = std::move(registration.deferredCompute);
     if ((snapshot.type == 0 || snapshot.type == 1) && (!snapshot.prepared->entries.empty() || !snapshot.prepared->deferredCompute.empty())) {
@@ -920,7 +927,7 @@ void Driver::RegisterShader(const Shader* shader) {
         nullState.shader = null.registeredState->shader;
         nullState.context = null.registeredState->context;
         nullState.userConfig = null.registeredState->userConfig;
-        null.prepared->entries = PrepareRegistered(null, *localDevice, nullState, true).entries;
+        null.prepared->entries = PrepareRegistered(null, *localDevice, nullState, true, registeredPreparation).entries;
         PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(std::move(null)));
     }
     transaction.Commit();
