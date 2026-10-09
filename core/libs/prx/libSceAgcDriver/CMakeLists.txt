@@ -170,6 +170,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleColorSurface.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorResolve.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
@@ -520,6 +521,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/Graphics.cpp
         tests/ColorTargetLayout.cpp
         tests/MsaaState.cpp
+        tests/ColorResolveState.cpp
         tests/BdaResources.cpp
         tests/GuestAllocations.cpp
         tests/LiveStack.cpp
@@ -550,6 +552,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/TextureDetiler.cpp
         Graphics/src/Texture.cpp
         Graphics/src/MultisampleColorSurface.cpp
+        Graphics/src/ColorResolve.cpp
         Graphics/src/UnitShadow.cpp
         Graphics/src/Sampler.cpp
         Graphics/src/Recorder.cpp
@@ -797,6 +800,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/TextureDetiler.cpp
             Graphics/src/Texture.cpp
             Graphics/src/MultisampleColorSurface.cpp
+            Graphics/src/ColorResolve.cpp
             Graphics/src/UnitShadow.cpp
             Graphics/src/Sampler.cpp
             ${agcTextureDetileShaderHeader}

@@ -920,6 +920,73 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     return color;
 }
 
+std::optional<ColorResolvePass> DecodeColorResolvePass(const QueueState& queue) {
+    const auto& cx = queue.context;
+    const auto colorControl = find(cx, 0x202);
+    if (colorControl == cx.end() || ((colorControl->second >> 4u) & 7u) != 3u) return std::nullopt;
+    Require(colorControl->second == 0xcc0030u, "color resolve requires copy ROP without additional color-control flags");
+    Require(read(queue.userConfig, 0x242, RegisterBank::UserConfig) == 7u, "color resolve requires a 2D rectangle primitive");
+    Require(read(cx, 0x200) == 0u && (read(cx, 0x000) & ~0x20u) == 0u, "color resolve with depth or stencil work is unsupported");
+    const auto mode = read(cx, 0x292);
+    Require((mode & ~0x22u) == 0u, "color resolve requires disabled MSAA scan conversion without unsupported scan modes");
+    zero(cx, 0x293, ScanControlMask, "color resolve sample iteration or unsupported scan control");
+    const auto aa = read(cx, 0x2f8);
+    Require((aa & ~0x0071e007u) == 0u && (aa & 7u) == 3u && ((aa >> 20u) & 7u) == 3u,
+        "color resolve requires matching eight coverage and exposed samples without coverage conversion");
+    const auto eqaa = read(cx, 0x201);
+    Require((eqaa & ~0x00107777u) == 0u && (eqaa & 7u) == 3u && ((eqaa >> 4u) & 7u) <= 3u &&
+        ((eqaa >> 8u) & 7u) <= 3u && ((eqaa >> 12u) & 7u) <= 3u && (eqaa & 0x100000u) != 0u,
+        "color resolve with mixed anchor counts, overrasterization or unsupported EQAA state is unsupported");
+    Require(read(cx, 0x8e) == 0xfu && read(cx, 0x8f) == 0xfu, "color resolve requires all source components in MRT0");
+    zero(cx, 0x80, ~0u, "color resolve window offset");
+    Require(read(cx, 0x206) == 0x43fu, "color resolve requires homogeneous positions and all viewport transforms");
+    Require(read(cx, 0x313) == 0x6000u, "color resolve with conservative rasterization is unsupported");
+    for (std::uint32_t slot = 0; slot < 2u; ++slot) {
+        const auto stride = slot * 0xfu;
+        Require((read(cx, 0x31d + stride) & 0x0001f000u) == (slot == 0u ? 0x0001b000u : 0u),
+            "color resolve requires eight source samples/fragments and one destination sample/fragment");
+        Require((read(cx, 0x31c + stride) & 0x10006000u) == 0u, "color resolve with compressed, DCC or CMASK color is unsupported");
+        Require((read(cx, 0x31c + stride) & ~0x00009f7cu) == 0u,
+            "color resolve with nonstandard rounding, optimization or color-control flags is unsupported");
+        Require(read(cx, 0x31b + stride) == 0u && (read(cx, 0x3b0 + slot) >> 28u) == 0u &&
+            ((read(cx, 0x3b8 + slot) >> 24u) & 3u) == 1u,
+            "color resolve with mipmapped, array or volume views is unsupported");
+        for (const auto offset : {0x31fu + stride, 0x321u + stride, 0x325u + stride, 0x398u + slot, 0x3a0u + slot, 0x3a8u + slot}) {
+            const auto metadata = find(cx, offset);
+            Require(metadata == cx.end() || metadata->second == 0u, "color resolve with CMASK, FMASK or DCC addresses is unsupported");
+        }
+    }
+    ColorResolvePass pass{DecodeColorBuffer(cx, 0u), DecodeColorBuffer(cx, 1u), {}};
+    Require(pass.source.samples == VK_SAMPLE_COUNT_8_BIT && pass.destination.samples == VK_SAMPLE_COUNT_1_BIT,
+        "color resolve requires eight source samples and one destination sample");
+    Require((pass.source.format == VK_FORMAT_R8G8B8A8_UNORM || pass.source.format == VK_FORMAT_B8G8R8A8_UNORM) &&
+        pass.destination.format == pass.source.format && pass.source.componentMapping == 0xe4u && pass.destination.componentMapping == 0xe4u,
+        "color resolve requires matching RGBA8 or BGRA8 UNORM formats and identity component mappings");
+    Require(pass.source.tileMode == ColorTileMode::RenderTarget && pass.destination.tileMode == ColorTileMode::RenderTarget,
+        "color resolve requires SW_64KB_R_X source and destination surfaces");
+    Require(pass.source.extent.width == pass.destination.extent.width && pass.source.extent.height == pass.destination.extent.height,
+        "color resolve requires matching source and destination extents");
+    Require(pass.source.address <= std::numeric_limits<std::uint64_t>::max() - pass.source.bytes &&
+        pass.destination.address <= std::numeric_limits<std::uint64_t>::max() - pass.destination.bytes,
+        "color resolve surface address overflow");
+    Require(pass.source.address + pass.source.bytes <= pass.destination.address ||
+        pass.destination.address + pass.destination.bytes <= pass.source.address,
+        "color resolve source and destination storage overlaps");
+    const auto xs = std::fabs(readFloat(cx, 0x10f));
+    const auto xo = readFloat(cx, 0x110);
+    const auto ys = std::fabs(readFloat(cx, 0x111));
+    const auto yo = readFloat(cx, 0x112);
+    Require(xs * 2.0f == static_cast<float>(pass.source.extent.width) && xo == xs &&
+        ys * 2.0f == static_cast<float>(pass.source.extent.height) && yo == ys,
+        "color resolve requires a full-surface viewport without source or destination offsets");
+    pass.region = {{0, 0}, pass.source.extent};
+    intersect(pass.region, cx, 0xc, true);
+    intersect(pass.region, cx, 0x81, false);
+    intersect(pass.region, cx, 0x90, false);
+    if ((mode & 2u) != 0u) intersect(pass.region, cx, 0x94, false);
+    return pass;
+}
+
 std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue) {
     const auto& cx = queue.context;
     const auto control = find(cx, 0x202);

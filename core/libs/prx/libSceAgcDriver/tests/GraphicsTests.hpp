@@ -30,6 +30,7 @@ struct TextureDetilerTestAccess {
 };
 
 void RunMsaaStateTests();
+void RunColorResolveStateTests();
 void RunTextureFormatTests();
 void RunTextureTilingTests();
 void RunGuestTextureResourceTests();

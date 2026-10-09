@@ -2886,6 +2886,7 @@ int main() {
         RunGuestLeaseWaitTests();
         stateTests();
         RunMsaaStateTests();
+        RunColorResolveStateTests();
         depthMaintenanceTests();
         hardwareScreenOffsetTests();
         srgb8TargetTests();
