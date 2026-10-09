@@ -192,6 +192,21 @@ public:
     GuestBlock(const GuestBlock&) = delete;
     GuestBlock& operator=(const GuestBlock&) = delete;
     std::uint64_t Address() const { return reinterpret_cast<std::uintptr_t>(data); }
+    void Protect(bool writable) {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(data, mappedBytes, true, writable, [&] {
+            GuestArena::GuestArenaSetProtection_nid_postfix(Address(), mappedBytes, writable ? 0x04u : 0x02u);
+        });
+    }
+    void Recommit() {
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Unmap(data, mappedBytes, [&](const void*, std::size_t, const void*, bool) { reset(); });
+        }
+        commit(mappedBytes);
+        GuestAllocations::Mutation mutation;
+        mutation.Add(data, mappedBytes, true, true);
+    }
     std::byte* data = nullptr;
 
 private:
@@ -552,6 +567,70 @@ void FootprintTests(const Context& context) {
     ClearDepthSurfaces(context.device);
 }
 
+void MappingLifetimeTests(const Device& device, SampleProgram& sampler) {
+    const auto& context = device.GetContext();
+    GuestBlock memory(64u * Block);
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearCachedTextures(device); ClearDepthSurfaces(device); }
+    } cleanup{context.device};
+    auto target = Target(memory.Address(), {64, 64}, 0);
+    target.mipCount = 1;
+    target.clearDepth = 0.5f;
+    const auto oldView = DepthSurfaceView(context, target);
+    const auto words = Descriptor(target, 0, 0);
+    auto oldSample = Sample(context, target, 0, 0);
+    Require(oldSample != nullptr && DepthSurfaceHolds(context, words, Identity, oldSample.get()), "original depth view is not held");
+    ExpectValue(sampler, *oldSample, 0, 0.5f, "original depth allocation");
+    memory.Protect(false);
+    memory.Protect(true);
+    Require(DepthSurfaceAt(target.address) && DepthSurfaceView(context, target) == oldView, "mprotect retired the live depth image");
+    memory.Recommit();
+    Require(!DepthSurfaceAt(target.address) && !DepthSurfaceHolds(context, words, Identity, oldSample.get()), "unmap/recommit kept the old depth allocation active");
+    const std::array<std::uint32_t, 8> colorWords{
+        static_cast<std::uint32_t>(memory.Address() >> 8u),
+        static_cast<std::uint32_t>((memory.Address() >> 40u) & 0xffu) | (71u << 20u),
+        0x00080008u, 0xa1b00facu, 0x00000020u, 0x00700000u, 0, 0
+    };
+    {
+        auto storage = CachedStorageSurface(context, DecodeTextureResource(colorWords));
+        Require(storage != nullptr && storage->View() != VK_NULL_HANDLE, "new RGBA16 allocation remained blocked by the retired depth image");
+    }
+    ClearCachedTextures(context.device);
+    target.clearDepth = 0.875f;
+    const auto newView = DepthSurfaceView(context, target);
+    auto newSample = Sample(context, target, 0, 0);
+    Require(newView != oldView && newSample != nullptr && !DepthSurfaceHolds(context, words, Identity, oldSample.get()), "new depth bind revived the unmapped image");
+    ExpectValue(sampler, *newSample, 0, 0.875f, "new depth allocation constructor clear");
+    oldSample.reset();
+    newSample.reset();
+    ClearDepthSurfaces(context.device);
+    VkImageFormatProperties properties{};
+    const auto supported = context.imageFormatProperties(context.physical, VK_FORMAT_D32_SFLOAT, VK_IMAGE_TYPE_2D,
+        VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, &properties);
+    if (supported == VK_SUCCESS && (properties.sampleCounts & VK_SAMPLE_COUNT_8_BIT) != 0 && context.sampleLocations &&
+        (context.sampleLocationProperties.sampleLocationSampleCounts & VK_SAMPLE_COUNT_8_BIT) != 0) {
+        target.samples = VK_SAMPLE_COUNT_8_BIT;
+        target.sampleLocations = {
+            {0.5625f, 0.3125f}, {0.4375f, 0.6875f}, {0.8125f, 0.5625f}, {0.3125f, 0.1875f},
+            {0.1875f, 0.8125f}, {0.0625f, 0.4375f}, {0.6875f, 0.9375f}, {0.9375f, 0.0625f}
+        };
+        const auto multisampleView = DepthSurfaceView(context, target);
+        Require(DepthSurfaceAt(target.address), "MSAA8 target was not active");
+        memory.Recommit();
+        Require(!DepthSurfaceAt(target.address), "MSAA8 allocation ignored unmap/recommit");
+        {
+            auto storage = CachedStorageSurface(context, DecodeTextureResource(colorWords));
+            Require(storage != nullptr && storage->View() != VK_NULL_HANDLE, "MSAA8 cache blocked reused RGBA16 storage");
+        }
+        ClearCachedTextures(context.device);
+        Require(DepthSurfaceView(context, target) != multisampleView, "MSAA8 rebind revived the unmapped image");
+        std::puts("MSAA8 mapping lifetime tested");
+    } else {
+        std::puts("MSAA8 mapping lifetime unavailable on this device");
+    }
+}
+
 void MultisampleMipRefusal(const Context& context) {
     GuestBlock memory(0xb0000);
     auto target = Target(memory.Address(), {512, 256}, 1);
@@ -583,6 +662,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--htile-only") {
             HtileClearTests(*device, sampler);
             std::puts("HTILE padded uniform clear and no-false-clear tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--mapping-lifetime-only") {
+            MappingLifetimeTests(*device, sampler);
+            std::puts("depth mapping lifetime and mprotect preservation tests passed");
             return 0;
         }
         RenderAndSample(*device, sampler, {512, 256}, 0xb0000, "macro mip chain");

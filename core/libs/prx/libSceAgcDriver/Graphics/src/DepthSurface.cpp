@@ -273,6 +273,7 @@ public:
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     bool retired = false;
+    bool mappingInvalidated = false;
     bool pendingClear = false;
     std::uint64_t htileAddress = 0;
     bool htileStencil = false;
@@ -323,6 +324,17 @@ std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
     return *list;
 }
 
+void invalidateDepthMappings(std::uintptr_t address, std::size_t bytes) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (!surface->mappingInvalidated && surface->Overlaps(address, bytes)) {
+            surface->retired = true;
+            surface->mappingInvalidated = true;
+            surface->pendingClear = false;
+        }
+    }
+}
+
 }
 
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
@@ -342,11 +354,12 @@ std::uint64_t DepthMipChainBytes(VkExtent2D extent, std::uint32_t bytesPerTexel,
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
     static_cast<void>(validatedSurfaceExtent(target));
+    GuestAllocations::GuestAllocationsSetMappingInvalidator_nid_postfix(&invalidateDepthMappings);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     DepthSurface* bound = nullptr;
     for (const auto& surface : surfaces()) {
-        if (surface->context.device == context.device && sameSurface(surface->target, target)) {
+        if (!surface->mappingInvalidated && surface->context.device == context.device && sameSurface(surface->target, target)) {
             Require(surface->target.sampleLocationsGrid.width == target.sampleLocationsGrid.width && surface->target.sampleLocationsGrid.height == target.sampleLocationsGrid.height &&
                 surface->target.sampleLocations.size() == target.sampleLocations.size() && std::equal(surface->target.sampleLocations.begin(), surface->target.sampleLocations.end(), target.sampleLocations.begin(),
                     [](const auto& a, const auto& b) { return a.x == b.x && a.y == b.y; }), "changing sample locations for an existing depth/stencil surface is unsupported");
