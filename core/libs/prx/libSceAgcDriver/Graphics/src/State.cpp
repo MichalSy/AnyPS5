@@ -490,8 +490,8 @@ std::string DepthMaintenanceRejection(const QueueState& queue) {
     const auto frontMask = word(0x10c);
     const auto backMask = word(0x10d);
     const auto reject = [&](const char* reason) {
-        char detail[384];
-        std::snprintf(detail, sizeof(detail), "DB_RENDER_CONTROL stencil clear %s is unsupported (DB_RENDER_CONTROL=0x%08x, DB_DEPTH_CONTROL=0x%08x, DB_DEPTH_VIEW=0x%08x, DB_STENCILREFMASK=0x%08x, DB_STENCILREFMASK_BF=0x%08x)", reason, control->second, depthControl, view, frontMask, backMask);
+        char detail[768];
+        std::snprintf(detail, sizeof(detail), "DB_RENDER_CONTROL stencil clear %s is unsupported (DB_RENDER_CONTROL=0x%08x, DB_DEPTH_CONTROL=0x%08x, DB_DEPTH_VIEW=0x%08x, DB_STENCILREFMASK=0x%08x, DB_STENCILREFMASK_BF=0x%08x, DB_Z_INFO=0x%08x, DB_STENCIL_INFO=0x%08x, DB_Z_READ_BASE=0x%08x:%08x, DB_STENCIL_READ_BASE=0x%08x:%08x, DB_STENCIL_WRITE_BASE=0x%08x:%08x)", reason, control->second, depthControl, view, frontMask, backMask, word(0x010), word(0x011), word(0x01a) & 0xffu, word(0x012), word(0x01b) & 0xffu, word(0x013), word(0x01d) & 0xffu, word(0x015));
         return std::string(detail);
     };
     if (control->second != 2u && control->second != 0x22u) return reject("with additional control flags");
