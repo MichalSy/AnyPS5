@@ -36,7 +36,7 @@ int main() {
     Require(fsetpos_nid_postfix(&file, &beginning) == 0);
     Require(std::fgetc(file.GetHandle()) == 'p');
     Require(fgetpos_nid_postfix(&file, &position) == 0 && position == 1);
-    file.Close();
+    Require(file.Close() == 0);
 
     int descriptors[2];
 #ifdef _WIN32
@@ -58,8 +58,8 @@ int main() {
     Require(errno == expectedError);
     Require(position == 123);
 #ifdef _WIN32
-    Require(std::fclose(pipe.GetHandle()) == EOF);
+    Require(pipe.Close() == EOF);
 #else
-    pipe.Close();
+    Require(pipe.Close() == 0);
 #endif
 }

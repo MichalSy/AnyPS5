@@ -113,21 +113,13 @@ unsigned int APS5_VABI _ZSt14_Random_devicev_nid_postfix() {
 }
 
 void APS5_VABI _Lockfilelock_nid_postfix(FileStream* stream) {
-    if (stream == nullptr) throw std::invalid_argument("_Lockfilelock: null stream");
-#ifdef _WIN32
-    _lock_file(GetNativeStream(stream));
-#else
-    flockfile(GetNativeStream(stream));
-#endif
+    if (!stream) { errno = 22; return; }
+    stream->Lock();
 }
 
 void APS5_VABI _Unlockfilelock_nid_postfix(FileStream* stream) {
-    if (stream == nullptr) throw std::invalid_argument("_Unlockfilelock: null stream");
-#ifdef _WIN32
-    _unlock_file(GetNativeStream(stream));
-#else
-    funlockfile(GetNativeStream(stream));
-#endif
+    if (!stream) { errno = 22; return; }
+    stream->Unlock();
 }
 
 unsigned long APS5_VABI _Stoul_nid_postfix(const char* str, char** endptr, int base) {

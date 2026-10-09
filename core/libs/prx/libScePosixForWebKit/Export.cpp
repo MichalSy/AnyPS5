@@ -1,5 +1,6 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestFileDescriptors.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include <cctype>
@@ -42,13 +43,16 @@ int APS5_VABI isatty_nid_postfix(int descriptor) {
         return 0;
     }
     const int savedError = *__error_nid_postfix();
+    const auto lease = GuestFiles::Acquire_nid_no_patch(descriptor);
+    if (!lease) { Failure(errno); return 0; }
+    const int nativeDescriptor = GuestFiles::NativeDescriptor_nid_no_patch(lease);
     errno = 0;
 #ifdef _WIN32
     const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
-    const int result = ::_isatty(descriptor);
+    const int result = ::_isatty(nativeDescriptor);
     _set_thread_local_invalid_parameter_handler(previous);
 #else
-    const int result = ::isatty(descriptor);
+    const int result = ::isatty(nativeDescriptor);
 #endif
     *__error_nid_postfix() = result ? savedError : errno == EBADF ? GuestEbadf : GuestEnotty;
     return result ? 1 : 0;

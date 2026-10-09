@@ -821,13 +821,9 @@ static void CheckReadsIntoSharedWriteTracking() {
     std::int32_t deleted = -1;
     Require(sceKernelAioDeleteRequest(id, &deleted) == 0);
     Require(sceKernelMprotect(mapped, page * 2, 1) == 0);
-    bool refused = false;
-    try {
-        sceKernelPread(fd, mapped, page, 0);
-    } catch (const std::exception&) {
-        refused = true;
-    }
-    Require(refused);
+    const std::vector<unsigned char> unchanged(bytes, bytes + page);
+    Require(sceKernelPread(fd, mapped, page, 0) == static_cast<std::int64_t>(SCE_KERNEL_ERROR_EFAULT));
+    Require(std::memcmp(bytes, unchanged.data(), page) == 0);
     KernelAioResult refusedResult{-1, 0};
     KernelAioRwRequest refusedRequest{0, page, bytes, &refusedResult, fd};
     Require(sceKernelAioSubmitReadCommands(&refusedRequest, 1, 0, &id) == 0);

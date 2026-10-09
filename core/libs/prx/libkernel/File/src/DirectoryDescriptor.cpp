@@ -3,6 +3,7 @@
 
 #ifdef _WIN32
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
@@ -35,8 +36,15 @@ namespace File {
 int OpenDirectoryDescriptor(const std::filesystem::path& path) {
     const int fd = ::_open("NUL", _O_RDONLY | _O_BINARY);
     if (fd < 0) return -1;
-    std::lock_guard lock(g_mutex);
-    g_directories[fd] = DirectoryState{path};
+    try {
+        std::lock_guard lock(g_mutex);
+        g_directories.emplace(fd, DirectoryState{path});
+    } catch (...) {
+        const int error = errno;
+        ::_close(fd);
+        errno = error;
+        throw;
+    }
     return fd;
 }
 

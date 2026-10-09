@@ -1,5 +1,6 @@
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libkernel/File/include/FileFlags.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
@@ -13,6 +14,8 @@
 #include <unistd.h>
 #endif
 extern "C" {
+int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
+int APS5_VABI sceKernelClose(int);
 FileStream* APS5_VABI fopen_nid_postfix(const char*, const char*);
 std::size_t APS5_VABI fread_nid_postfix(void*, std::size_t, std::size_t, FileStream*);
 std::size_t APS5_VABI fwrite_nid_postfix(const void*, std::size_t, std::size_t, FileStream*);
@@ -134,29 +137,27 @@ int main() {
     Require(fdopen_nid_postfix(-1, "rb") == nullptr && *__error_nid_postfix() == 9);
     Require(fdopen_nid_postfix(0, nullptr) == nullptr && *__error_nid_postfix() == 22);
     Require(fdopen_nid_postfix(0, "invalid") == nullptr && *__error_nid_postfix() == 22);
-    std::FILE* original = std::tmpfile();
+    const auto fdopenFilename = "anyps5-fdopen-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    std::FILE* original = std::fopen(fdopenFilename.c_str(), "w+b");
     Require(original != nullptr);
-    std::fputs("retained", original);
-    std::fflush(original);
-#ifdef _WIN32
-    const int descriptor = _dup(_fileno(original));
-#else
-    const int descriptor = ::dup(::fileno(original));
-#endif
-    Require(descriptor >= 0);
+    Require(std::fputs("retained", original) >= 0 && std::fflush(original) == 0);
+    const int descriptor = sceKernelOpen(fdopenFilename.c_str(), SCE_KERNEL_O_RDWR, 0);
+    Require(descriptor >= 3 && descriptor <= 32767);
     auto* wrapped = fdopen_nid_postfix(descriptor, "r+b");
     Require(wrapped != nullptr && fileno_nid_postfix(wrapped) == descriptor);
+    Require(wrapped->GuestState().descriptor == descriptor);
     setbuf_nid_postfix(wrapped, nullptr);
     Require(fseek_nid_postfix(wrapped, 0, SEEK_SET) == 0);
     char contents[32]{};
     Require(fgets_nid_postfix(contents, sizeof(contents), wrapped) == contents && std::strcmp(contents, "retained") == 0);
     Require(fclose_nid_postfix(wrapped) == 0);
-#ifdef _WIN32
-    Require(_close(descriptor) == -1);
-#else
-    Require(::close(descriptor) == -1);
-#endif
+    Require(sceKernelClose(descriptor) == static_cast<int>(0x80020009u));
+    std::rewind(original);
+    char nativeContents[16]{};
+    Require(std::fread(nativeContents, 1, sizeof(nativeContents), original) == 8);
+    Require(std::memcmp(nativeContents, "retained", 8) == 0 && std::ferror(original) == 0);
     Require(std::fclose(original) == 0);
+    Require(std::filesystem::remove(fdopenFilename));
     char stringOutput[256];
     std::memset(stringOutput, '!', sizeof(stringOutput));
     std::int64_t count = -1;

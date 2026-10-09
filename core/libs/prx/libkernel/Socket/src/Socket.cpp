@@ -2,6 +2,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestFileDescriptors.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 
@@ -16,7 +17,7 @@
 #ifndef _WIN32
 #include <cerrno>
 #include <fcntl.h>
-#include <sys/select.h>
+#include <poll.h>
 #endif
 
 namespace {
@@ -77,44 +78,39 @@ int PollVirtual(KernelSocketPoll::Poller poller, std::vector<KernelSocketPoll::E
     return result;
 }
 
-int PollNative(std::vector<KernelSocketPoll::Entry>& entries, int timeoutMilliseconds) {
+int PollNative(std::vector<KernelSocketPoll::Entry>& entries, const std::vector<int>& descriptors, int timeoutMilliseconds) {
 #ifdef _WIN32
     if (!entries.empty()) return -GuestEopnotsupp;
     if (timeoutMilliseconds > 0) std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMilliseconds));
     return 0;
 #else
-    fd_set readfds;
-    fd_set writefds;
-    fd_set exceptfds;
-    FD_ZERO(&readfds);
-    FD_ZERO(&writefds);
-    FD_ZERO(&exceptfds);
-    int nfds = 0;
-    for (auto& entry : entries) {
+    std::vector<pollfd> native;
+    native.reserve(entries.size());
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        auto& entry = entries[index];
         entry.revents = 0;
-        if (::fcntl(entry.descriptor, F_GETFD) < 0) return errno == EBADF ? -GuestEbadf : -5;
-        if (entry.events & KernelSocketPoll::Readable) FD_SET(entry.descriptor, &readfds);
-        if (entry.events & KernelSocketPoll::Writable) FD_SET(entry.descriptor, &writefds);
-        if (entry.events & KernelSocketPoll::Urgent) FD_SET(entry.descriptor, &exceptfds);
-        nfds = std::max(nfds, entry.descriptor + 1);
+        short events = 0;
+        if (entry.events & KernelSocketPoll::Readable) events |= POLLIN;
+        if (entry.events & KernelSocketPoll::Writable) events |= POLLOUT;
+        if (entry.events & KernelSocketPoll::Urgent) events |= POLLPRI;
+        native.push_back({descriptors[index], events, 0});
     }
-    timeval timeout{timeoutMilliseconds / 1000, (timeoutMilliseconds % 1000) * 1000};
-    const int result = ::select(nfds, &readfds, &writefds, &exceptfds, &timeout);
-    if (result < 0) {
-        switch (errno) {
-            case EINTR: return -4;
-            case EBADF: return -GuestEbadf;
-            case ENOMEM: return -GuestEnomem;
-            case EFAULT: return -GuestEfault;
-            case EINVAL: return -GuestEinval;
-            case EAGAIN: return -35;
-            default: return -5;
-        }
+    const auto started = std::chrono::steady_clock::now();
+    const auto errorResult = [] { return -GuestFiles::NativeError_nid_no_patch(errno); };
+    const int result = ::poll(native.data(), static_cast<nfds_t>(native.size()), timeoutMilliseconds);
+    if (result < 0) return errorResult();
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        if (native[index].revents & POLLNVAL) return -GuestEbadf;
+        if (native[index].revents & POLLIN) entries[index].revents |= KernelSocketPoll::Readable;
+        if (native[index].revents & POLLOUT) entries[index].revents |= KernelSocketPoll::Writable;
+        if (native[index].revents & POLLPRI) entries[index].revents |= KernelSocketPoll::Urgent;
+        if (native[index].revents & POLLHUP) entries[index].revents |= KernelSocketPoll::HangUp;
+        if (native[index].revents & POLLERR) entries[index].revents |= KernelSocketPoll::Error;
     }
-    for (auto& entry : entries) {
-        if (FD_ISSET(entry.descriptor, &readfds)) entry.revents |= KernelSocketPoll::Readable;
-        if (FD_ISSET(entry.descriptor, &writefds)) entry.revents |= KernelSocketPoll::Writable;
-        if (FD_ISSET(entry.descriptor, &exceptfds)) entry.revents |= KernelSocketPoll::Urgent;
+    if (result > 0 && ReadyCount(entries) == 0 && timeoutMilliseconds > 0) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+        const auto remaining = static_cast<int>(std::max<std::int64_t>(0, timeoutMilliseconds - elapsed));
+        if (remaining > 0 && ::poll(nullptr, 0, remaining) < 0) return errorResult();
     }
     return result;
 #endif
@@ -177,10 +173,20 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         if (entry.revents & KernelSocketPoll::Unknown) nativeEntries.push_back(entry);
         else virtualEntries.push_back(entry);
     }
+    std::vector<GuestFiles::Lease> nativeLeases;
+    std::vector<int> nativeDescriptors;
+    nativeLeases.reserve(nativeEntries.size());
+    nativeDescriptors.reserve(nativeEntries.size());
+    for (const auto& entry : nativeEntries) {
+        auto lease = GuestFiles::Acquire_nid_no_patch(entry.descriptor);
+        if (!lease) return fail(GuestEbadf);
+        nativeDescriptors.push_back(GuestFiles::NativeDescriptor_nid_no_patch(lease));
+        nativeLeases.push_back(std::move(lease));
+    }
     for (;;) {
         const int virtualResult = PollVirtual(poller, virtualEntries, 0);
         if (virtualResult < 0) return fail(-virtualResult);
-        const int nativeResult = PollNative(nativeEntries, 0);
+        const int nativeResult = PollNative(nativeEntries, nativeDescriptors, 0);
         if (nativeResult < 0) return fail(-nativeResult);
         const int ready = ReadyCount(virtualEntries) + ReadyCount(nativeEntries);
         if (ready > 0 || (limit != nullptr && std::chrono::steady_clock::now() >= deadline)) {
@@ -217,11 +223,11 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
             if (ReadyCount(virtualEntries) == 0) {
                 const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - waitStart).count();
                 const int remaining = static_cast<int>(std::max<std::int64_t>(0, waitMilliseconds - elapsed));
-                const int pauseResult = PollNative(nativeEntries, remaining);
+                const int pauseResult = PollNative(nativeEntries, nativeDescriptors, remaining);
                 if (pauseResult < 0) return fail(-pauseResult);
             }
         } else {
-            const int result = PollNative(nativeEntries, waitMilliseconds);
+            const int result = PollNative(nativeEntries, nativeDescriptors, waitMilliseconds);
             if (result < 0) return fail(-result);
         }
     }

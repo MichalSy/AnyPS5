@@ -2,6 +2,7 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestFileDescriptors.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
@@ -32,22 +33,23 @@ static std::int64_t NativeLseek(int fd, std::int64_t offset, int whence) {
     return result;
 }
 static int NativeRead(int fd, void* buf, std::size_t n) {
-    if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
-        throw std::runtime_error("sceKernelRead: nbytes exceeds platform limit");
+    if (n > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        errno = EINVAL;
+        return -1;
     }
-    return ::_read(fd, buf, static_cast<unsigned int>(n));
+    char empty = 0;
+    return ::_read(fd, buf == nullptr ? &empty : buf, static_cast<unsigned int>(n));
 }
 static int NativeWrite(int fd, const void* buf, std::size_t n) {
-    if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
-        throw std::runtime_error("sceKernelWrite: nbytes exceeds platform limit");
+    if (n > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        errno = EINVAL;
+        return -1;
     }
-    return ::_write(fd, buf, static_cast<unsigned int>(n));
+    const char empty = 0;
+    return ::_write(fd, buf == nullptr ? &empty : buf, static_cast<unsigned int>(n));
 }
-static int NativeClose(int fd) {
-    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
-    const int result = ::_close(fd);
-    _set_thread_local_invalid_parameter_handler(previous);
-    return result;
+static void NativeCleanup(int fd) noexcept {
+    File::ForgetDirectoryDescriptor(fd);
 }
 static int NativeUnlink(const std::filesystem::path& p) {
     return ::_wunlink(p.wstring().c_str());
@@ -81,7 +83,7 @@ static std::int64_t NativeRead(int fd, void* buf, std::size_t n) {
 static std::int64_t NativeWrite(int fd, const void* buf, std::size_t n) {
     return ::write(fd, buf, n);
 }
-static int NativeClose(int fd) { return ::close(fd); }
+static constexpr GuestFiles::NativeCleanup NativeCleanup = nullptr;
 static int NativeUnlink(const std::filesystem::path& p) {
     return ::unlink(p.c_str());
 }
@@ -97,81 +99,75 @@ static int MapFlags(int sceFlags) {
     if (sceFlags & SCE_KERNEL_O_TRUNC) f |= O_TRUNC;
     if (sceFlags & SCE_KERNEL_O_EXCL) f |= O_EXCL;
     if (sceFlags & SCE_KERNEL_O_SYNC) f |= O_SYNC;
+    if (sceFlags & SCE_KERNEL_O_NONBLOCK) f |= O_NONBLOCK;
     if (sceFlags & SCE_KERNEL_O_DIRECTORY) f |= O_DIRECTORY;
     return f;
 }
 #endif
 
+static int SceErrorFromGuest(int error) {
+    return static_cast<int>(0x80020000u | static_cast<unsigned>(error));
+}
+
 static int SceErrorFromErrno(int error) {
-    constexpr int GuestEio = 5;
-    const int guest = error > 0 && error <= 34 ? error : GuestEio;
-    return static_cast<int>(0x80020000u | static_cast<unsigned>(guest));
+    return SceErrorFromGuest(GuestFiles::NativeError_nid_no_patch(error));
 }
 
 extern "C" {
 
 int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
-    APS5_LOG_OUT("path=%s flags=0x%X nativeFlags=0x%X mode=0%o", path, flags, MapFlags(flags), mode);
+    if (path == nullptr) return SCE_KERNEL_ERROR_EFAULT;
+    if (*path == '\0') return SCE_KERNEL_ERROR_ENOENT;
+    if ((flags & SCE_KERNEL_O_ACCMODE) == SCE_KERNEL_O_ACCMODE) return SCE_KERNEL_ERROR_EINVAL;
+    if (GuestFiles::InitializeStandards_nid_no_patch() != 0) return SceErrorFromGuest(errno);
+    const int nativeFlags = MapFlags(flags);
+    APS5_LOG_OUT("path=%s flags=0x%X nativeFlags=0x%X mode=0%o", path, flags, nativeFlags, mode);
     auto native = ResolvePath_nid_no_patch(path);
-    int fd = NativeOpen(native, MapFlags(flags), mode);
+    int fd = NativeOpen(native, nativeFlags, mode);
 #ifdef _WIN32
-    if (fd < 0 && errno != ENOENT) {
+    if (fd < 0 && errno != ENOENT && (flags & SCE_KERNEL_O_ACCMODE) == SCE_KERNEL_O_RDONLY) {
         std::error_code error;
         if (std::filesystem::is_directory(native, error)) fd = File::OpenDirectoryDescriptor(native);
     }
 #endif
-    if (fd < 0) {
-        return SceErrorFromErrno(errno);
-    }
+    if (fd < 0) return SceErrorFromErrno(errno);
+    const auto lease = GuestFiles::AdoptOwned_nid_no_patch(fd, flags & SCE_KERNEL_O_ACCMODE, NativeCleanup);
+    if (!lease) return SceErrorFromGuest(errno);
     if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY || (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)))
         RecordWrittenPath_nid_no_patch(native);
-    return fd;
+    return GuestFiles::LogicalDescriptor_nid_no_patch(lease);
 }
 
 int APS5_VABI sceKernelClose(int d) {
-#ifdef _WIN32
-    File::ForgetDirectoryDescriptor(d);
-#endif
-    if (NativeClose(d) != 0) {
-        if (errno == EBADF) return SCE_KERNEL_ERROR_EBADF;
-        throw std::runtime_error(std::string(__func__) + ": close failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
-    }
-    return 0;
+    return GuestFiles::Close_nid_no_patch(d) == 0 ? 0 : SceErrorFromGuest(errno);
 }
 
 std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
-    if (buf == nullptr) {
-        throw std::invalid_argument(std::string(__func__) + ": buf is null");
-    }
+    const auto lease = GuestFiles::Acquire_nid_no_patch(d);
+    if (!lease) return SceErrorFromGuest(errno);
+    if (GuestFiles::AccessMode_nid_no_patch(lease) == 1) return SCE_KERNEL_ERROR_EBADF;
+    if (buf == nullptr && nbytes != 0) return SCE_KERNEL_ERROR_EFAULT;
     const GuestArena::HostWrite destination(buf, nbytes);
-    if (!destination.Open()) errno = EFAULT;
-    auto n = destination.Open() ? NativeRead(d, buf, nbytes) : -1;
-    if (n < 0) {
-        throw std::runtime_error(std::string(__func__) + ": read failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
-    }
-    return static_cast<std::int64_t>(n);
+    if (!destination.Open()) return SCE_KERNEL_ERROR_EFAULT;
+    const auto result = NativeRead(GuestFiles::NativeDescriptor_nid_no_patch(lease), buf, nbytes);
+    return result < 0 ? SceErrorFromErrno(errno) : static_cast<std::int64_t>(result);
 }
 
 std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes) {
-    if (buf == nullptr) {
-        throw std::invalid_argument(std::string(__func__) + ": buf is null");
-    }
-    auto n = NativeWrite(d, buf, nbytes);
-    if (n < 0) {
-        throw std::runtime_error(std::string(__func__) + ": write failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
-    }
-    return static_cast<std::int64_t>(n);
+    const auto lease = GuestFiles::Acquire_nid_no_patch(d);
+    if (!lease) return SceErrorFromGuest(errno);
+    if (GuestFiles::AccessMode_nid_no_patch(lease) == 0) return SCE_KERNEL_ERROR_EBADF;
+    if (buf == nullptr && nbytes != 0) return SCE_KERNEL_ERROR_EFAULT;
+    const auto result = NativeWrite(GuestFiles::NativeDescriptor_nid_no_patch(lease), buf, nbytes);
+    return result < 0 ? SceErrorFromErrno(errno) : static_cast<std::int64_t>(result);
 }
 
 std::int64_t APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
-    if (whence < 0 || whence > 2) {
-        return SCE_KERNEL_ERROR_EINVAL;
-    }
-    const std::int64_t result = NativeLseek(d, offset, whence);
-    if (result < 0) {
-        return errno == EOVERFLOW ? SCE_KERNEL_ERROR_EOVERFLOW : SceErrorFromErrno(errno);
-    }
-    return result;
+    if (whence < 0 || whence > 2) return SCE_KERNEL_ERROR_EINVAL;
+    const auto lease = GuestFiles::Acquire_nid_no_patch(d);
+    if (!lease) return SceErrorFromGuest(errno);
+    const auto result = NativeLseek(GuestFiles::NativeDescriptor_nid_no_patch(lease), offset, whence);
+    return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
 int APS5_VABI sceKernelStat(const char* path, FileStat* sb) {

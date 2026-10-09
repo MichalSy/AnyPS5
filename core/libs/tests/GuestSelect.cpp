@@ -1,5 +1,6 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
+#include "prx/libc/include/GuestFileDescriptors.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -23,6 +24,10 @@
 extern "C" {
 int APS5_VABI select_nid_postfix(int, void*, void*, void*, const void*);
 int* APS5_VABI __error_nid_postfix();
+int APS5_VABI pipe_nid_postfix(int*);
+int APS5_VABI sceKernelClose(int);
+std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
+std::int64_t APS5_VABI sceKernelWrite(int, const void*, std::size_t);
 }
 
 using DescriptorSet = std::array<std::uint64_t, 16>;
@@ -94,15 +99,15 @@ int main() {
 
     int pipe[2];
 #ifdef _WIN32
-    Require(::_pipe(pipe, 4096, _O_BINARY) == 0, "create native pipe");
+    Require(pipe_nid_postfix(pipe) == 0, "create guest pipe");
     reads = {};
     Set(reads, pipe[0]);
     const auto nativeReads = reads;
     Require(select_nid_postfix(pipe[0] + 1, reads.data(), nullptr, nullptr, pollNow.data()) == -1 &&
         *__error_nid_postfix() == 45 && reads == nativeReads, "Windows CRT descriptors are explicitly unsupported");
-    Require(::_close(pipe[0]) == 0 && ::_close(pipe[1]) == 0, "close native pipe");
+    Require(sceKernelClose(pipe[0]) == 0 && sceKernelClose(pipe[1]) == 0, "close guest pipe");
 #else
-    Require(::pipe(pipe) == 0, "create native pipe");
+    Require(pipe_nid_postfix(pipe) == 0, "create guest pipe");
     reads = {};
     Set(reads, pipe[0]);
     Require(select_nid_postfix(pipe[0] + 1, reads.data(), nullptr, nullptr, pollNow.data()) == 0 &&
@@ -110,7 +115,7 @@ int main() {
     const char message = 's';
     std::thread writer([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
-        Require(::write(pipe[1], &message, 1) == 1, "write native pipe");
+        Require(sceKernelWrite(pipe[1], &message, 1) == 1, "write guest pipe");
     });
     reads = {};
     Set(reads, pipe[0]);
@@ -119,11 +124,15 @@ int main() {
     writer.join();
     Require(result == 1 && IsSet(reads, pipe[0]) && second == Timeval{1, 0}, "pipe becomes readable during wait");
     char received = 0;
-    Require(::read(pipe[0], &received, 1) == 1 && received == message, "read native pipe");
+    Require(sceKernelRead(pipe[0], &received, 1) == 1 && received == message, "read guest pipe");
 
     int sockets[2];
     Require(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0, "create native socket pair");
     Require(::write(sockets[1], &message, 1) == 1, "write native socket");
+    auto socketLease = GuestFiles::AdoptOwned_nid_no_patch(sockets[0], 2);
+    Require(static_cast<bool>(socketLease), "adopt owned native socket privately");
+    sockets[0] = GuestFiles::LogicalDescriptor_nid_no_patch(socketLease);
+    socketLease.reset();
     reads = {};
     DescriptorSet writes{};
     DescriptorSet exceptions{};
@@ -133,7 +142,7 @@ int main() {
     Require(select_nid_postfix(sockets[0] + 1, reads.data(), writes.data(), exceptions.data(), pollNow.data()) == 2 &&
         IsSet(reads, sockets[0]) && IsSet(writes, sockets[0]) && !IsSet(exceptions, sockets[0]),
         "return counts readiness bits and ordinary data is not exceptional");
-    Require(::close(sockets[0]) == 0 && ::close(sockets[1]) == 0, "close native socket pair");
+    Require(sceKernelClose(sockets[0]) == 0 && ::close(sockets[1]) == 0, "close owned socket pair");
     reads = {};
     Set(reads, sockets[0]);
     const auto closedReads = reads;
@@ -141,11 +150,35 @@ int main() {
         *__error_nid_postfix() == 9 && reads == closedReads, "invalid native descriptor reports EBADF without changing sets");
     reads = {};
     Set(reads, 1023);
-    if (::fcntl(1023, F_GETFD) < 0) {
-        const auto highReads = reads;
-        Require(select_nid_postfix(1024, reads.data(), nullptr, nullptr, pollNow.data()) == -1 &&
-            *__error_nid_postfix() == 9 && reads == highReads, "invalid high descriptor is not silently ignored");
-    }
+    const auto highReads = reads;
+    Require(select_nid_postfix(1024, reads.data(), nullptr, nullptr, pollNow.data()) == -1 &&
+        *__error_nid_postfix() == 9 && reads == highReads, "unowned high guest descriptor is not silently ignored");
+
+    int privatePipe[2];
+    Require(::pipe(privatePipe) == 0, "create private high-descriptor fixture");
+    const int highNative = ::fcntl(privatePipe[0], F_DUPFD_CLOEXEC, 1024);
+    Require(highNative >= 1024, "native descriptor exceeds guest fd_set range");
+    Require(::close(privatePipe[0]) == 0, "close original private pipe reader");
+    auto highLease = GuestFiles::AdoptOwned_nid_no_patch(highNative, 0);
+    Require(static_cast<bool>(highLease), "adopt private high native descriptor");
+    const int highGuest = GuestFiles::LogicalDescriptor_nid_no_patch(highLease);
+    Require(highGuest < 1024 && highGuest != highNative, "logical descriptor remains representable independently");
+    highLease.reset();
+    Require(::write(privatePipe[1], &message, 1) == 1, "prepare high native descriptor readability");
+    reads = {};
+    Set(reads, highGuest);
+    Require(select_nid_postfix(highGuest + 1, reads.data(), nullptr, nullptr, pollNow.data()) == 1 &&
+        IsSet(reads, highGuest), "high native descriptor readiness maps to the guest bit");
+    Require(sceKernelRead(highGuest, &received, 1) == 1 && received == message, "read actual high native pipe payload");
+    Require(::close(privatePipe[1]) == 0, "close private writer");
+    DescriptorSet highExceptions{};
+    Set(highExceptions, highGuest);
+    const auto ignoredHangupStart = std::chrono::steady_clock::now();
+    Require(select_nid_postfix(highGuest + 1, nullptr, nullptr, highExceptions.data(), shortWait.data()) == 0 &&
+        !IsSet(highExceptions, highGuest), "native EOF is not an exceptional-data event");
+    Require(std::chrono::steady_clock::now() - ignoredHangupStart >= std::chrono::milliseconds(20),
+        "unrequested native hangup still waits for timeout");
+    Require(sceKernelClose(highGuest) == 0, "close high native guest descriptor");
 
     struct sigaction previous{};
     struct sigaction action{};
@@ -193,7 +226,7 @@ int main() {
     Require(std::chrono::steady_clock::now() - hangupStart >= std::chrono::milliseconds(20), "unrequested hangup still observes timeout");
 #ifndef _WIN32
     virtualReadiness = KernelSocketPoll::Readable | KernelSocketPoll::Writable;
-    Require(::write(pipe[1], &message, 1) == 1, "prepare mixed descriptor sets");
+    Require(sceKernelWrite(pipe[1], &message, 1) == 1, "prepare mixed descriptor sets");
     reads = {};
     virtualWrites = {};
     Set(reads, pipe[0]);
@@ -202,14 +235,14 @@ int main() {
     Require(select_nid_postfix(VirtualDescriptor + 1, reads.data(), virtualWrites.data(), nullptr, pollNow.data()) == 3 &&
         IsSet(reads, pipe[0]) && IsSet(reads, VirtualDescriptor) && IsSet(virtualWrites, VirtualDescriptor),
         "native and virtual descriptor readiness is combined");
-    Require(::read(pipe[0], &received, 1) == 1, "drain mixed readiness pipe");
-    Require(::close(pipe[1]) == 0, "close pipe writer");
+    Require(sceKernelRead(pipe[0], &received, 1) == 1, "drain mixed readiness pipe");
+    Require(sceKernelClose(pipe[1]) == 0, "close guest pipe writer");
     KernelSetSocketPoller_nid_no_patch(nullptr);
     reads = {};
     Set(reads, pipe[0]);
     Require(select_nid_postfix(pipe[0] + 1, reads.data(), nullptr, nullptr, pollNow.data()) == 1 &&
         IsSet(reads, pipe[0]), "native EOF is readable");
-    Require(::close(pipe[0]) == 0, "close pipe reader");
+    Require(sceKernelClose(pipe[0]) == 0, "close guest pipe reader");
 #endif
     KernelSetSocketPoller_nid_no_patch(nullptr);
 }

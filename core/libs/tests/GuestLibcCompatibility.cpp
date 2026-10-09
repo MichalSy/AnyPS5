@@ -26,6 +26,9 @@ void APS5_VABI syslog_nid_postfix(int, const char*, ...);
 int APS5_VABI isatty_nid_postfix(int);
 int APS5_VABI mkstemp_nid_postfix(char*);
 int APS5_VABI close_nid_postfix(int);
+std::int64_t APS5_VABI read_nid_postfix(int, void*, std::size_t);
+std::int64_t APS5_VABI write_nid_postfix(int, const void*, std::size_t);
+std::int64_t APS5_VABI lseek_nid_postfix(int, std::int64_t, int);
 int APS5_VABI socket_nid_postfix(int, int, int);
 int* APS5_VABI __error_nid_postfix();
 }
@@ -54,6 +57,14 @@ bool NativeRedirect(int from, int to) {
 #endif
 }
 
+int NativeClose(int descriptor) {
+#ifdef _WIN32
+    return ::_close(descriptor);
+#else
+    return ::close(descriptor);
+#endif
+}
+
 int NativeDescriptor(std::FILE* stream) {
 #ifdef _WIN32
     return ::_fileno(stream);
@@ -77,7 +88,7 @@ void CheckLog() {
     const int afterNull = *__error_nid_postfix();
     std::fflush(stderr);
     Require(NativeRedirect(saved, NativeDescriptor(stderr)));
-    Require(close_nid_postfix(saved) == 0);
+    Require(NativeClose(saved) == 0);
     Require(afterLog == 45 && afterNull == 45);
     std::rewind(capture);
     std::array<char, 1024> text{};
@@ -117,19 +128,23 @@ int main() {
     char first[] = "/compat-temp/file.XXXXXX";
     char second[] = "/compat-temp/file.XXXXXX";
     const int file = mkstemp_nid_postfix(first);
-    Require(file >= 0);
+    Require(file >= 3 && file <= 32767);
     Require(std::strcmp(first, "/compat-temp/file.XXXXXX") != 0);
     Require(std::filesystem::exists(ResolvePath_nid_no_patch(first)));
     Require(isatty_nid_postfix(file) == 0 && *__error_nid_postfix() == 25);
 #ifndef _WIN32
     struct stat status{};
-    Require(::fstat(file, &status) == 0 && (status.st_mode & 0777) == 0600);
-    Require(::write(file, "x", 1) == 1 && ::lseek(file, 0, SEEK_SET) == 0);
-    char byte = '\0';
-    Require(::read(file, &byte, 1) == 1 && byte == 'x');
+    Require(::stat(ResolvePath_nid_no_patch(first).c_str(), &status) == 0 && (status.st_mode & 0777) == 0600);
 #endif
+    Require(write_nid_postfix(file, "x", 1) == 1 && lseek_nid_postfix(file, 0, SEEK_SET) == 0);
+    char byte = '\0';
+    Require(read_nid_postfix(file, &byte, 1) == 1 && byte == 'x');
+    Require(lseek_nid_postfix(file, 0, SEEK_CUR) == 1);
+    auto* persisted = std::fopen(ResolvePath_nid_no_patch(first).string().c_str(), "rb");
+    Require(persisted != nullptr && std::fgetc(persisted) == 'x' && std::fgetc(persisted) == EOF);
+    Require(std::fclose(persisted) == 0);
     const int another = mkstemp_nid_postfix(second);
-    Require(another >= 0 && std::strcmp(first, second) != 0);
+    Require(another >= 3 && another <= 32767 && another != file && std::strcmp(first, second) != 0);
     Require(close_nid_postfix(file) == 0 && close_nid_postfix(another) == 0);
     RemovePathAlias_nid_no_patch("/compat-temp");
     std::filesystem::remove_all(root);

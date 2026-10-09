@@ -10,16 +10,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-static int MakePipe(int* ends) { return ::_pipe(ends, 64, _O_BINARY); }
-static int ClosePipe(int end) { return ::_close(end); }
-#else
-#include <unistd.h>
-static int MakePipe(int* ends) { return ::pipe(ends); }
-static int ClosePipe(int end) { return ::close(end); }
-#endif
+
 
 struct GuestIovec {
     void* base;
@@ -29,6 +20,8 @@ struct GuestIovec {
 extern "C" {
 int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
 int APS5_VABI sceKernelClose(int);
+int APS5_VABI pipe_nid_postfix(int*);
+int APS5_VABI close_nid_postfix(int);
 std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
 std::int64_t APS5_VABI sceKernelLseek(int, std::int64_t, int);
 std::int64_t APS5_VABI sceKernelReadv(int, const GuestIovec*, int);
@@ -126,7 +119,7 @@ int main() {
     Require(sceKernelPwritev(file, writes, 2, 0) == ErrorEbadf);
 
     int ends[2] = {};
-    Require(MakePipe(ends) == 0);
+    Require(pipe_nid_postfix(ends) == 0);
     char xyz[] = "xyz";
     GuestIovec message[1] = {{xyz, 3}};
     Require(sceKernelWritev(ends[1], message, 1) == 3);
@@ -134,7 +127,7 @@ int main() {
     Require(std::memcmp(first, "xyz", 3) == 0);
     Require(sceKernelPreadv(ends[0], reads, 2, 0) == ErrorEspipe);
     Require(sceKernelPwritev(ends[1], message, 1, 0) == ErrorEspipe);
-    Require(ClosePipe(ends[0]) == 0 && ClosePipe(ends[1]) == 0);
+    Require(close_nid_postfix(ends[0]) == 0 && close_nid_postfix(ends[1]) == 0);
 
     std::filesystem::remove_all(root);
     return 0;

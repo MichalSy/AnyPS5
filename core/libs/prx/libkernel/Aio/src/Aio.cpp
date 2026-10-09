@@ -9,6 +9,7 @@
 #include <thread>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestFileDescriptors.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 
@@ -105,9 +106,11 @@ std::int64_t NativePwrite(std::int32_t fd, const void* buf, std::size_t nbyte, s
 }
 
 bool RunRequest(KernelAioRwRequest& req, bool write) {
-    const std::int64_t done = write
-        ? NativePwrite(req.fd, req.buf, req.nbyte, req.offset)
-        : NativePread(req.fd, req.buf, req.nbyte, req.offset);
+    const auto lease = GuestFiles::Acquire_nid_no_patch(req.fd);
+    const auto native = lease ? GuestFiles::NativeDescriptor_nid_no_patch(lease) : -1;
+    const std::int64_t done = !lease ? -1 : write
+        ? NativePwrite(native, req.buf, req.nbyte, req.offset)
+        : NativePread(native, req.buf, req.nbyte, req.offset);
     if (done < 0) {
         const int error = errno;
         req.result->return_value = static_cast<std::int64_t>(SCE_KERNEL_ERROR_EIO);

@@ -13,6 +13,8 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Math.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Time.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FileAndHeap.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/FileStream.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestFileDescriptors.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StdioExtras.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StandardStreams.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestAllocations.cpp
@@ -46,6 +48,18 @@ if(WIN32)
 endif()
 
 if(BUILD_TESTING)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test_executable(guest_file_descriptor_ownership_tests ${LIBS_INCLUDE_DIR}/tests/GuestFileDescriptorOwnership.cpp)
+        target_include_directories(guest_file_descriptor_ownership_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_file_descriptor_ownership_tests PRIVATE libc)
+        add_test(NAME guest_file_descriptor_ownership COMMAND guest_file_descriptor_ownership_tests)
+        set_tests_properties(guest_file_descriptor_ownership PROPERTIES TIMEOUT 20)
+        add_test_executable(guest_stdio_errno_tests ${LIBS_INCLUDE_DIR}/tests/GuestStdioErrno.cpp)
+        target_include_directories(guest_stdio_errno_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_stdio_errno_tests PRIVATE libkernel libc)
+        add_test(NAME guest_stdio_errno COMMAND guest_stdio_errno_tests)
+        set_tests_properties(guest_stdio_errno PROPERTIES TIMEOUT 20)
+    endif()
     add_test_executable(guest_time_conversion_tests ${LIBS_INCLUDE_DIR}/tests/GuestTimeConversion.cpp)
     target_include_directories(guest_time_conversion_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_time_conversion_tests PRIVATE libc)
@@ -217,7 +231,7 @@ if(BUILD_TESTING)
     endif()
     add_test_executable(guest_standard_stream_tests ${LIBS_INCLUDE_DIR}/tests/GuestStandardStreams.cpp)
     target_include_directories(guest_standard_stream_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(guest_standard_stream_tests PRIVATE libc)
+    target_link_libraries(guest_standard_stream_tests PRIVATE libc libkernel)
     configure_windows_unwind(guest_standard_stream_tests)
     add_test(NAME guest_standard_streams COMMAND guest_standard_stream_tests)
     if(WIN32)

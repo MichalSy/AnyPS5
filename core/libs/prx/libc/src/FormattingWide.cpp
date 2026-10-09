@@ -236,12 +236,14 @@ int APS5_VABI snwprintf_s_nid_postfix(char16_t* buffer, std::size_t size, const 
 }
 
 int APS5_VABI wprintf_nid_postfix(const char16_t* format, ...) {
+    auto* native = GetNativeStream(&_Stdout_nid_postfix);
+    if (!native) return -1;
     APS5_VA_BEGIN(format);
     int result = -1;
     try {
         const std::u16string text = FormatWide(format, reinterpret_cast<VaList*>(args));
         const std::string bytes = ToUtf8(text);
-        if (std::fwrite(bytes.data(), 1, bytes.size(), stdout) == bytes.size()) result = static_cast<int>(text.size());
+        if (std::fwrite(bytes.data(), 1, bytes.size(), native) == bytes.size()) result = static_cast<int>(text.size());
     } catch (const std::exception&) {
         errno = 22;
     }
@@ -254,7 +256,12 @@ int APS5_VABI fputwc_nid_postfix(char16_t value, FileStream* stream) {
     try {
         const std::string bytes = ToUtf8(std::u16string(1, value));
         auto* native = GetNativeStream(stream);
-        if (std::fwrite(bytes.data(), 1, bytes.size(), native) != bytes.size()) throw std::runtime_error("stream write failed");
+        if (!native) return -1;
+        if (std::fwrite(bytes.data(), 1, bytes.size(), native) != bytes.size()) {
+            stream->SyncStatus();
+            errno = GuestFiles::NativeError_nid_no_patch(errno);
+            return -1;
+        }
         stream->SyncStatus();
         return value;
     } catch (const std::exception&) {
@@ -269,7 +276,12 @@ int APS5_VABI fputws_nid_postfix(const char16_t* str, FileStream* stream) {
         const std::u16string text(str);
         const std::string bytes = ToUtf8(text);
         auto* native = GetNativeStream(stream);
-        if (std::fwrite(bytes.data(), 1, bytes.size(), native) != bytes.size()) throw std::runtime_error("stream write failed");
+        if (!native) return -1;
+        if (std::fwrite(bytes.data(), 1, bytes.size(), native) != bytes.size()) {
+            stream->SyncStatus();
+            errno = GuestFiles::NativeError_nid_no_patch(errno);
+            return -1;
+        }
         stream->SyncStatus();
         return static_cast<int>(text.size());
     } catch (const std::exception&) {
