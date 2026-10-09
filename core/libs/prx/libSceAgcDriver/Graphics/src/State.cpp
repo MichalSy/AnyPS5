@@ -931,7 +931,7 @@ std::optional<ColorResolvePass> DecodeColorResolvePass(const QueueState& queue) 
     Require((mode & ~0x22u) == 0u, "color resolve requires disabled MSAA scan conversion without unsupported scan modes");
     zero(cx, 0x293, ScanControlMask, "color resolve sample iteration or unsupported scan control");
     const auto aa = read(cx, 0x2f8);
-    Require((aa & ~0x0071e007u) == 0u && (aa & 7u) == 3u && ((aa >> 20u) & 7u) == 3u,
+    Require(aa == 0u || ((aa & ~0x0071e007u) == 0u && (aa & 7u) == 3u && ((aa >> 20u) & 7u) == 3u),
         "color resolve requires matching eight coverage and exposed samples without coverage conversion");
     const auto eqaa = read(cx, 0x201);
     Require((eqaa & ~0x00107777u) == 0u && (eqaa & 7u) == 3u && ((eqaa >> 4u) & 7u) <= 3u &&

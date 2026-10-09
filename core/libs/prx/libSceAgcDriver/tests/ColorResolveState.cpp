@@ -131,6 +131,23 @@ void RunColorResolveStateTests() {
     for (const auto byte : sourceMemory) Require(byte == std::byte{0x39}, "resolve state decoding modified source storage");
     for (const auto byte : destinationMemory) Require(byte == std::byte{0xa7}, "resolve state decoding modified destination storage");
     auto queue = captured;
+    queue.context[0x2f8] = 0u;
+    reads.clear();
+    std::optional<ColorResolvePass> disabledRasterizer;
+    {
+        ReadLog log(reads);
+        disabledRasterizer = DecodeColorResolvePass(queue);
+    }
+    Require(disabledRasterizer.has_value(), "an eight-sample source resolve was rejected with single-sample rasterizer state");
+    fields(*disabledRasterizer);
+    Require(disabledRasterizer->region.extent.width == Width && disabledRasterizer->region.extent.height == Height, "rasterizer sample count changed the resolve region");
+    for (const auto read : reads) Require(DrawKeyCovers(read), "single-sample rasterizer resolve reads an unkeyed register");
+    queue.context[0x31d] = 0u;
+    rejects(queue, "eight source samples/fragments");
+    queue = captured;
+    queue.context[0x2f8] = 0x01000000u;
+    rejects(queue, "matching eight coverage");
+    queue = captured;
     queue.context[0x090] = (9u << 16u) | 5u;
     queue.context[0x091] = (21u << 16u) | 19u;
     auto partial = DecodeColorResolvePass(queue);
