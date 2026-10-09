@@ -11,6 +11,9 @@
 extern "C" {
 int APS5_VABI sceHttpSetCookieEnabled(int, int);
 int APS5_VABI sceHttpSendRequest(int, const void*, std::size_t);
+int APS5_VABI sceNpAuthCreateRequest(void);
+int APS5_VABI sceSystemGestureAppendTouchRecognizer(std::int32_t, SystemGestureTouchRecognizer*);
+int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceNpEntitlementAccessGetEntitlementKey(
     std::uint32_t, const NpUnifiedEntitlementLabel*, NpEntitlementAccessEntitlementKey*);
 int APS5_VABI sceRudpInit_nid_postfix(void*, int);
@@ -20,7 +23,43 @@ int APS5_VABI sceRudpTerminate();
 
 static void Require(bool value) { if (!value) std::abort(); }
 
+static void CheckUnsupportedGestureAppend() {
+    constexpr int unsupported = static_cast<int>(0x8002002du);
+    struct RecognizerBuffer {
+        std::uint64_t before;
+        SystemGestureTouchRecognizer recognizer;
+        std::uint64_t after;
+    } output;
+    std::memset(&output, 0xa5, sizeof(output));
+    std::array<unsigned char, sizeof(output)> original{};
+    std::memcpy(original.data(), &output, sizeof(output));
+    for (int savedError : {0, 13}) {
+        *__error_nid_postfix() = savedError;
+        for (std::int32_t handle : {1, 0, -1, 0x7fffffff}) {
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                const int result = sceSystemGestureAppendTouchRecognizer(handle, &output.recognizer);
+                Require(result == unsupported && result < 0);
+                Require(std::memcmp(&output, original.data(), sizeof(output)) == 0);
+                Require(sceSystemGestureAppendTouchRecognizer(handle, nullptr) == unsupported);
+                Require(*__error_nid_postfix() == savedError);
+            }
+        }
+    }
+}
+
 int main() {
+    CheckUnsupportedGestureAppend();
+    constexpr int signedOut = static_cast<int>(0x80550006u);
+    static_assert(sizeof(int) == sizeof(std::int32_t));
+    for (int savedError : {0, 13}) {
+        *__error_nid_postfix() = savedError;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            const int result = sceNpAuthCreateRequest();
+            Require(result == signedOut && result < 0);
+            Require(*__error_nid_postfix() == savedError);
+        }
+    }
+
     constexpr int invalidValue = static_cast<int>(0x804311FE);
     constexpr int network = static_cast<int>(0x80431063);
     Require(sceHttpSetCookieEnabled(1, 0) == 0);

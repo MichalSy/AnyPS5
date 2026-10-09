@@ -117,6 +117,21 @@ int main() {
         for (const auto value : interpolants) Require(value.value == 0xdeadbeef);
         pixel.num_input_semantics = 1;
         Require(sceAgcLinkShaders(linkedContext.data(), linkedPrimitive.data(), nullptr, &vertex, &pixel, 7) == 0);
+        special.vgt_gs_out_prim_type = {};
+        Require(sceAgcLinkShaders(linkedContext.data(), linkedPrimitive.data(), nullptr, &vertex, &pixel, 7) == 0);
+        Require(linkedContext[1].offset == VGT_GS_OUT_PRIM_TYPE &&
+                linkedContext[1].value == static_cast<uint32_t>(GsOutputPrimitiveType::Rectangle2D));
+        special.vgt_shader_stages_en.value = VGT_SHADER_STAGES_GS_BIT;
+        rejected = false;
+        try { sceAgcCreatePrimState(linkedContext.data(), linkedPrimitive.data(), nullptr, &vertex, 7); }
+        catch (const std::runtime_error&) { rejected = true; }
+        Require(rejected);
+        special.vgt_shader_stages_en.value = 0;
+        rejected = false;
+        try { sceAgcCreatePrimState(linkedContext.data(), linkedPrimitive.data(), &hull, &vertex, 7); }
+        catch (const std::runtime_error&) { rejected = true; }
+        Require(rejected);
+        special.vgt_gs_out_prim_type = {VGT_GS_OUT_PRIM_TYPE, 2};
         preparations = mappings = links = 0;
         Require(sceAgcCreatePrimState(nullptr, nullptr, nullptr, nullptr, 7) == 0);
         Require(sceAgcCreateInterpolantMapping(interpolants.data(), &vertex, nullptr) == 0);

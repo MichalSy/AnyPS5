@@ -158,6 +158,48 @@ int FindImage(dl_phdr_info* image, std::size_t, void* data) {
 
 extern "C" {
 
+#ifdef __linux__
+bool FillModuleUnwindInfo_nid_no_patch(std::uint64_t address, ModuleInfoForUnwind* info) {
+    struct Search {
+        std::uintptr_t address;
+        ModuleInfoForUnwind* info;
+        bool found;
+    } search{static_cast<std::uintptr_t>(address), info, false};
+    dl_iterate_phdr([](dl_phdr_info* image, std::size_t, void* data) {
+        auto& search = *static_cast<Search*>(data);
+        if (!Contains(*image, search.address, 1)) return 0;
+        ModuleInfoForUnwind result{};
+        result.st_size = sizeof(result);
+        std::string path = image->dlpi_name ? image->dlpi_name : "";
+        if (path.empty()) {
+            char executable[4096];
+            const auto length = ::readlink("/proc/self/exe", executable, sizeof(executable));
+            if (length < 0) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: cannot resolve the executable path");
+            path.assign(executable, static_cast<std::size_t>(length));
+        }
+        std::strncpy(result.name, path.c_str(), sizeof(result.name) - 1);
+        bool first = true;
+        for (std::uint16_t index = 0; index < image->dlpi_phnum; ++index) {
+            const auto& header = image->dlpi_phdr[index];
+            const std::uintptr_t start = image->dlpi_addr + header.p_vaddr;
+            if (header.p_type == PT_LOAD && first) {
+                result.seg0_addr = start;
+                result.seg0_size = header.p_memsz;
+                first = false;
+            } else if (header.p_type == PT_GNU_EH_FRAME) {
+                result.eh_frame_hdr_addr = start;
+                result.eh_frame_addr = EhFrameAddress(*image, start);
+                result.eh_frame_size = EhFrameSize(*image, result.eh_frame_addr);
+            }
+        }
+        *search.info = result;
+        search.found = true;
+        return 1;
+    }, &search);
+    return search.found;
+}
+#endif
+
 int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, ModuleInfoEx* info) {
     if (!info) return SCE_KERNEL_ERROR_EFAULT;
     if (flags != 2) throw std::invalid_argument("sceKernelGetModuleInfoFromAddr: unsupported flags " + std::to_string(flags));

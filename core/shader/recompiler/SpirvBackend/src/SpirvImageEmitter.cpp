@@ -1582,31 +1582,49 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         EmitLabel(state, labels[index]);
         std::uint32_t modeMerge = 0u;
+        std::uint32_t inactiveLabel = 0u;
+        std::uint32_t inactiveValue = 0u;
         if (base.indirectRoot != ImageResource::NoIndirectImage) {
             const auto enabled = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageModeBase + memory.resource * PipelineSpecialization::ImageModeStride + index, 1u);
             const auto active = Binary(state, spv::OpINotEqual, TypeBool(state), enabled, ConstantU32(state, 0u));
             const auto activeLabel = state.module.AllocateId();
-            const auto inactiveLabel = state.module.AllocateId();
+            inactiveLabel = state.module.AllocateId();
             modeMerge = state.module.AllocateId();
             state.module.AddFunction(spv::OpSelectionMerge, modeMerge, spv::SelectionControlMaskNone);
             state.module.AddFunction(spv::OpBranchConditional, active, activeLabel, inactiveLabel);
             EmitLabel(state, inactiveLabel);
-            state.module.AddFunction(spv::OpUnreachable);
+            if (returnsValue) {
+                inactiveValue = state.module.AllocateId();
+                state.module.AddFunction(spv::OpUndef, TypeId(state, inst.Type()), inactiveValue);
+            }
+            state.module.AddFunction(spv::OpBranch, modeMerge);
             EmitLabel(state, activeLabel);
         }
         emitMode(modes[index]);
+        auto modeValue = returnsValue ? ctx.Def(&inst) : 0u;
         if (modeMerge != 0u) {
+            const auto activeLabel = state.currentLabel;
             state.module.AddFunction(spv::OpBranch, modeMerge);
             EmitLabel(state, modeMerge);
+            if (returnsValue) {
+                const auto result = state.module.AllocateId();
+                state.module.AddFunction(spv::OpPhi, TypeId(state, inst.Type()), result, modeValue, activeLabel, inactiveValue, inactiveLabel);
+                modeValue = result;
+            }
         }
-        if (returnsValue) incoming.insert(incoming.end(), {ctx.Def(&inst), state.currentLabel});
+        if (returnsValue) incoming.insert(incoming.end(), {modeValue, state.currentLabel});
         ctx.definitions.erase(&inst);
         state.module.AddFunction(spv::OpBranch, merge);
     }
     state.runtimeImage = nullptr;
     state.runtimeImageMetadata = 0u;
     EmitLabel(state, invalid);
-    state.module.AddFunction(spv::OpUnreachable);
+    if (returnsValue) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpUndef, TypeId(state, inst.Type()), value);
+        incoming.insert(incoming.end(), {value, invalid});
+    }
+    state.module.AddFunction(spv::OpBranch, merge);
     EmitLabel(state, merge);
     if (returnsValue) {
         std::vector<std::uint32_t> phi{spv::OpPhi, TypeId(state, inst.Type()), resultId};

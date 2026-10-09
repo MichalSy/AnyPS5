@@ -19,6 +19,10 @@
 #include <fstream>
 #endif
 
+#ifdef __linux__
+extern "C" bool FillModuleUnwindInfo_nid_no_patch(std::uint64_t, ModuleInfoForUnwind*);
+#endif
+
 #ifdef _WIN32
 namespace {
 std::uint64_t ReadEncoded(const std::uint8_t*& p, std::uint8_t encoding) {
@@ -76,10 +80,7 @@ extern "C" {
 void* APS5_VABI dlopen_nid_postfix(const char* path, int flags);
 void* APS5_VABI dlsym_nid_postfix(void* handle, const char* name);
 int APS5_VABI dlclose_nid_postfix(void* handle);
-}
-
-namespace {
-constexpr int kRtldNow = 2;
+void* LoadStartModule_nid_no_patch(const char* path, size_t args, const void* argp, int* result);
 }
 
 extern "C" {
@@ -157,6 +158,9 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
   info->seg0_size = textSize;
   return 0;
 #else
+#ifdef __linux__
+  if (FillModuleUnwindInfo_nid_no_patch(addr, info)) return 0;
+#endif
   std::ifstream maps("/proc/self/maps");
   if (!maps) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: failed to open /proc/self/maps");
   std::string line;
@@ -188,13 +192,11 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
 }
 
 KernelModule APS5_VABI sceKernelLoadStartModule(const char* module_file_name, size_t args, const void* argp, uint32_t flags, const KernelLoadModuleOpt* opt, int* res) {
- (void)args;
- (void)argp;
  (void)flags;
  (void)opt;
  if (res) *res = 0;
  if (!module_file_name) return static_cast<KernelModule>(SCE_KERNEL_ERROR_EFAULT);
- void* handle = dlopen_nid_postfix(module_file_name, kRtldNow);
+ void* handle = LoadStartModule_nid_no_patch(module_file_name, args, argp, res);
  if (!handle) return static_cast<KernelModule>(SCE_KERNEL_ERROR_ENOENT);
  return static_cast<KernelModule>(reinterpret_cast<intptr_t>(handle));
 }

@@ -141,11 +141,21 @@ namespace {
 constexpr int GuestMapFixedFlag = 0x10;
 
 #if defined(__linux__)
-void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment) {
-    constexpr std::uintptr_t UserLimit = 0x7fff00000000ull;
+void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment,
+                   std::uintptr_t limit = 0x7fff00000000ull, bool skipSystemReserved = false) {
+    const auto alignMask = static_cast<std::uintptr_t>(alignment) - 1;
+    const auto align = [&](std::uintptr_t address) {
+        if (address > std::numeric_limits<std::uintptr_t>::max() - alignMask)
+            throw std::runtime_error("No free range above the mapping address hint");
+        const auto candidate = (address + alignMask) & ~alignMask;
+        if (candidate > limit || len > limit - candidate)
+            throw std::runtime_error("No free range above the mapping address hint");
+        return candidate;
+    };
     for (int attempt = 0; attempt < 8; ++attempt) {
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> used;
         std::ifstream maps("/proc/self/maps");
+        if (!maps) throw std::runtime_error("Cannot inspect occupied memory ranges");
         std::string line;
         while (std::getline(maps, line)) {
             std::istringstream fields(line);
@@ -153,16 +163,22 @@ void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment)
             char dash = 0;
             if (fields >> std::hex >> begin >> dash >> end) used.emplace_back(begin, end);
         }
+        if (maps.bad()) throw std::runtime_error("Cannot inspect occupied memory ranges");
+        if (skipSystemReserved) used.emplace_back(0x7ffffc000ull, 0x1000000000ull);
         std::sort(used.begin(), used.end());
-        auto candidate = (start + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
+        auto candidate = align(start);
         for (const auto& [begin, end] : used) {
             if (end <= candidate) continue;
             if (begin >= candidate + len) break;
-            candidate = (end + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
+            candidate = align(end);
         }
-        if (candidate + len > UserLimit || candidate + len < candidate) throw std::runtime_error("No free range above the mapping address hint");
-        void* result = mmap(reinterpret_cast<void*>(candidate), len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (result != MAP_FAILED) return result;
+        void* const requested = reinterpret_cast<void*>(candidate);
+        void* result = mmap(requested, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (result != MAP_FAILED) {
+            if (result == requested) return result;
+            if (munmap(result, len) != 0) throw std::system_error(errno, std::generic_category(), "Unexpected mapping munmap failed");
+            throw std::runtime_error("Kernel does not support non-overwriting fixed mmap");
+        }
         if (errno != EEXIST) throw std::system_error(errno, std::generic_category(), "Hinted mmap failed");
     }
     throw std::runtime_error("Hinted mmap kept racing with other mappings");
@@ -506,31 +522,11 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     }
 #ifdef _WIN32
     return mmap_aligned(len, prot, alignment);
+#else
+    constexpr std::uintptr_t GuestStart = 0x200000000ull;
+    constexpr std::uintptr_t GuestEnd = 0xfc00000000ull;
+    return MapAtOrAbove(GuestStart, len, prot, alignment, GuestEnd, true);
 #endif
-    if (len > std::numeric_limits<size_t>::max() - alignment) {
-        throw std::overflow_error("Aligned mapping size overflow");
-    }
-    const size_t allocLen = len + alignment;
-    void* result = mmap(nullptr, allocLen, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (result == MAP_FAILED) {
-        // return SCE_KERNEL_ERROR_ENOMEM;
-        throw std::system_error(errno, std::generic_category(), "Aligned mmap failed");
-    }
-    const auto raw = reinterpret_cast<std::uintptr_t>(result);
-    const size_t prefix = (alignment - (raw & (alignment - 1))) & (alignment - 1);
-    void* aligned = reinterpret_cast<void*>(raw + prefix);
-    const size_t suffix = allocLen - prefix - len;
-    if (prefix != 0 && munmap(result, prefix) != 0) {
-        const int error = errno;
-        Unmap(result, allocLen);
-        throw std::system_error(error, std::generic_category(), "Mapping prefix munmap failed");
-    }
-    if (suffix != 0 && munmap(reinterpret_cast<void*>(raw + prefix + len), suffix) != 0) {
-        const int error = errno;
-        Unmap(aligned, allocLen - prefix);
-        throw std::system_error(error, std::generic_category(), "Mapping suffix munmap failed");
-    }
-    return aligned;
 }
 
 struct ProtectedRange {

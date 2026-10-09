@@ -5,17 +5,26 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <csignal>
+#include <pthread.h>
+#include <ucontext.h>
 #endif
 
 extern "C" Pthread APS5_VABI scePthreadSelf();
 #ifdef _WIN32
 extern "C" void Aps5RedirectedEntryStub();
+#else
+extern "C" std::mutex* NativeSignalRegistration_nid_no_patch();
+extern "C" void CopyGuestSignalMask_nid_no_patch(const void* nativeMask, std::uint32_t* guestBits);
 #endif
 
 namespace {
@@ -79,13 +88,20 @@ struct GuestUcontext {
 
 static_assert(offsetof(GuestUcontext, mcontext) == 0x40);
 static_assert(offsetof(GuestUcontext, mcontext) + offsetof(GuestMcontext, rsp) == 0xf8);
+static_assert(sizeof(GuestMcontext) == 0x480);
+static_assert(sizeof(GuestUcontext) == 0x500);
 
 using GuestExceptionHandler = void (APS5_VABI *)(int, void*);
 
 constexpr std::array<int, 6> AllowedSignals{1, 4, 8, 10, 11, 30};
 
 std::mutex handlersLock;
+#ifdef _WIN32
 std::array<void*, 32> handlers{};
+#else
+std::atomic<GuestExceptionHandler> linuxHandler{nullptr};
+static_assert(decltype(linuxHandler)::is_always_lock_free);
+#endif
 
 bool Allowed(int signum) {
     for (const int allowed : AllowedSignals)
@@ -93,12 +109,12 @@ bool Allowed(int signum) {
     return false;
 }
 
+#ifdef _WIN32
 GuestExceptionHandler Handler(int signum) {
     std::lock_guard lock(handlersLock);
     return reinterpret_cast<GuestExceptionHandler>(handlers[signum]);
 }
 
-#ifdef _WIN32
 constexpr std::size_t RedZone = 128;
 constexpr std::size_t HomeArea = 32;
 
@@ -236,6 +252,114 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
     ResumeThread(native);
     return true;
 }
+#else
+int NativeError(int error) {
+    switch (error) {
+    case 0: return 0;
+    case EPERM: return SCE_KERNEL_ERROR_EPERM;
+    case ESRCH: return SCE_KERNEL_ERROR_ESRCH;
+    case EINTR: return SCE_KERNEL_ERROR_EINTR;
+    case EAGAIN: return SCE_KERNEL_ERROR_EAGAIN;
+    case ENOMEM: return SCE_KERNEL_ERROR_ENOMEM;
+    case EINVAL: return SCE_KERNEL_ERROR_EINVAL;
+    default: return SCE_KERNEL_ERROR_EOPNOTSUPP;
+    }
+}
+
+struct BlockCallerSignal {
+    sigset_t previous{};
+    int error;
+    int savedErrno = errno;
+
+    BlockCallerSignal() {
+        sigset_t blocked;
+        ::sigemptyset(&blocked);
+        ::sigaddset(&blocked, SIGUSR1);
+        error = ::pthread_sigmask(SIG_BLOCK, &blocked, &previous);
+    }
+
+    ~BlockCallerSignal() {
+        if (error == 0) ::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+        errno = savedErrno;
+    }
+};
+
+void LinuxDeliver(int signum, siginfo_t*, void* rawContext) {
+    const int savedErrno = errno;
+    const auto handler = linuxHandler.load(std::memory_order_acquire);
+    if (signum != SIGUSR1 || handler == nullptr || rawContext == nullptr) {
+        errno = savedErrno;
+        return;
+    }
+    auto& native = *static_cast<ucontext_t*>(rawContext);
+    auto& registers = native.uc_mcontext.gregs;
+    alignas(64) GuestUcontext guest{};
+    auto& m = guest.mcontext;
+    CopyGuestSignalMask_nid_no_patch(&native.uc_sigmask, guest.sigmask);
+    guest.stackPointer = native.uc_stack.ss_sp;
+    guest.stackSize = native.uc_stack.ss_size;
+    guest.stackFlags = ((native.uc_stack.ss_flags & SS_ONSTACK) ? 1 : 0)
+                     | ((native.uc_stack.ss_flags & SS_DISABLE) ? 4 : 0);
+    m.onstack = (native.uc_stack.ss_flags & SS_ONSTACK) ? 1 : 0;
+    m.rdi = registers[REG_RDI];
+    m.rsi = registers[REG_RSI];
+    m.rdx = registers[REG_RDX];
+    m.rcx = registers[REG_RCX];
+    m.r8 = registers[REG_R8];
+    m.r9 = registers[REG_R9];
+    m.rax = registers[REG_RAX];
+    m.rbx = registers[REG_RBX];
+    m.rbp = registers[REG_RBP];
+    m.r10 = registers[REG_R10];
+    m.r11 = registers[REG_R11];
+    m.r12 = registers[REG_R12];
+    m.r13 = registers[REG_R13];
+    m.r14 = registers[REG_R14];
+    m.r15 = registers[REG_R15];
+    m.trapno = static_cast<std::uint32_t>(registers[REG_TRAPNO]);
+    m.addr = registers[REG_CR2];
+    m.flags = 1;
+    m.err = registers[REG_ERR];
+    m.rip = registers[REG_RIP];
+    m.rflags = registers[REG_EFL];
+    m.rsp = registers[REG_RSP];
+    const auto segments = static_cast<std::uint64_t>(registers[REG_CSGSFS]);
+    m.cs = segments & 0xffff;
+    m.gs = static_cast<std::uint16_t>(segments >> 16);
+    m.fs = static_cast<std::uint16_t>(segments >> 32);
+    m.ss = segments >> 48;
+    m.len = sizeof(GuestMcontext);
+    const auto fp = native.uc_mcontext.fpregs;
+    static_assert(sizeof(*fp) == 512);
+    m.fpformat = fp == nullptr ? 0x10000 : 0x10002;
+    m.ownedfp = fp == nullptr ? 0x20000 : 0x20001;
+    if (fp != nullptr) std::memcpy(m.fpstate, fp, sizeof(*fp));
+    handler(30, &guest);
+    registers[REG_RDI] = m.rdi;
+    registers[REG_RSI] = m.rsi;
+    registers[REG_RDX] = m.rdx;
+    registers[REG_RCX] = m.rcx;
+    registers[REG_R8] = m.r8;
+    registers[REG_R9] = m.r9;
+    registers[REG_RAX] = m.rax;
+    registers[REG_RBX] = m.rbx;
+    registers[REG_RBP] = m.rbp;
+    registers[REG_R10] = m.r10;
+    registers[REG_R11] = m.r11;
+    registers[REG_R12] = m.r12;
+    registers[REG_R13] = m.r13;
+    registers[REG_R14] = m.r14;
+    registers[REG_R15] = m.r15;
+    registers[REG_RIP] = m.rip;
+    registers[REG_RSP] = m.rsp;
+    registers[REG_EFL] = m.rflags;
+    if (fp != nullptr) std::memcpy(fp, m.fpstate, 464);
+    errno = savedErrno;
+}
+
+bool LinuxOwnsSignal(const struct sigaction& action) {
+    return (action.sa_flags & SA_SIGINFO) != 0 && action.sa_sigaction == LinuxDeliver;
+}
 #endif
 
 }
@@ -270,29 +394,62 @@ extern "C" {
 
 int APS5_VABI sceKernelInstallExceptionHandler(int signum, void* handler) {
  if (!Allowed(signum) || handler == nullptr) return SCE_KERNEL_ERROR_EINVAL;
+#ifdef _WIN32
  std::lock_guard lock(handlersLock);
  if (handlers[signum] != nullptr) return SCE_KERNEL_ERROR_EAGAIN;
  handlers[signum] = handler;
  return 0;
+#else
+ if (signum != 30) return SCE_KERNEL_ERROR_EOPNOTSUPP;
+ BlockCallerSignal blocked;
+ if (blocked.error != 0) return NativeError(blocked.error);
+ std::scoped_lock lock(handlersLock, *NativeSignalRegistration_nid_no_patch());
+ if (linuxHandler.load(std::memory_order_acquire) != nullptr) return SCE_KERNEL_ERROR_EAGAIN;
+ struct sigaction current{};
+ if (::sigaction(SIGUSR1, nullptr, &current) != 0) return NativeError(errno);
+ if (current.sa_handler != SIG_DFL && current.sa_handler != SIG_IGN) return SCE_KERNEL_ERROR_EOPNOTSUPP;
+ struct sigaction replacement{};
+ replacement.sa_sigaction = LinuxDeliver;
+ replacement.sa_flags = SA_SIGINFO | SA_RESTART;
+ ::sigemptyset(&replacement.sa_mask);
+ linuxHandler.store(reinterpret_cast<GuestExceptionHandler>(handler), std::memory_order_release);
+ if (::sigaction(SIGUSR1, &replacement, nullptr) != 0) {
+     linuxHandler.store(nullptr, std::memory_order_release);
+     return NativeError(errno);
+ }
+ return 0;
+#endif
 }
 
 int APS5_VABI sceKernelRemoveExceptionHandler(int signum) {
  if (!Allowed(signum)) return SCE_KERNEL_ERROR_EINVAL;
+#ifdef _WIN32
  std::lock_guard lock(handlersLock);
  handlers[signum] = nullptr;
  return 0;
+#else
+ return SCE_KERNEL_ERROR_EOPNOTSUPP;
+#endif
 }
 
 int APS5_VABI sceKernelRaiseException(Pthread thread, int signum) {
  if (signum != 30) return SCE_KERNEL_ERROR_EINVAL;
  if (thread == nullptr || thread->_finished.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
+#ifdef _WIN32
  const auto handler = Handler(signum);
  if (handler == nullptr) throw std::runtime_error("sceKernelRaiseException: no handler installed for the signal");
-#ifdef _WIN32
  return RaiseOn(thread, handler, signum) ? 0 : SCE_KERNEL_ERROR_ESRCH;
 #else
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (thread->nativeHandle == std::thread::native_handle_type{}) return SCE_KERNEL_ERROR_ESRCH;
+ BlockCallerSignal blocked;
+ if (blocked.error != 0) return NativeError(blocked.error);
+ std::scoped_lock lock(handlersLock, *NativeSignalRegistration_nid_no_patch());
+ if (linuxHandler.load(std::memory_order_acquire) == nullptr) return SCE_KERNEL_ERROR_EINVAL;
+ struct sigaction current{};
+ if (::sigaction(SIGUSR1, nullptr, &current) != 0) return NativeError(errno);
+ if (!LinuxOwnsSignal(current)) return SCE_KERNEL_ERROR_EOPNOTSUPP;
+ if (thread->_finished.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
+ return NativeError(::pthread_kill(thread->nativeHandle, SIGUSR1));
 #endif
 }
 

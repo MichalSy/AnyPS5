@@ -1,16 +1,19 @@
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "SceShaders.hpp"
+#include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <array>
+#include <cstddef>
 #include <vector>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -61,6 +64,43 @@ struct Fixture {
         queue.shader[resources] = 16u << 1u;
     }
 };
+
+void CheckShaderUserDataWireLayout() {
+    constexpr auto wireSize = offsetof(ShaderUserData, sharp_resource_count) + sizeof(ShaderUserData::sharp_resource_count);
+    static_assert(wireSize == 54);
+    constexpr std::uint64_t headerAddress = 0x1000;
+    std::array<std::byte, sizeof(Shader) + wireSize> header{};
+    Shader shader{};
+    ShaderUserData users{};
+    shader.user_data = reinterpret_cast<ShaderUserData*>(headerAddress + sizeof(Shader));
+    const auto encode = [&] {
+        std::memcpy(header.data(), &shader, sizeof(shader));
+        std::memcpy(header.data() + sizeof(shader), &users, wireSize);
+    };
+    encode();
+    for (const bool staticAbi : {false, true}) {
+        const auto vertex = AgcDriver::Graphics::DecodeVertexStageInfo(header, headerAddress, {}, nullptr, staticAbi);
+        Require(vertex.resourcesNum == 0 && !vertex.fetchEmbedded, "resource-free AGC wire header was decoded incorrectly");
+    }
+    Reject([&] { AgcDriver::Graphics::DecodeVertexStageInfo(std::span(header).first(header.size() - 1), headerAddress, {}, nullptr, true); }, "outside the registered shader header");
+    users.direct_resource_count = ShaderRegs::AGC_DIRECT_RESOURCE_TYPE_COUNT + 1;
+    encode();
+    Reject([&] { AgcDriver::Graphics::DecodeVertexStageInfo(header, headerAddress, {}, nullptr, true); }, "direct-resource count exceeds");
+    users.direct_resource_count = 1;
+    users.direct_resource_offset = reinterpret_cast<std::uint16_t*>(headerAddress + header.size());
+    encode();
+    Reject([&] { AgcDriver::Graphics::DecodeVertexStageInfo(header, headerAddress, {}, nullptr, true); }, "AGC header array is outside");
+    shader.user_data = reinterpret_cast<ShaderUserData*>(headerAddress - 1);
+    encode();
+    Reject([&] { AgcDriver::Graphics::DecodeVertexStageInfo(header, headerAddress, {}, nullptr, true); }, "precedes the shader header");
+    shader.user_data = reinterpret_cast<ShaderUserData*>(std::numeric_limits<std::uintptr_t>::max());
+    encode();
+    Reject([&] { AgcDriver::Graphics::DecodeVertexStageInfo(header, 0, {}, nullptr, true); }, "outside the registered shader header");
+    shader.user_data = reinterpret_cast<ShaderUserData*>(sizeof(Shader));
+    users.direct_resource_offset = reinterpret_cast<std::uint16_t*>(std::numeric_limits<std::uintptr_t>::max());
+    encode();
+    Reject([&] { AgcDriver::Graphics::DecodeVertexStageInfo(header, 0, {}, nullptr, true); }, "AGC header array is outside");
+}
 
 void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path, const std::filesystem::path& dump) {
     using namespace AgcDriver::DriverDetail;
@@ -238,6 +278,7 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
 
 int main(int argc, char** argv) {
     try {
+        CheckShaderUserDataWireLayout();
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Require(argc <= 2, "invalid test arguments");

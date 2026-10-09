@@ -1,9 +1,9 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 #include <cstdio>
 #include <cstdlib>
-#include <stdexcept>
 #include <cstring>
 extern "C" int APS5_VABI sceSystemServiceLoadExec(const char*, const char* const*);
 extern "C" void APS5_VABI _Exit_nid_postfix(int);
@@ -53,8 +53,5 @@ int main(int argc, char** argv) {
     }
     Require(sceSystemServiceLoadExec(nullptr, nullptr) == SYSTEM_SERVICE_ERROR_PARAMETER);
     Require(sceSystemServiceLoadExec("", nullptr) == SYSTEM_SERVICE_ERROR_PARAMETER);
-    bool rejected = false;
-    try { sceSystemServiceLoadExec("/app0/another.bin", nullptr); }
-    catch (const std::runtime_error&) { rejected = true; }
-    Require(rejected);
+    Require(sceSystemServiceLoadExec("/app0/another.bin", nullptr) == SCE_KERNEL_ERROR_EOPNOTSUPP);
 }

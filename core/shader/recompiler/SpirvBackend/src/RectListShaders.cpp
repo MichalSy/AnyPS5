@@ -393,7 +393,7 @@ RectListShaders BuildRectListShaders(const RecompileResult& vertex, const Recomp
     }
     const auto components = static_cast<std::uint32_t>((parameters.size() + 1) * 4);
     require(limits.maxPatchSize >= 4 && components <= limits.maxControlPerVertexInputComponents && components <= limits.maxControlPerVertexOutputComponents && components <= limits.maxEvaluationInputComponents && components <= limits.maxEvaluationOutputComponents && limits.maxControlPerPatchOutputComponents >= 6 && components * 4 + 6 <= limits.maxControlTotalOutputComponents, "tessellation interface exceeds device limits");
-    std::uint32_t faultBinding = 0;
+    std::uint32_t faultBinding = RuntimeAbi::BindingNumber(RuntimeAbi::Stage::TessellationControl, RuntimeAbi::Binding::FaultBuffer);
     for (const auto* shader : {&vertex, &fragment}) {
         for (const auto& binding : shader->bindings) {
             require(binding.binding < std::numeric_limits<std::uint32_t>::max(), "descriptor binding overflow");

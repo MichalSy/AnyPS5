@@ -1,6 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderDeviceProfile.hpp"
 #include "BdaAbi.hpp"
 #include "Optimization/BindingAllocator.hpp"
+#include "Optimization/DescriptorBindingBuilder.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
+#include "PipelineSpecialization.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -118,7 +121,22 @@ void CheckAbi() {
     Reject([] { BindingNumber(static_cast<Stage>(4u), Binding::Buffers); }, "invalid stage or binding");
     Reject([] { BindingNumber(Stage::Main, Binding::Count); }, "invalid stage or binding");
     Reject([] { ShaderRecompiler::RuntimeAbi::RequireVersion(0u); }, "incompatible version");
+    Reject([] { ShaderRecompiler::RuntimeAbi::RequireVersion(10u); }, "incompatible version");
     ShaderRecompiler::RuntimeAbi::RequireVersion(ShaderRecompiler::RuntimeAbi::Version);
+    using namespace ShaderRecompiler;
+    Require(RuntimeAbi::Version == 11u && RuntimeAbi::SampledHeapCapacity == 32u && RuntimeAbi::BindlessTableCapacity == 16u, "sampled and bindless heap capacities are not independent");
+    Require(RuntimeAbi::StorageHeapCapacity == 4u && RuntimeAbi::SamplerHeapCapacity == 16u, "storage or sampler heap capacity changed");
+    Require(PipelineSpecialization::DescriptorIndexStride == 128u && RuntimeAbi::SampledHeapCapacity < PipelineSpecialization::DescriptorIndexStride, "sampled heap exceeds the descriptor specialization stride");
+    std::set<std::uint32_t> indices;
+    for (std::uint32_t binding = RuntimeAbi::FirstImageBinding; binding <= static_cast<std::uint32_t>(Binding::Samplers); ++binding) {
+        for (std::uint32_t element = 0u; element < RuntimeAbi::HeapCapacity(static_cast<Binding>(binding)); ++element) {
+            const auto id = PipelineSpecialization::DescriptorIndex(binding, element);
+            Require(indices.insert(id).second && id < PipelineSpecialization::ImageModeBase, "typed heap descriptor specialization IDs overlap");
+        }
+    }
+    Require(sizeof(RuntimeAbi::ResourceMetadata) == 48u && sizeof(RuntimeAbi::ShaderData) == 13760u, "runtime metadata size changed");
+    Require(RuntimeAbi::UserDataDword == 4u && RuntimeAbi::BufferOffsetsDword == 132u && RuntimeAbi::DispatchThreadLimitDword == 164u && RuntimeAbi::ExportMappingsDword == 3432u, "runtime metadata offsets changed");
+    Require(offsetof(RuntimeAbi::ShaderData, images) == 672u && offsetof(RuntimeAbi::ShaderData, samplers) == 12960u, "image or sampler metadata offset changed");
 }
 
 void CheckHeaps() {
@@ -135,12 +153,21 @@ void CheckHeaps() {
     image.numericClass = IrTextureNumericClass::Float;
     image.dimension = RdnaImageDimension::Dim2D;
     const auto single = allocate(image, 1u);
-    const auto full = allocate(image, RuntimeAbi::SampledHeapCapacity, RuntimeAbi::SamplerHeapCapacity / 2u);
+    const auto nineteen = allocate(image, 19u);
+    const auto full = allocate(image, 32u, RuntimeAbi::SamplerHeapCapacity / 2u);
+    const auto binding = DescriptorBindingForImage(image);
+    Require(BindingAllocator{}.FindBinding(nineteen.layout, binding).resources.size() == 19u, "nineteen direct sampled images were not allocated");
+    const auto& sampled = BindingAllocator{}.FindBinding(full.layout, binding).resources;
+    Require(sampled.size() == 32u, "the full sampled heap was not allocated");
+    for (std::uint32_t slot = 0u; slot < sampled.size(); ++slot) Require(sampled[slot] == slot, "direct sampled image slots were reordered");
     Require(single.layout.ShaderDataDwords() == full.layout.ShaderDataDwords() && single.layout.memoryOffsetDword == full.layout.memoryOffsetDword && !full.layout.UsesPushData(), "runtime layout depends on resource count");
     Require(full.layout.memoryOffsetDword == 0u && full.layout.DispatchThreadLimitDword() == 0u && full.layout.ShaderDataDwords() == 0u, "direct image resources allocated runtime metadata");
-    Reject([&] { allocate(image, RuntimeAbi::SampledHeapCapacity + 1u); }, "heap capacity exceeded");
+    Reject([&] { allocate(image, 33u); }, "heap capacity exceeded");
     Reject([&] { allocate(image, 1u, RuntimeAbi::SamplerHeapCapacity + 1u); }, "metadata capacity");
     image.resourceClass = ImageResourceClass::Storage;
+    const auto directStorage = allocate(image, 4u);
+    Require(BindingAllocator{}.FindBinding(directStorage.layout, DescriptorBindingForImage(image)).resources.size() == 4u, "four direct storage images were not allocated");
+    Reject([&] { allocate(image, 5u); }, "heap capacity exceeded");
     image.mipMode = ImageMipMode::DynamicStorage;
     image.mipCount = RuntimeAbi::StorageHeapCapacity;
     const auto storage = allocate(image, 1u);
@@ -167,12 +194,71 @@ void CheckHeaps() {
     Reject([] { RuntimeAbi::HeapCapacity(RuntimeAbi::Binding::ShaderData); }, "not a typed heap");
 }
 
+void CheckBindlessHeaps() {
+    using namespace ShaderRecompiler;
+    Require(ResourceMaterializer::BindlessSlots() == 16u, "bindless tables grew with the sampled heap");
+    IrProgram program;
+    program.Metadata().shaderInfoComplete = true;
+    auto& info = program.Resources().info;
+    ImageResource image;
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.numericClass = IrTextureNumericClass::Float;
+    image.dimension = RdnaImageDimension::Dim2D;
+    info.images.assign(32u, image);
+    std::vector<std::uint32_t> expected;
+    for (std::uint32_t root = 0u; root < 2u; ++root) {
+        auto& table = info.images[root];
+        table.indirectRoot = root;
+        table.indirectSearchIterations = 5u;
+        table.indirectMappingOffset = root * 33u;
+        table.indirectResources.push_back(root);
+        expected.push_back(root);
+        for (std::uint32_t slot = 1u; slot < 16u; ++slot) {
+            const auto resource = 1u + root * 15u + slot;
+            info.images[resource].indirectRoot = root;
+            table.indirectResources.push_back(resource);
+            expected.push_back(resource);
+        }
+    }
+    for (const auto& resource : info.images) info.runtimeImageModes.push_back(ResourceMaterializer::RuntimeImageModes(resource));
+    const auto allocation = BindingAllocator{}.Allocate(program, {0u, 0u, 0u, 128u});
+    const auto kind = DescriptorBindingForImage(image);
+    const auto binding = static_cast<std::uint32_t>(kind);
+    Require(BindingAllocator{}.FindBinding(allocation.layout, kind).resources == expected && expected[16] == 1u, "two bindless tables did not get consecutive sixteen-slot blocks");
+    Require(allocation.layout.runtimeImageCount == 32u && allocation.layout.ImageMetadataDword() == 0u && allocation.layout.ShaderDataDwords() == 384u, "two bindless tables changed the compact metadata layout");
+    ResourceSnapshot snapshot;
+    snapshot.images.assign(32u, DescriptorValue{{0x00001000u, 0x03800000u, 0x0000c000u, 0x90000facu, 0u, 0u, 0u, 0u}, 8u});
+    const auto checkPrepared = [&](const std::vector<std::uint32_t>& resources) {
+        const auto prepared = DescriptorBindingBuilder{}.Prepare(allocation.layout, info, IrShaderStage::Compute, snapshot);
+        const auto heap = std::ranges::find_if(prepared.bindings, [&](const auto& entry) { return entry.descriptor.binding == binding; });
+        Require(heap != prepared.bindings.end() && heap->resources == resources && heap->descriptor.count == resources.size(), "prepared bindless heap slots were not compacted in allocation order");
+        for (std::uint32_t element = 0u; element < resources.size(); ++element) {
+            const auto resource = resources[element];
+            const auto metadata = std::ranges::find_if(prepared.imageMetadata, [&](const auto& entry) { return entry.resource == resource; });
+            Require(metadata != prepared.imageMetadata.end() && metadata->metadata.binding == binding && metadata->metadata.firstElement == element && metadata->metadata.elementCount == 1u && metadata->offset == resource * 12u, "bindless metadata names the wrong prepared slot or offset");
+        }
+        for (std::uint32_t element = 0u; element < expected.size(); ++element) {
+            const auto resource = expected[element];
+            const auto compact = std::ranges::find(resources, resource);
+            const auto value = compact == resources.end() ? 0u : static_cast<std::uint32_t>(compact - resources.begin());
+            const auto id = PipelineSpecialization::DescriptorIndex(binding, element);
+            Require(std::ranges::find(prepared.specialization, PipelineSpecializationConstant{id, value}) != prepared.specialization.end(), "bindless descriptor specialization names the wrong compact slot");
+        }
+    };
+    checkPrepared(expected);
+    snapshot.images[0].dwords[3] = 0xa0000facu;
+    auto compact = expected;
+    compact.erase(compact.begin());
+    checkPrepared(compact);
+}
+
 }
 
 int main() {
     try {
         CheckAbi();
         CheckHeaps();
+        CheckBindlessHeaps();
         CheckProfile();
         std::cout << "shader runtime ABI and device profile tests passed\n";
         return 0;

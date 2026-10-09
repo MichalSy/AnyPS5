@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -25,6 +26,8 @@ const char* findModuleName(const std::uint32_t id) {
 
 std::mutex gMutex;
 std::unordered_map<std::uint32_t, std::int32_t> gLoadCount;
+constexpr std::uint16_t kSaveDataDialogModuleId = 0x00a0;
+bool gSaveDataDialogInitialCleanupConsumed = false;
 
 bool fillModuleInfoForUnwind(std::uint64_t addr, ModuleInfoForUnwind* info) {
 #ifdef _WIN32
@@ -159,6 +162,18 @@ int APS5_VABI sceSysmoduleUnloadModule(std::uint16_t id) {
     }
     std::lock_guard<std::mutex> lock(gMutex);
     auto it = gLoadCount.find(id);
+    if (id == kSaveDataDialogModuleId && it == gLoadCount.end() &&
+        !gSaveDataDialogInitialCleanupConsumed) {
+        static const bool allowInitialCleanup = [] {
+            const auto* value = std::getenv("ANYPS5_SAVEDATA_INITIAL_CLEANUP");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        if (allowInitialCleanup) {
+            gSaveDataDialogInitialCleanupConsumed = true;
+            APS5_LOG_CHARS_ERR("[SYSMODULE:initial-cleanup] allowed pre-load unload for module 0x00a0");
+            return 0;
+        }
+    }
     if (it == gLoadCount.end() || it->second < 1) {
         return 0x80A90003;
     }

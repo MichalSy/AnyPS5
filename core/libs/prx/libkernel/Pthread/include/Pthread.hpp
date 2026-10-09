@@ -80,6 +80,7 @@ struct PthreadPrivate {
     void* nativeHandle = nullptr;
 #else
     std::thread _thr;
+    std::thread::native_handle_type nativeHandle{};
 #endif
     std::thread::id threadId;
     std::atomic<unsigned> references{2};

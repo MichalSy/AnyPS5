@@ -25,8 +25,10 @@ constexpr std::uint32_t Threads = 32;
 constexpr std::uint32_t Side = 2;
 constexpr std::uint32_t Format8888UNorm = 56;
 constexpr std::uint32_t Format8888UInt = 60;
+constexpr std::uint32_t Format8888Srgb = 130;
 constexpr std::uint32_t Format32Float = 22;
 constexpr std::uint32_t Type2D = 9;
+constexpr std::uint32_t Equal = 2;
 constexpr std::uint32_t LessEqual = 3;
 constexpr std::uint32_t ClampWrap = 0;
 constexpr std::uint32_t ClampMirror = 1;
@@ -63,6 +65,7 @@ struct Sampler {
     std::uint32_t border = BorderBlack;
     std::uint32_t reduction = 0;
     std::uint32_t lodBias = 0;
+    std::uint32_t compare = LessEqual;
 };
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
@@ -83,7 +86,7 @@ std::array<std::uint32_t, 8> TextureDescriptor(std::uint32_t format) {
 
 std::array<std::uint32_t, 4> SamplerDescriptor(const Sampler& sampler) {
     return {
-        sampler.clamp | (sampler.clamp << 3u) | (ClampEdge << 6u) | (LessEqual << 12u) | (sampler.reduction << 29u),
+        sampler.clamp | (sampler.clamp << 3u) | (ClampEdge << 6u) | (sampler.compare << 12u) | (sampler.reduction << 29u),
         0u,
         sampler.lodBias | (sampler.filter << 20u) | (sampler.filter << 22u),
         sampler.border << 30u,
@@ -132,37 +135,43 @@ std::int32_t OffsetComponent(std::uint32_t tid, std::uint32_t component) {
     return static_cast<std::int32_t>(field ^ 0x20u) - 0x20;
 }
 
-float ReferenceTexel(int x, int y, float reference, const Sampler& sampler) {
+float Compare(float reference, float red, const Sampler& sampler) {
+    Require(sampler.compare == Equal || sampler.compare == LessEqual, "unsupported reference comparison function");
+    return (sampler.compare == Equal ? reference == red : reference <= red) ? 1.0f : 0.0f;
+}
+
+float ReferenceTexel(int x, int y, float reference, const Sampler& sampler, std::uint32_t format) {
     const std::uint32_t clamp = sampler.clamp;
     const int size = static_cast<int>(Side);
     if (clamp == ClampBorder && (x < 0 || x >= size || y < 0 || y >= size)) {
         const float border = sampler.border == BorderWhite ? 1.0f : 0.0f;
-        return reference <= border ? 1.0f : 0.0f;
+        return Compare(reference, border, sampler);
     }
     const auto address = [&](int value) {
         if (clamp == ClampEdge) return std::clamp(value, 0, static_cast<int>(Side) - 1);
         const int size = static_cast<int>(Side);
         return ((value % size) + size) % size;
     };
-    const float red = static_cast<float>(Red[address(y) * Side + address(x)]) / 255.0f;
-    return reference <= red ? 1.0f : 0.0f;
+    float red = static_cast<float>(Red[address(y) * Side + address(x)]) / 255.0f;
+    if (format == Format8888Srgb) red = red <= 0.04045f ? red / 12.92f : std::pow((red + 0.055f) / 1.055f, 2.4f);
+    return Compare(reference, red, sampler);
 }
 
-float Expected(std::uint32_t tid, const Sampler& sampler, bool offsets) {
+float Expected(std::uint32_t tid, const Sampler& sampler, bool offsets, std::uint32_t format) {
     const float u = Input[tid * 3u + 1u] * static_cast<float>(Side);
     const float v = Input[tid * 3u + 2u] * static_cast<float>(Side);
     const float reference = std::clamp(Input[tid * 3u + 0u], 0.0f, 1.0f);
     const int offsetX = offsets ? OffsetComponent(tid, 0u) : 0;
     const int offsetY = offsets ? OffsetComponent(tid, 1u) : 0;
-    if (sampler.filter == FilterPoint) return ReferenceTexel(static_cast<int>(std::floor(u)) + offsetX, static_cast<int>(std::floor(v)) + offsetY, reference, sampler);
+    if (sampler.filter == FilterPoint) return ReferenceTexel(static_cast<int>(std::floor(u)) + offsetX, static_cast<int>(std::floor(v)) + offsetY, reference, sampler, format);
     const float cu = u - 0.5f;
     const float cv = v - 0.5f;
     const int x = static_cast<int>(std::floor(cu)) + offsetX;
     const int y = static_cast<int>(std::floor(cv)) + offsetY;
     const float a = cu - std::floor(cu);
     const float b = cv - std::floor(cv);
-    const float top = ReferenceTexel(x, y, reference, sampler) * (1.0f - a) + ReferenceTexel(x + 1, y, reference, sampler) * a;
-    const float bottom = ReferenceTexel(x, y + 1, reference, sampler) * (1.0f - a) + ReferenceTexel(x + 1, y + 1, reference, sampler) * a;
+    const float top = ReferenceTexel(x, y, reference, sampler, format) * (1.0f - a) + ReferenceTexel(x + 1, y, reference, sampler, format) * a;
+    const float bottom = ReferenceTexel(x, y + 1, reference, sampler, format) * (1.0f - a) + ReferenceTexel(x + 1, y + 1, reference, sampler, format) * a;
     return top * (1.0f - b) + bottom * b;
 }
 
@@ -191,10 +200,10 @@ ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, std::
     return ShaderRecompiler::Recompile(request);
 }
 
-void Run(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char* name, bool offsets = false, bool useCache = false) {
+void Run(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char* name, bool offsets = false, bool useCache = false, std::uint32_t format = Format8888UNorm) {
     Output.fill(-1.0f);
     const std::span<const std::uint32_t> code = offsets ? std::span<const std::uint32_t>(OffsetCode) : std::span<const std::uint32_t>(Code);
-    const auto result = Compile(device, Format8888UNorm, sampler, code, useCache);
+    const auto result = Compile(device, format, sampler, code, useCache);
     for (const auto& binding : result.bindings) {
         Require(binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers, "emulated comparison retained a sampler binding");
         Require(std::all_of(binding.imageSamplers.begin(), binding.imageSamplers.end(), [](auto mask) { return mask == 0u; }), "emulated comparison retained an unused sampler association");
@@ -202,10 +211,40 @@ void Run(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char* na
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
-        const float expected = Expected(tid, sampler, offsets);
+        const float expected = Expected(tid, sampler, offsets, format);
         const float tolerance = sampler.filter == FilterPoint ? 0.0f : 1e-4f;
         Require(std::fabs(Output[tid] - expected) <= tolerance, std::string(name) + ": thread " + std::to_string(tid) + " compared to " + std::to_string(Output[tid]) + ", expected " + std::to_string(expected));
     }
+}
+
+void CheckSrgb(AgcDriver::VulkanDevice& device) {
+    const auto original = Input;
+    const auto set = [](std::uint32_t tid, float reference, float u, float v) {
+        Input[tid * 3u] = reference;
+        Input[tid * 3u + 1u] = u;
+        Input[tid * 3u + 2u] = v;
+    };
+    set(0u, 0.3f, 0.25f, 0.75f);
+    set(1u, 0.1f, 0.75f, 0.25f);
+    set(2u, 0.2f, 0.25f, 0.75f);
+    set(3u, 0.04f, 0.75f, 0.25f);
+    Run(device, {ClampEdge, FilterPoint}, "sRGB point comparison", false, false, Format8888Srgb);
+    Require(Output[0] == 0.0f && Output[1] == 0.0f && Output[2] == 1.0f && Output[3] == 1.0f, "sRGB comparison did not compare against linear red texels");
+    set(0u, -0.25f, 0.25f, 0.25f);
+    set(1u, 1.25f, 0.75f, 0.75f);
+    Run(device, {ClampEdge, FilterPoint, BorderBlack, 0u, 0u, Equal}, "sRGB equal comparison clamps reference", false, false, Format8888Srgb);
+    Require(Output[0] == 1.0f && Output[1] == 1.0f, "sRGB comparison did not clamp reference to zero and one");
+    set(0u, 0.1f, 0.5f, 0.5f);
+    for (unsigned iteration = 0; iteration < 2; ++iteration) {
+        Run(device, {ClampEdge, FilterBilinear}, "cached UNORM comparison before sRGB", false, true);
+        Require(Output[0] == 0.75f, "UNORM comparison did not filter three passing texels");
+        Run(device, {ClampEdge, FilterBilinear}, "cached sRGB compare before filtering", false, true, Format8888Srgb);
+        Require(Output[0] == 0.5f, "sRGB comparison did not filter two passing linear texels");
+    }
+    Run(device, {ClampWrap, FilterBilinear}, "sRGB bilinear wrap with texel offsets", true, false, Format8888Srgb);
+    Run(device, {ClampBorder, FilterBilinear, BorderWhite}, "sRGB bilinear white border", false, false, Format8888Srgb);
+    Run(device, {ClampBorder, FilterBilinear, BorderBlack}, "sRGB bilinear black border", false, false, Format8888Srgb);
+    Input = original;
 }
 
 bool BindsDepthCompare(const ShaderRecompiler::RecompileResult& result) {
@@ -249,6 +288,7 @@ int main() {
             Run(*device, {ClampEdge, FilterPoint}, "cached point comparison", false, true);
             Run(*device, {ClampWrap, FilterBilinear}, "cached bilinear comparison with offsets", true, true);
         }
+        CheckSrgb(*device);
         Reject(*device, Format32Float, {ClampEdge, FilterPoint}, "native comparison with a nonconstant texel offset requires", OffsetCode, false);
         Reject(*device, Format8888UInt, {ClampEdge, FilterPoint}, "unsupported format");
         Reject(*device, Format8888UNorm, {ClampMirror, FilterPoint}, "wrap, clamp-to-edge or clamp-to-border");

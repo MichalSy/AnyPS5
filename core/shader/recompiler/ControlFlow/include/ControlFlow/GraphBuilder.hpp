@@ -3,7 +3,9 @@
 
 #include "ControlFlow/ControlFlowGraph.hpp"
 #include "RdnaDecoder/RdnaProgram.hpp"
+#include "UnresolvedScalarCallRequirement.hpp"
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -12,6 +14,15 @@ struct SwappcInfo {
     bool fetchCallAllowed = false;
     std::uint32_t userDataBaseRegister = 0;
     std::uint32_t userDataCount = 0;
+};
+
+class UnresolvedScalarCall : public std::invalid_argument {
+public:
+    explicit UnresolvedScalarCall(UnresolvedScalarCallRequirement requirement);
+    [[nodiscard]] const UnresolvedScalarCallRequirement& Requirement() const noexcept;
+
+private:
+    UnresolvedScalarCallRequirement requirement;
 };
 
 struct SwappcCall {

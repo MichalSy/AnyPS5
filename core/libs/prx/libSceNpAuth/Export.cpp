@@ -23,8 +23,7 @@ int APS5_VABI sceNpAuthCreateAsyncRequest(const void* param) {
 }
 
 int APS5_VABI sceNpAuthCreateRequest(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return SCE_NP_ERROR_SIGNED_OUT;
 }
 
 int APS5_VABI sceNpAuthDeleteRequest(int req_id) {

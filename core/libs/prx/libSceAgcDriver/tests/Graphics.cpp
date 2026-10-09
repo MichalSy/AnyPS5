@@ -19,6 +19,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -66,6 +67,8 @@ AgcDriver::QueueState makeState() {
     queue.context[0x114] = 0;
     queue.context[0xb4] = 0;
     queue.context[0xb5] = std::bit_cast<std::uint32_t>(1.0f);
+    queue.shader[0x008] = 0x100u;
+    queue.shader[0x009] = 0u;
     return queue;
 }
 
@@ -256,6 +259,37 @@ void stateTests() {
     Require(!disabled.pixelKillEnable && !disabled.depthExportEnable && !disabled.sampleMaskExportEnable, "the null pixel program inherited stale exports");
     for (const auto mode : disabled.targetOutputMode) Require(mode == 0, "the null pixel program inherited stale color exports");
     expectFailure([&] { AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state), false); }, "input count exceeds 32");
+    for (const std::uint32_t presence : {0u, 1u, 2u, 3u}) {
+        auto absent = makeState();
+        absent.shader.erase(0x008);
+        absent.shader.erase(0x009);
+        if ((presence & 1u) != 0u) absent.shader[0x008] = 0u;
+        if ((presence & 2u) != 0u) absent.shader[0x009] = 0u;
+        absent.context[0x8e] = 0u;
+        absent.context[0x203] = 0x441u;
+        absent.context[0x1c4] = 1u;
+        absent.context[0x1b6] = 0x8000u | 31u;
+        absent.context.erase(0x1b3);
+        absent.context.erase(0x1b4);
+        absent.context.erase(0x1c5);
+        Require(AgcDriver::Graphics::PixelProgramSkipped(absent), "an absent or zero pixel address inherited stale execution or export state");
+        Require(AgcDriver::Graphics::DrawRejection(absent, false).empty(), "an absent pixel program was rejected before canonical null shader decoding");
+        const auto decoded = AgcDriver::Graphics::DecodePixelStageInfo(absent.context, {}, true);
+        Require(!decoded.wave32 && !decoded.pixelKillEnable && !decoded.depthExportEnable && decoded.interpolatorCount == 0, "an absent pixel program inherited stale ABI state");
+        absent.context[0x8e] = 0xfu;
+        Require(AgcDriver::Graphics::DrawRejection(absent, false).find("writes color") != std::string::npos, "an absent pixel program was allowed to write color");
+    }
+    for (const auto [addressRegister, value] : {std::pair{0x008u, 0x100u}, std::pair{0x009u, 1u}, std::pair{0x009u, 0x100u}}) {
+        auto partial = makeState();
+        partial.shader.erase(0x008);
+        partial.shader.erase(0x009);
+        partial.shader[addressRegister] = value;
+        partial.context[0x8e] = 0u;
+        partial.context[0x203] = 0x400u;
+        partial.context.erase(0x1b3);
+        Require(!AgcDriver::Graphics::PixelProgramSkipped(partial), "a partial nonzero pixel address was silently treated as absent");
+        Require(AgcDriver::Graphics::DrawRejection(partial, false).find("missing register at DWORD 0x1b3") != std::string::npos, "a partial nonzero pixel address bypassed active shader validation");
+    }
 }
 
 VkFormatFeatureFlags srgb8Features = 0;
@@ -787,7 +821,7 @@ void depthMaintenanceTests() {
             expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, reason);
         }
     }
-    for (const auto control : {0u, 1u, 2u, 3u, 0x20u, 0x40u, 0x2000u, 0x2063u}) {
+    for (const auto control : {0u, 0x20u, 0x40u, 0x2000u}) {
         auto queue = makeState();
         queue.context[0x000] = control;
         Require(AgcDriver::Graphics::DepthMaintenanceRejection(queue).empty(), "ordinary depth controls were mistaken for maintenance");
@@ -795,6 +829,64 @@ void depthMaintenanceTests() {
     auto absent = makeState();
     absent.context.erase(0x000);
     Require(AgcDriver::Graphics::DepthMaintenanceRejection(absent).empty(), "an absent depth control produced a maintenance verdict");
+}
+
+void stencilClearTests() {
+    auto queue = makeState();
+    queue.context[0x000] = 0x22;
+    queue.context[0x002] = 0;
+    queue.context[0x007] = (1u << 16u) | 3u;
+    queue.context[0x00a] = 0x127;
+    queue.context[0x00b] = std::bit_cast<std::uint32_t>(0.75f);
+    queue.context[0x010] = 3;
+    queue.context[0x011] = 1;
+    for (const auto offset : {0x012u, 0x014u}) queue.context[offset] = 0x100;
+    for (const auto offset : {0x013u, 0x015u}) queue.context[offset] = 0x200;
+    queue.context[0x10b] = 0;
+    queue.context[0x10c] = 0x00ff7a19;
+    queue.context[0x10d] = 0x00ff1d81;
+    queue.context[0x200] = 0x007007f1;
+    queue.context[0x1b3] = queue.context[0x1b4] = 2;
+    for (const auto control : {2u, 0x22u}) {
+        queue.context[0x000] = control;
+        Require(AgcDriver::Graphics::DepthMaintenanceRejection(queue).empty(), "supported stencil clear was rejected by precheck");
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "supported stencil clear was rejected as a draw");
+        std::vector<AgcDriver::Graphics::RegisterRead> log;
+        AgcDriver::Graphics::RegisterReadLog() = &log;
+        const auto state = AgcDriver::Graphics::DecodeState(queue);
+        AgcDriver::Graphics::RegisterReadLog() = nullptr;
+        for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "stencil clear reads a register missing from the draw key");
+        const auto& face = state.stencilFront;
+        Require(state.depth && state.depth->clearDepth == 0.75f && state.depth->clearStencil == 0x27 && state.stencilTest && !state.depthTest && !state.depthWrite && !state.depthBoundsTest, "stencil clear altered depth state or clear values");
+        Require(face.compareOp == VK_COMPARE_OP_ALWAYS && face.failOp == VK_STENCIL_OP_REPLACE && face.passOp == VK_STENCIL_OP_REPLACE && face.depthFailOp == VK_STENCIL_OP_REPLACE && face.reference == 0x27 && face.compareMask == 0xff && face.writeMask == 0xff, "stencil clear did not replace every covered stencil value");
+        Require(std::memcmp(&face, &state.stencilBack, sizeof(face)) == 0, "stencil clear front/back faces differ");
+    }
+    const auto valid = queue;
+    const auto reject = [&](std::uint32_t offset, std::uint32_t value) {
+        auto unsupported = valid;
+        unsupported.context[offset] = value;
+        const auto reason = AgcDriver::Graphics::DepthMaintenanceRejection(unsupported);
+        Require(reason.find("DB_RENDER_CONTROL") != std::string::npos, "unsupported stencil clear passed precheck");
+        Require(AgcDriver::Graphics::DrawRejection(unsupported, false) == reason, "stencil clear precheck and draw rejection differ");
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(unsupported); }, reason);
+    };
+    for (const auto control : {1u, 3u, 0x23u, 0x42u, 0x62u, 0x2022u, 0x26u, 0x1022u}) reject(0x000, control);
+    for (const auto depth : {0u, 0x007007f0u, 0x007007f3u, 0x007007f5u, 0x007007f9u, 0x007002f1u, 0x002007f1u}) reject(0x200, depth);
+    for (const auto view : {1u, 1u << 13u, 1u << 24u, 1u << 25u, 1u << 26u}) reject(0x002, view);
+    reject(0x10c, 0x007f0019);
+    reject(0x10d, 0x007f0081);
+    reject(0x010, 2);
+    reject(0x010, 3u | (1u << 2u));
+    reject(0x010, 3u | (1u << 16u));
+    reject(0x011, 0);
+    reject(0x011, 0x1001);
+    reject(0x015, 0x201);
+    reject(0x01d, 1);
+    auto missing = valid;
+    missing.context[0x013] = missing.context[0x015] = 0;
+    Require(AgcDriver::Graphics::DepthMaintenanceRejection(missing).find("without a stencil address") != std::string::npos, "stencil clear accepted a null plane");
+    const auto diagnostic = AgcDriver::Graphics::DepthMaintenanceRejection([&] { auto invalid = valid; invalid.context[0x200] = 0; return invalid; }());
+    Require(diagnostic.find("DB_DEPTH_CONTROL=0x00000000") != std::string::npos && diagnostic.find("DB_DEPTH_VIEW=0x00000000") != std::string::npos && diagnostic.find("DB_STENCILREFMASK=0x00ff7a19") != std::string::npos, "stencil clear diagnostic lacks the register values");
 }
 
 // SPI_SHADER_Z_FORMAT (0x1c4) and the export enables of DB_SHADER_CONTROL (0x203): Z export needs a
@@ -1984,6 +2076,48 @@ void rectListTests() {
     target.spirvVersion = 0x00010300u;
     target.supportedCapabilities = capabilities;
     target.tessellation = TessellationTargetLimits{32, 128, 128, 120, 4096, 128, 128};
+    {
+        const auto mainBinding = RuntimeAbi::BindingNumber(RuntimeAbi::Stage::Main, RuntimeAbi::Binding::Buffers);
+        const auto fragmentBinding = RuntimeAbi::BindingNumber(RuntimeAbi::Stage::Fragment, RuntimeAbi::Binding::Buffers);
+        const auto reservedFaultBinding = RuntimeAbi::BindingNumber(RuntimeAbi::Stage::TessellationControl, RuntimeAbi::Binding::FaultBuffer);
+        RecompileResult resourceVertex;
+        resourceVertex.spirv = makeModule({.plainBuffer = true});
+        resourceVertex.bindings.push_back({DescriptorKind::StorageBuffer, DescriptorRole::GuestBuffers, 0, mainBinding, 1, {}});
+        RecompileResult resourceFragment;
+        auto fragmentWords = makeModule({.fragment = true, .plainBuffer = true});
+        for (std::size_t at = 5; at < fragmentWords.size(); at += fragmentWords[at] >> 16u) {
+            if (static_cast<spv::Op>(fragmentWords[at] & 0xffffu) == spv::OpDecorate && fragmentWords[at + 2] == spv::DecorationBinding) fragmentWords[at + 3] = fragmentBinding;
+        }
+        resourceFragment.spirv = std::move(fragmentWords);
+        resourceFragment.bindings.push_back({DescriptorKind::StorageBuffer, DescriptorRole::GuestBuffers, 0, fragmentBinding, 1, {}});
+        RecompileResult preparedVertex;
+        RecompileResult preparedFragment;
+        static_cast<CompiledShaderArtifact&>(preparedVertex) = resourceVertex;
+        static_cast<CompiledShaderArtifact&>(preparedFragment) = resourceFragment;
+        Require(preparedVertex.bindings.empty() && preparedFragment.bindings.empty(), "artifact-only rect-list inputs unexpectedly contain invocation bindings");
+        const auto checkFaultBinding = [&](const RectListShaders& shaders, std::uint32_t expected) {
+            Require(shaders.control.bindings.size() == 1 && shaders.control.bindings.front().role == DescriptorRole::FaultBuffer && shaders.control.bindings.front().binding == expected && shaders.evaluation.bindings.empty(), "rect-list fault descriptor has the wrong binding");
+            const auto& words = shaders.control.spirv.Words();
+            std::map<std::uint32_t, std::uint32_t> bindings;
+            std::map<std::uint32_t, std::uint32_t> sets;
+            std::set<std::uint32_t> buffers;
+            for (std::size_t at = 5; at < words.size(); at += words[at] >> 16u) {
+                const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+                if (op == spv::OpVariable && words[at + 3] == spv::StorageClassStorageBuffer) buffers.insert(words[at + 2]);
+                if (op != spv::OpDecorate) continue;
+                if (words[at + 2] == spv::DecorationBinding) bindings.emplace(words[at + 1], words[at + 3]);
+                if (words[at + 2] == spv::DecorationDescriptorSet) sets.emplace(words[at + 1], words[at + 3]);
+            }
+            Require(bindings.size() == 1 && buffers.size() == 1 && bindings.contains(*buffers.begin()) && bindings.at(*buffers.begin()) == expected && sets.contains(*buffers.begin()) && sets.at(*buffers.begin()) == 0, "rect-list SPIR-V fault descriptor disagrees with its binding metadata");
+        };
+        Require(reservedFaultBinding != mainBinding && reservedFaultBinding != fragmentBinding, "rect-list fault descriptor overlaps a source stage");
+        checkFaultBinding(BuildRectListShaders(preparedVertex, preparedFragment, target), reservedFaultBinding);
+        checkFaultBinding(BuildRectListShaders(resourceVertex, resourceFragment, target), reservedFaultBinding);
+        resourceFragment.bindings.front().binding = reservedFaultBinding + 17;
+        checkFaultBinding(BuildRectListShaders(resourceVertex, resourceFragment, target), reservedFaultBinding + 18);
+        resourceFragment.bindings.front().binding = std::numeric_limits<std::uint32_t>::max();
+        expectFailure([&] { static_cast<void>(BuildRectListShaders(resourceVertex, resourceFragment, target)); }, "descriptor binding overflow");
+    }
     for (const auto version : {0x00010300u, 0x00010400u}) {
         target.spirvVersion = version;
         auto auxiliary = BuildRectListShaders(vertex, fragment, target);
@@ -2756,6 +2890,7 @@ int main() {
         srgb8TargetTests();
         DepthClipTests();
         DepthStencilTests();
+        stencilClearTests();
         ZExportTests();
         DepthBoundsBiasTests();
         conservativeZExportTests();

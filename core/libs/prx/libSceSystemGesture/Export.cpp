@@ -2,6 +2,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 
 // No touch input is emulated: recognizers exist but never report events.
 static constexpr int32_t GESTURE_HANDLE = 1;
@@ -12,10 +13,9 @@ static constexpr int SCE_SYSTEM_GESTURE_ERROR_INDEX_OUT_OF_ARRAY = static_cast<i
 extern "C" {
 
 int APS5_VABI sceSystemGestureAppendTouchRecognizer(int32_t gesture_handle, SystemGestureTouchRecognizer* recognizer) {
- (void)gesture_handle;
- (void)recognizer;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+    (void)gesture_handle;
+    (void)recognizer;
+    return SCE_KERNEL_ERROR_EOPNOTSUPP;
 }
 
 int APS5_VABI sceSystemGestureClose(int32_t gesture_handle) {

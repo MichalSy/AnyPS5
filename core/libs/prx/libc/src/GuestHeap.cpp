@@ -272,4 +272,10 @@ void* GuestHeapAlign_nid_postfix(std::size_t alignment, std::size_t bytes) {
     return allocate(mutation, alignment, bytes);
 }
 
+std::size_t GuestHeapUsableSize_nid_postfix(const void* pointer) {
+    if (pointer == nullptr) return 0;
+    GuestAllocations::Mutation mutation;
+    return mutation.Find(pointer).bytes;
+}
+
 }

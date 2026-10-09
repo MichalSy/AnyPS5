@@ -25,7 +25,13 @@ int APS5_VABI sceAgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_
         throw std::runtime_error(std::string(__func__) + ": invalid shader type or missing special registers");
     }
     (void)GraphicsPrimTypeToGsOut(prim_type);
-    const auto valid = [](const Shader* shader) { return shader->specials->vgt_shader_stages_en.offset == ShaderRegs::VGT_SHADER_STAGES_EN && shader->specials->vgt_gs_out_prim_type.offset == ShaderRegs::VGT_GS_OUT_PRIM_TYPE; };
+    const auto valid = [hs](const Shader* shader) {
+        const auto& special = *shader->specials;
+        if (special.vgt_shader_stages_en.offset != ShaderRegs::VGT_SHADER_STAGES_EN) return false;
+        if (special.vgt_gs_out_prim_type.offset == ShaderRegs::VGT_GS_OUT_PRIM_TYPE) return true;
+        return hs == nullptr && (special.vgt_shader_stages_en.value & ShaderRegs::VGT_SHADER_STAGES_GS_BIT) == 0 &&
+            special.vgt_gs_out_prim_type.offset == 0 && special.vgt_gs_out_prim_type.value == 0;
+    };
     if (!valid(gs) || (hs != nullptr && !valid(hs))) {
         throw std::runtime_error(std::string(__func__) + ": invalid context register offsets");
     }

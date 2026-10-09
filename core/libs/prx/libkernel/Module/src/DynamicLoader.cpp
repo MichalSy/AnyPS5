@@ -43,6 +43,24 @@ std::mutex modulesMutex;
 std::map<std::uintptr_t, std::shared_ptr<Module>> modules;
 std::uintptr_t nextHandle = 0x20000000;
 std::map<const void*, std::uintptr_t> imageIds;
+struct ModuleStartContext {
+    std::filesystem::path path;
+    std::size_t args = 0;
+    const void* argp = nullptr;
+    int result = 0;
+    bool invoked = false;
+};
+thread_local ModuleStartContext* moduleStartContext = nullptr;
+class ModuleStartScope {
+public:
+    explicit ModuleStartScope(ModuleStartContext* context) : previous(moduleStartContext) { moduleStartContext = context; }
+    ~ModuleStartScope() { moduleStartContext = previous; }
+    ModuleStartScope(const ModuleStartScope&) = delete;
+    ModuleStartScope& operator=(const ModuleStartScope&) = delete;
+
+private:
+    ModuleStartContext* previous;
+};
 void* Symbol(Module& module, const char* name) {
 #ifdef _WIN32
     return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module.native), name));
@@ -110,11 +128,12 @@ static std::filesystem::path RelinkedModulePath(const std::filesystem::path& pat
     return std::filesystem::is_regular_file(relinked, error) ? relinked : path;
 }
 
-void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
+static void* OpenModule(const char* path, int flags, ModuleStartContext* start) {
     if ((flags & ~0x103) || (flags & 3) == 0 || (flags & 3) == 3) {
         Error("dlopen: unsupported flags"); return nullptr;
     }
     try {
+        const ModuleStartScope scope(start);
         auto module = std::make_shared<Module>();
         module->global = (flags & 0x100) != 0 || !path;
 #ifdef _WIN32
@@ -135,6 +154,7 @@ void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
         const auto resolved = path ? RelinkedModulePath(ResolvePath_nid_no_patch(path)).string() : std::string{};
         const int nativeFlags = ((flags & 3) == 1 ? RTLD_LAZY : RTLD_NOW) |
             ((flags & 0x100) ? RTLD_GLOBAL : RTLD_LOCAL);
+        if (start && path) start->path = std::filesystem::weakly_canonical(resolved);
         module->native = ::dlopen(path ? resolved.c_str() : nullptr, nativeFlags);
         if (!module->native) { Error(::dlerror()); return nullptr; }
 #endif
@@ -144,6 +164,35 @@ void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
         return reinterpret_cast<void*>(handle);
     } catch (const std::exception& error) { Error(error.what()); return nullptr; }
 }
+void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
+    return OpenModule(path, flags, nullptr);
+}
+void* LoadStartModule_nid_no_patch(const char* path, std::size_t args, const void* argp, int* result) {
+    ModuleStartContext start;
+    start.args = args;
+    start.argp = argp;
+    auto* handle = OpenModule(path, 2, &start);
+    if (result) *result = start.result;
+    return handle;
+}
+#ifndef _WIN32
+int GuestModuleInitialize_nid_no_patch(int (APS5_VABI *initializer)(std::size_t, const void*, void*)) {
+    auto* context = moduleStartContext;
+    if (context && !context->invoked) {
+        Dl_info image{};
+        if (::dladdr(reinterpret_cast<const void*>(initializer), &image) && image.dli_fname) {
+            std::error_code error;
+            const auto path = std::filesystem::weakly_canonical(image.dli_fname, error);
+            if (!error && path == context->path) {
+                context->invoked = true;
+                context->result = initializer(context->args, context->argp, nullptr);
+                return context->result;
+            }
+        }
+    }
+    return initializer(0, nullptr, nullptr);
+}
+#endif
 void* APS5_VABI dlsym_nid_postfix(void* handle, const char* name) {
     if (!name || !*name) { Error("dlsym: empty symbol name"); return nullptr; }
     try {

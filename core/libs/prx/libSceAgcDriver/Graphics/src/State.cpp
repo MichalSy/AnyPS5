@@ -193,7 +193,8 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
 }
 
 void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result) {
-    zero(cx, 0x000, 0x00001f9fu, "depth/stencil clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
+    zero(cx, 0x000, 0x00001f9du, "depth clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
+    const bool stencilClear = (read(cx, 0x000) & 2u) != 0;
     const auto view = read(cx, 0x002);
     zero(cx, 0x002, 0x3c000000u, "depth mips (DB_DEPTH_VIEW MIP_LEVEL)");
     zero(cx, 0x010, 0x000f100cu, "multisampled, partially resident or mipmapped depth (DB_Z_INFO)");
@@ -234,7 +235,10 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
         result.maxDepthBounds = readFloat(cx, 0x009);
     }
     result.stencilTest = (depthControl & 1u) != 0;
-    if (result.stencilTest) {
+    if (stencilClear) {
+        result.stencilFront = {VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_ALWAYS, 0xffu, 0xffu, depth.clearStencil};
+        result.stencilBack = result.stencilFront;
+    } else if (result.stencilTest) {
         const auto ops = read(cx, 0x10b);
         result.stencilFront = stencilFace((depthControl >> 8u) & 7u, ops, read(cx, 0x10c), stencilReadOnly);
         result.stencilBack = (depthControl & 0x80u) != 0 ? stencilFace((depthControl >> 20u) & 7u, ops >> 12u, read(cx, 0x10d), stencilReadOnly) : result.stencilFront;
@@ -474,9 +478,33 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
 }
 
 std::string DepthMaintenanceRejection(const QueueState& queue) {
-    const auto control = find(queue.context, 0x000);
-    if (control == queue.context.end() || (control->second & ~0x2063u) == 0) return {};
-    return zeroMessage(0x000, control->second, "DB_RENDER_CONTROL depth copy, resummarize or decompress");
+    const auto& cx = queue.context;
+    const auto control = find(cx, 0x000);
+    if (control == cx.end()) return {};
+    if ((control->second & ~0x2063u) != 0) return zeroMessage(0x000, control->second, "DB_RENDER_CONTROL depth copy, resummarize or decompress");
+    if ((control->second & 1u) != 0) return zeroMessage(0x000, control->second, "DB_RENDER_CONTROL depth clear");
+    if ((control->second & 2u) == 0) return {};
+    const auto word = [&](std::uint32_t offset) { const auto value = find(cx, offset); return value == cx.end() ? 0u : value->second; };
+    const auto depthControl = word(0x200);
+    const auto view = word(0x002);
+    const auto frontMask = word(0x10c);
+    const auto backMask = word(0x10d);
+    const auto reject = [&](const char* reason) {
+        char detail[384];
+        std::snprintf(detail, sizeof(detail), "DB_RENDER_CONTROL stencil clear %s is unsupported (DB_RENDER_CONTROL=0x%08x, DB_DEPTH_CONTROL=0x%08x, DB_DEPTH_VIEW=0x%08x, DB_STENCILREFMASK=0x%08x, DB_STENCILREFMASK_BF=0x%08x)", reason, control->second, depthControl, view, frontMask, backMask);
+        return std::string(detail);
+    };
+    if (control->second != 2u && control->second != 0x22u) return reject("with additional control flags");
+    if ((depthControl & ~0x007007f1u) != 0 || (depthControl & 0xfu) != 1u) return reject("with disabled stencil or depth work");
+    if (((depthControl >> 8u) & 7u) != 7u || ((depthControl & 0x80u) != 0 && ((depthControl >> 20u) & 7u) != 7u)) return reject("with conditional stencil comparisons");
+    if (((frontMask >> 16u) & 0xffu) != 0xffu || ((depthControl & 0x80u) != 0 && ((backMask >> 16u) & 0xffu) != 0xffu)) return reject("with partial stencil write masks");
+    if (view != 0) return reject("with read-only, mipmapped or array views");
+    const auto zInfo = word(0x010);
+    const auto stencilInfo = word(0x011);
+    if ((zInfo & 3u) == 2u || (zInfo & 0x000f100cu) != 0 || (stencilInfo & 0x1001u) != 1u) return reject("without a supported single-sample stencil plane");
+    if (word(0x013) != word(0x015) || (word(0x01b) & 0xffu) != (word(0x01d) & 0xffu)) return reject("with differing stencil read/write addresses");
+    if (word(0x013) == 0 && (word(0x01b) & 0xffu) == 0) return reject("without a stencil address");
+    return {};
 }
 
 State DecodeState(const QueueState& queue) {
@@ -884,7 +912,7 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
 bool PixelProgramSkipped(const QueueState& queue) {
     const auto low = find(queue.shader, 0x008, RegisterBank::Shader);
     const auto high = find(queue.shader, 0x009, RegisterBank::Shader);
-    if (low != queue.shader.end() && high != queue.shader.end() && low->second == 0 && high->second == 0) return true;
+    if ((low == queue.shader.end() || low->second == 0) && (high == queue.shader.end() || high->second == 0)) return true;
     const auto& cx = queue.context;
     const auto targetMask = find(cx, 0x8e);
     const auto shaderMask = find(cx, 0x8f);

@@ -504,6 +504,9 @@ std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const Swa
             continue;
         }
         if (!staticTarget || call.targetIndex == InvalidControlFlowId) {
+            if (!staticTarget && instruction.source0.kind == RdnaOperandKind::ScalarRegister && targetRegister % 2u == 0u && targetRegister <= 104u) {
+                throw UnresolvedScalarCall({instruction.programCounter, targetRegister, linkRegister});
+            }
             throw std::invalid_argument("computed/data-dependent s_swappc_b64 call target at program counter " + toHexString(instruction.programCounter) + " is not statically resolvable");
         }
         call.targetProgramCounter = target;
@@ -888,6 +891,13 @@ void GraphBuilder::linkBlocks(std::vector<BasicBlock>& blocks, const RdnaProgram
     for (auto& block : blocks) {
         sortUnique(block.predecessors);
     }
+}
+
+UnresolvedScalarCall::UnresolvedScalarCall(UnresolvedScalarCallRequirement requirement)
+    : std::invalid_argument("computed/data-dependent s_swappc_b64 call target at program counter " + toHexString(requirement.programCounter) + " is not statically resolvable"), requirement(requirement) {}
+
+const UnresolvedScalarCallRequirement& UnresolvedScalarCall::Requirement() const noexcept {
+    return requirement;
 }
 
 ControlFlowGraph GraphBuilder::Build(const RdnaProgram& program, const SwappcInfo* swappc) const {

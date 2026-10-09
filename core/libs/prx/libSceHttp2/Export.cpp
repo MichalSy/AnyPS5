@@ -182,6 +182,12 @@ int APS5_VABI sceHttp2SetResolveTimeOut(int id, uint32_t usec) {
     return 0;
 }
 
+int APS5_VABI sceHttp2SetResolveRetry(int id, int count) {
+    (void)id;
+    (void)count;
+    return ERROR_NETWORK;
+}
+
 int APS5_VABI sceHttp2SetSendTimeOut(int id, uint32_t usec) {
     (void)id;
     (void)usec;
@@ -243,6 +249,47 @@ int APS5_VABI sceHttp2AbortRequest(int req_id) {
 int APS5_VABI sceHttp2GetMemoryPoolStats() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
+}
+
+int APS5_VABI sceHttp2WebSocketCreateRequest(int tmpl_id, const char* url, uintptr_t callback1, uintptr_t callback2, uintptr_t callback3, uintptr_t callback4, void* buffer, size_t buffer_size, void* user_data, uintptr_t option) {
+    (void)tmpl_id;
+    (void)url;
+    (void)callback1;
+    (void)callback2;
+    (void)callback3;
+    (void)callback4;
+    (void)buffer;
+    (void)buffer_size;
+    (void)user_data;
+    (void)option;
+    return ERROR_NETWORK;
+}
+
+int APS5_VABI sceHttp2WebSocketSendTextMessageAsync(int req_id, const char* message, uintptr_t option1, uintptr_t option2, uintptr_t option3) {
+    (void)req_id;
+    (void)message;
+    (void)option1;
+    (void)option2;
+    (void)option3;
+    return ERROR_NETWORK;
+}
+
+int APS5_VABI sceHttp2WebSocketSendDataMessageAsync(int req_id, const void* data, size_t size, uintptr_t option1, uintptr_t option2) {
+    (void)req_id;
+    (void)data;
+    (void)size;
+    (void)option1;
+    (void)option2;
+    return ERROR_NETWORK;
+}
+
+int APS5_VABI sceHttp2WebSocketCloseAsync(int req_id, const uint16_t* close_code, const char* reason, uintptr_t option1, uintptr_t option2) {
+    (void)req_id;
+    (void)close_code;
+    (void)reason;
+    (void)option1;
+    (void)option2;
+    return ERROR_NETWORK;
 }
 
 int APS5_VABI sceHttp2CookieFlush(int id) {

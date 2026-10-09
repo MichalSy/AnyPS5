@@ -29,6 +29,30 @@
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 
+#ifndef _WIN32
+namespace {
+std::mutex nativeThreadClocksLock;
+std::unordered_map<int, std::int32_t> nativeThreadClocks;
+
+bool NativeThreadClock(int guestClock, clockid_t* nativeClock) {
+    std::lock_guard lock(nativeThreadClocksLock);
+    const auto found = nativeThreadClocks.find(guestClock);
+    if (found == nativeThreadClocks.end()) return false;
+    *nativeClock = found->second;
+    return true;
+}
+}
+
+extern "C" int RegisterNativeThreadClock_nid_no_patch(std::int32_t nativeClockId) {
+    std::lock_guard lock(nativeThreadClocksLock);
+    for (const auto& [guest, native] : nativeThreadClocks)
+        if (native == nativeClockId) return guest;
+    const auto guest = 0x10000 + static_cast<int>(nativeThreadClocks.size());
+    nativeThreadClocks.emplace(guest, nativeClockId);
+    return guest;
+}
+#endif
+
 static std::uint64_t RawMonotonicNanos() {
 #ifdef _WIN32
     return TimedWait::NowNanos();
@@ -326,6 +350,20 @@ static std::uint64_t ProcessCpuResolutionNanos() {
 #endif
 
 int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
+#ifndef _WIN32
+    clockid_t threadClock{};
+    if (clockId >= 0x10000 && NativeThreadClock(clockId, &threadClock)) {
+        if (!tp) { *__error_nid_postfix() = 14; return -1; }
+        timespec native{};
+        if (::clock_gettime(threadClock, &native) != 0) {
+            *__error_nid_postfix() = errno == ESRCH ? 3 : 22;
+            return -1;
+        }
+        tp->tv_sec = native.tv_sec;
+        tp->tv_nsec = native.tv_nsec;
+        return 0;
+    }
+#endif
     if (tp == nullptr) {
         APS5_INVALID_ARG_EX;
     }
@@ -440,6 +478,21 @@ int APS5_VABI gettimeofday_nid_postfix(KernelTimeval* tv, KernelTimezone* tz) {
 }
 
 int APS5_VABI clock_getres_nid_postfix(int clockId, KernelTimespec* res) {
+#ifndef _WIN32
+    clockid_t threadClock{};
+    if (clockId >= 0x10000 && NativeThreadClock(clockId, &threadClock)) {
+        timespec native{};
+        if (::clock_getres(threadClock, &native) != 0) {
+            *__error_nid_postfix() = errno == ESRCH ? 3 : 22;
+            return -1;
+        }
+        if (res) {
+            res->tv_sec = native.tv_sec;
+            res->tv_nsec = native.tv_nsec;
+        }
+        return 0;
+    }
+#endif
     if (res == nullptr) {
         APS5_INVALID_ARG_EX;
     }
@@ -539,10 +592,10 @@ int APS5_VABI sceKernelClockGettime(KernelClockid clock_id, KernelTimespec* tp) 
     return clock_gettime_nid_postfix(static_cast<int>(clock_id), tp);
 }
 
-int APS5_VABI sceKernelConvertLocaltimeToUtc(int64_t local_time, int64_t reserved, int64_t* utc_time, KernelTimezone* timezone, int32_t* dst_seconds) {
+int APS5_VABI sceKernelConvertLocaltimeToUtc(int64_t local_time, int64_t reserved, int64_t* utc_time, KernelTimesec* st, int32_t* dst_seconds) {
     (void)reserved;
     if (utc_time != nullptr) *utc_time = local_time;
-    if (timezone != nullptr) *timezone = {0, 0};
+    if (st != nullptr) *st = {local_time, 0u, 0u};
     if (dst_seconds != nullptr) *dst_seconds = 0;
     return 0;
 }

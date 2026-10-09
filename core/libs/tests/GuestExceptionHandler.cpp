@@ -9,6 +9,7 @@ int APS5_VABI sceKernelRemoveExceptionHandler(int signum);
 
 static constexpr int SCE_KERNEL_ERROR_EINVAL = static_cast<int>(0x80020016);
 static constexpr int SCE_KERNEL_ERROR_EAGAIN = static_cast<int>(0x80020023);
+static constexpr int SCE_KERNEL_ERROR_EOPNOTSUPP = static_cast<int>(0x8002002d);
 
 static void APS5_VABI Handler(int, void*) {}
 static void APS5_VABI Other(int, void*) {}
@@ -22,6 +23,7 @@ int main() {
         Require(sceKernelInstallExceptionHandler(rejected, handler) == SCE_KERNEL_ERROR_EINVAL);
     Require(sceKernelInstallExceptionHandler(30, nullptr) == SCE_KERNEL_ERROR_EINVAL);
     Require(sceKernelRemoveExceptionHandler(9) == SCE_KERNEL_ERROR_EINVAL);
+#ifdef _WIN32
     for (const int signum : {1, 4, 8, 10, 11, 30}) {
         Require(sceKernelInstallExceptionHandler(signum, handler) == 0);
         Require(sceKernelInstallExceptionHandler(signum, other) == SCE_KERNEL_ERROR_EAGAIN);
@@ -30,4 +32,13 @@ int main() {
         Require(sceKernelRemoveExceptionHandler(signum) == 0);
     }
     Require(sceKernelRemoveExceptionHandler(30) == 0);
+#else
+    for (const int signum : {1, 4, 8, 10, 11}) {
+        Require(sceKernelInstallExceptionHandler(signum, handler) == SCE_KERNEL_ERROR_EOPNOTSUPP);
+        Require(sceKernelRemoveExceptionHandler(signum) == SCE_KERNEL_ERROR_EOPNOTSUPP);
+    }
+    Require(sceKernelInstallExceptionHandler(30, handler) == 0);
+    Require(sceKernelInstallExceptionHandler(30, other) == SCE_KERNEL_ERROR_EAGAIN);
+    Require(sceKernelRemoveExceptionHandler(30) == SCE_KERNEL_ERROR_EOPNOTSUPP);
+#endif
 }

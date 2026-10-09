@@ -1,6 +1,8 @@
 #include "SceTypes.hpp"
+#include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <stdexcept>
 
 extern "C" {
@@ -11,6 +13,12 @@ int APS5_VABI sceHttp2CreateCookieBox(int);
 int APS5_VABI sceHttp2SetCookieBox(int, int);
 int APS5_VABI sceHttp2CookieFlush(int);
 int APS5_VABI sceHttp2SetRequestNoContentLength(int);
+int APS5_VABI sceHttp2SetResolveRetry(int, int);
+int* APS5_VABI __error_nid_postfix();
+int APS5_VABI sceHttp2WebSocketCreateRequest(int, const char*, uintptr_t, uintptr_t, uintptr_t, uintptr_t, void*, std::size_t, void*, uintptr_t);
+int APS5_VABI sceHttp2WebSocketSendTextMessageAsync(int, const char*, uintptr_t, uintptr_t, uintptr_t);
+int APS5_VABI sceHttp2WebSocketSendDataMessageAsync(int, const void*, std::size_t, uintptr_t, uintptr_t);
+int APS5_VABI sceHttp2WebSocketCloseAsync(int, const std::uint16_t*, const char*, uintptr_t, uintptr_t);
 int APS5_VABI sceHttp2SendRequest(int, const void*, std::size_t);
 int APS5_VABI sceHttp2SendRequestAsync(int, const void*, std::size_t, Http2AsyncOption*, void*);
 int APS5_VABI sceHttp2WaitAsync(int, Http2AsyncResult*, std::uint32_t*, void*);
@@ -26,6 +34,40 @@ void* APS5_VABI sceKernelGetEventUserData(const KernelEvent* ev);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
+
+static int callbacks = 0;
+
+static void APS5_VABI WebSocketCallback() {
+    ++callbacks;
+}
+
+static void CheckOfflineWebSockets(int tmpl, int request) {
+    constexpr int network = static_cast<int>(0x80436063);
+    std::array<unsigned char, 0x4000 + 32> buffer;
+    buffer.fill(0xa5);
+    const auto original = buffer;
+    std::array<char, 8> text{'p', 'a', 'y', 'l', 'o', 'a', 'd', '\0'};
+    const auto originalText = text;
+    std::uint16_t closeCode = 1000;
+    int userData = 0x12345678;
+    const auto callback = reinterpret_cast<uintptr_t>(&WebSocketCallback);
+    for (int savedError : {0, 13}) {
+        *__error_nid_postfix() = savedError;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            Require(sceHttp2WebSocketCreateRequest(tmpl, "wss://example.com/", callback, callback, callback, callback, buffer.data() + 16, 0x4000, &userData, 0) == network);
+            Require(sceHttp2WebSocketCreateRequest(0, nullptr, 0, 0, 0, 0, nullptr, 0, nullptr, 0) == network);
+            Require(sceHttp2WebSocketSendTextMessageAsync(request, text.data(), 0, 0, 0) == network);
+            Require(sceHttp2WebSocketSendTextMessageAsync(-1, nullptr, 0, 0, 0) == network);
+            Require(sceHttp2WebSocketSendDataMessageAsync(request, buffer.data() + 16, 0x4000, 0, 0) == network);
+            Require(sceHttp2WebSocketSendDataMessageAsync(-1, nullptr, 0, 0, 0) == network);
+            Require(sceHttp2WebSocketCloseAsync(request, &closeCode, text.data(), 0, 0) == network);
+            Require(sceHttp2WebSocketCloseAsync(-1, nullptr, nullptr, 0, 0) == network);
+            Require(*__error_nid_postfix() == savedError);
+            Require(buffer == original && text == originalText);
+            Require(closeCode == 1000 && userData == 0x12345678 && callbacks == 0);
+        }
+    }
+}
 
 template <typename TCall>
 static bool Throws(TCall call) {
@@ -52,7 +94,18 @@ int main() {
     Require(sceHttp2SetCookieBox(request, other) == 0);
     Require(sceHttp2SetRequestNoContentLength(request) == 0);
     Require(sceHttp2CookieFlush(context) == 0);
+    for (int savedError : {0, 13}) {
+        *__error_nid_postfix() = savedError;
+        for (int id : {request, tmpl, context, 0, -1, 0x7fffffff}) {
+            for (int retries : {0, 1, 4, -1, 0x7fffffff}) {
+                const int result = sceHttp2SetResolveRetry(id, retries);
+                Require(result == static_cast<int>(0x80436063) && result < 0);
+                Require(*__error_nid_postfix() == savedError);
+            }
+        }
+    }
     Require(sceHttp2SendRequest(request, nullptr, 0) == static_cast<int>(0x80436063));
+    CheckOfflineWebSockets(tmpl, request);
 
     KernelEqueue eq = 0;
     Require(sceKernelCreateEqueue(&eq, "http2") == 0);

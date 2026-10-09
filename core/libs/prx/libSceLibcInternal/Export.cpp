@@ -1,9 +1,14 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/HeapDiagnostics.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -15,6 +20,10 @@
 
 extern "C" void APS5_VABI sceKernelSetThreadDtors(thread_dtors_func_t dtors);
 extern "C" int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, ModuleInfoEx* info);
+extern "C" const char* __progname_nid_postfix;
+extern "C" int* APS5_VABI __error_nid_postfix();
+extern "C" char* APS5_VABI strerror_nid_postfix(int error);
+extern "C" int APS5_VABI vsnprintf_nid_postfix(char* buffer, std::size_t size, const char* format, VaList* arguments);
 
 namespace {
 
@@ -98,11 +107,69 @@ void RegisterThreadExitHook() {
     }();
 }
 
+std::string SyslogFormat(const char* format, int error) {
+    std::string result;
+    for (const char* cursor = format; *cursor != '\0'; ++cursor) {
+        if (*cursor == '%' && cursor[1] == '%') {
+            result += "%%";
+            ++cursor;
+        } else if (*cursor == '%' && cursor[1] == 'm') {
+            for (const char* text = strerror_nid_postfix(error); *text != '\0'; ++text) {
+                if (*text == '%') result += '%';
+                result += *text;
+            }
+            ++cursor;
+        } else {
+            result += *cursor;
+        }
+    }
+    return result;
+}
+
 }
 
 extern "C" {
 
 int Need_sceLibcInternal_nid_postfix = 1;
+
+const char* APS5_VABI getprogname_nid_postfix() {
+    return __progname_nid_postfix;
+}
+
+std::size_t APS5_VABI malloc_usable_size_nid_postfix(const void* pointer) {
+    return ApplicationHeapUsableSize_nid_no_patch(pointer);
+}
+
+void APS5_VABI syslog_nid_postfix(int priority, const char* format, ...) {
+    const int savedError = *__error_nid_postfix();
+    if (!format) return;
+#ifdef _WIN32
+    __builtin_sysv_va_list arguments;
+    __builtin_sysv_va_start(arguments, format);
+#else
+    std::va_list arguments;
+    va_start(arguments, format);
+#endif
+    try {
+        const auto expanded = SyslogFormat(format, savedError);
+        char buffer[4096]{};
+        const int count = vsnprintf_nid_postfix(buffer, sizeof(buffer), expanded.c_str(), reinterpret_cast<VaList*>(arguments));
+        if (count >= 0) {
+            static std::mutex outputMutex;
+            std::lock_guard lock(outputMutex);
+            std::fprintf(stderr, "[guest syslog %d] %s", priority, buffer);
+            const auto length = std::strlen(buffer);
+            if (length == 0 || buffer[length - 1] != '\n') std::fputc('\n', stderr);
+        }
+    } catch (...) {
+    }
+#ifdef _WIN32
+    __builtin_sysv_va_end(arguments);
+#else
+    va_end(arguments);
+#endif
+    *__error_nid_postfix() = savedError;
+}
 
 void APS5_VABI __cxa_finalize_nid_postfix(void* dsoHandle) {
     CxaFinalize_nid_no_patch(dsoHandle);

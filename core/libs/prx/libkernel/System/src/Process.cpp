@@ -33,6 +33,8 @@
 #include <sys/resource.h>
 #endif
 
+extern "C" int* APS5_VABI __error_nid_postfix();
+
 namespace {
 
 constexpr int sceInvalidArgument = static_cast<int>(0x80020016u);
@@ -82,11 +84,6 @@ private:
 ProcessArguments& getProcessArguments() {
     static ProcessArguments arguments;
     return arguments;
-}
-
-void validateSchedulingPolicy(int policy) {
-    if (policy != 1 && policy != 3)
-        throw std::invalid_argument("Unsupported guest scheduling policy");
 }
 
 }
@@ -203,13 +200,21 @@ void APS5_VABI sceKernelSync(void) {
 }
 
 int APS5_VABI sched_get_priority_max_nid_postfix(int policy) {
-    validateSchedulingPolicy(policy);
-    return 256;
+    switch (policy) {
+        case 1:
+        case 3: return 256;
+        case 2: return 103;
+        default: *__error_nid_postfix() = 22; return -1;
+    }
 }
 
 int APS5_VABI sched_get_priority_min_nid_postfix(int policy) {
-    validateSchedulingPolicy(policy);
-    return 767;
+    switch (policy) {
+        case 1:
+        case 3: return 767;
+        case 2: return 0;
+        default: *__error_nid_postfix() = 22; return -1;
+    }
 }
 
 int APS5_VABI getrusage_nid_postfix(int who, GuestResourceUsage* usage) {

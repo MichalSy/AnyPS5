@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_SHADERREGISTRY_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_SHADERREGISTRY_HPP
 
+#include "UnresolvedScalarCallRequirement.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <array>
@@ -24,6 +25,11 @@ struct PreparedShaderState {
         std::size_t codeOffset;
         std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
     };
+    struct DeferredComputeEntry {
+        std::size_t codeOffset;
+        std::vector<std::uint64_t> key;
+        ShaderRecompiler::UnresolvedScalarCallRequirement requirement;
+    };
     struct Rectangle {
         std::uint64_t vertexId;
         std::uint64_t fragmentId;
@@ -40,6 +46,7 @@ struct PreparedShaderState {
         std::vector<std::weak_ptr<const ShaderSnapshot>> stages;
     };
     std::vector<Entry> entries;
+    std::vector<DeferredComputeEntry> deferredCompute;
     std::vector<std::vector<std::uint64_t>> registeredAbis;
     std::vector<GraphicsAbi> graphicsAbis;
     std::vector<Rectangle> rectangles;

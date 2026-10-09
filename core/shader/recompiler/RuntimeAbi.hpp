@@ -9,7 +9,7 @@
 
 namespace ShaderRecompiler::RuntimeAbi {
 
-inline constexpr std::uint32_t Version = 10u;
+inline constexpr std::uint32_t Version = 11u;
 inline constexpr std::uint32_t DescriptorSet = 0u;
 inline constexpr std::uint32_t StageCount = 4u;
 inline constexpr std::uint32_t PushConstantDwords = 32u;
@@ -34,9 +34,12 @@ enum class Stage : std::uint32_t { Main, Fragment, TessellationControl, Tessella
 inline constexpr std::uint32_t UserDataCapacity = 128u;
 inline constexpr std::uint32_t BufferCapacity = 128u;
 inline constexpr std::uint32_t ImageCapacity = 256u;
-inline constexpr std::uint32_t SampledHeapCapacity = 16u;
+inline constexpr std::uint32_t SampledHeapCapacity = 32u;
+inline constexpr std::uint32_t BindlessTableCapacity = 16u;
 inline constexpr std::uint32_t StorageHeapCapacity = 4u;
 inline constexpr std::uint32_t SamplerHeapCapacity = 16u;
+
+static_assert(BindlessTableCapacity != 0u && BindlessTableCapacity <= SampledHeapCapacity);
 
 struct ResourceMetadata {
     std::uint32_t binding;

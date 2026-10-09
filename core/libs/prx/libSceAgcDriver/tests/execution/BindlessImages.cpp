@@ -5,6 +5,7 @@
 #include <array>
 #include <cstring>
 #include <iostream>
+#include <limits>
 
 namespace {
 
@@ -60,18 +61,31 @@ void Run(AgcDriver::VulkanDevice& device) {
         if (artifact.variantId == 0u) artifact = shader;
         else Require(shader.cacheHit && shader.variantId == artifact.variantId, "bindless table changed the compiled artifact");
         if (iteration == 1u) {
-            auto invalid = shader;
-            auto binding = std::ranges::find_if(invalid.bindings, [](const DescriptorBinding& value) { return value.role == DescriptorRole::ShaderData; });
-            Require(binding != invalid.bindings.end(), "bindless shader has no runtime metadata");
-            const auto offset = invalid.imageMetadataDword + invalid.runtimeImageResources.at(0) * (sizeof(RuntimeAbi::ResourceMetadata) / sizeof(std::uint32_t)) + offsetof(RuntimeAbi::ResourceMetadata, firstElement) / sizeof(std::uint32_t);
-            binding->guestDescriptor.at(offset) = RuntimeAbi::SampledHeapCapacity;
-            bool rejected = false;
-            try {
-                device.Dispatch(invalid, 1u, 1u, 1u);
-            } catch (const std::exception& error) {
-                rejected = std::string_view(error.what()).find("runtime metadata exceeds its bound heap") != std::string_view::npos;
+            const auto metadata = std::ranges::find_if(shader.bindings, [](const DescriptorBinding& value) { return value.role == DescriptorRole::ShaderData; });
+            Require(metadata != shader.bindings.end(), "bindless shader has no runtime metadata");
+            const auto offset = shader.imageMetadataDword + shader.runtimeImageResources.at(0) * (sizeof(RuntimeAbi::ResourceMetadata) / sizeof(std::uint32_t));
+            const auto kind = metadata->guestDescriptor.at(offset);
+            const auto heap = std::ranges::find_if(shader.bindings, [kind](const DescriptorBinding& value) { return value.role == DescriptorRole::GuestImages && value.binding % static_cast<std::uint32_t>(RuntimeAbi::Binding::Count) == kind; });
+            Require(heap != shader.bindings.end() && heap->count != 0u && heap->count < RuntimeAbi::SampledHeapCapacity, "bindless shader has no compact sampled heap");
+            const std::array invalidRanges{
+                std::array{heap->count, 1u},
+                std::array{heap->count - 1u, 2u},
+                std::array{0u, std::numeric_limits<std::uint32_t>::max()},
+                std::array{std::numeric_limits<std::uint32_t>::max(), 1u}
+            };
+            for (const auto range : invalidRanges) {
+                auto invalid = shader;
+                auto binding = std::ranges::find_if(invalid.bindings, [](const DescriptorBinding& value) { return value.role == DescriptorRole::ShaderData; });
+                binding->guestDescriptor.at(offset + offsetof(RuntimeAbi::ResourceMetadata, firstElement) / sizeof(std::uint32_t)) = range[0];
+                binding->guestDescriptor.at(offset + offsetof(RuntimeAbi::ResourceMetadata, elementCount) / sizeof(std::uint32_t)) = range[1];
+                bool rejected = false;
+                try {
+                    device.Dispatch(invalid, 1u, 1u, 1u);
+                } catch (const std::exception& error) {
+                    rejected = std::string_view(error.what()).find("runtime metadata exceeds its bound heap") != std::string_view::npos;
+                }
+                Require(rejected, "driver accepted an out-of-range runtime heap range: first=" + std::to_string(range[0]) + " count=" + std::to_string(range[1]));
             }
-            Require(rejected, "driver accepted an out-of-range runtime heap index");
         }
         device.Dispatch(shader, 1u, 1u, 1u);
         device.SubmitRecorded(false);

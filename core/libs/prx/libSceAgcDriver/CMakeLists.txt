@@ -397,6 +397,12 @@ target_link_libraries(agc_shader_control_flow_tests PRIVATE shader_recompiler_ag
 set_target_properties(agc_shader_control_flow_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_control_flow_tests)
 
+add_test_executable(agc_scalar_call_requirements_tests EXCLUDE_FROM_ALL tests/ScalarCallRequirements.cpp)
+target_include_directories(agc_scalar_call_requirements_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_scalar_call_requirements_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_scalar_call_requirements_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_scalar_call_requirements_tests)
+
 add_test_executable(agc_driver_flip_tests EXCLUDE_FROM_ALL
         tests/Flip.cpp
 )
@@ -607,11 +613,14 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
 
+target_include_directories(agc_driver_deferred_compute_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+
 target_include_directories(agc_driver_prepared_exports_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
 target_include_directories(agc_driver_prepared_publication_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
 target_include_directories(agc_driver_prepared_graphics_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+target_include_directories(agc_driver_null_pixel_shader_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 target_link_libraries(agc_driver_interpolation_modes_tests PRIVATE shader_recompiler_agc_driver)
 
 target_include_directories(agc_driver_prepared_shaders_tests PRIVATE
@@ -624,7 +633,7 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_shader_bindless PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_structurizer_tests agc_spirv_module_tests agc_dpp_write_tests agc_masked_select_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_shader_disk_cache_tests agc_shader_device_profile_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_bda_device_tests ${agcExecutionTests})
+    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_structurizer_tests agc_spirv_module_tests agc_dpp_write_tests agc_masked_select_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_shader_disk_cache_tests agc_shader_device_profile_tests agc_shader_control_flow_tests agc_scalar_call_requirements_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_bda_device_tests ${agcExecutionTests})
         if(agcTest STREQUAL "agc_driver_constant_store_tests")
             continue()
         endif()
@@ -635,6 +644,21 @@ if(BUILD_TESTING)
         if(WIN32)
             set_tests_properties(${agcTestName} PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    add_test(NAME agc_driver_null_rectangle_pair COMMAND agc_driver_null_pixel_shader_tests --rect-pair)
+    set_tests_properties(agc_driver_null_rectangle_pair PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_null_rectangle_pair PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_null_depth_only COMMAND agc_driver_null_pixel_shader_tests --depth-only)
+    add_test(NAME agc_driver_null_depth_only_rectangle COMMAND agc_driver_null_pixel_shader_tests --depth-only-rect)
+    add_test(NAME agc_driver_null_depth_only_zero COMMAND agc_driver_null_pixel_shader_tests --depth-only-zero)
+    add_test(NAME agc_driver_null_depth_only_rectangle_zero COMMAND agc_driver_null_pixel_shader_tests --depth-only-rect-zero)
+    foreach(agcDepthOnlyTest IN ITEMS agc_driver_null_depth_only agc_driver_null_depth_only_rectangle agc_driver_null_depth_only_zero agc_driver_null_depth_only_rectangle_zero)
+        set_tests_properties(${agcDepthOnlyTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${agcDepthOnlyTest} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
     set_tests_properties(agc_driver_flat_store PROPERTIES RUN_SERIAL TRUE)
@@ -769,6 +793,7 @@ if(AGC_BUILD_VISUAL_TEST)
     )
 
     target_link_libraries(agc_driver_visual_test PRIVATE
+            libSceAgcDriver
             SDL2-static
             libc
     )
@@ -776,8 +801,23 @@ if(AGC_BUILD_VISUAL_TEST)
     set_target_properties(agc_driver_visual_test PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(agc_driver_visual_test)
 
+    if(BUILD_TESTING)
+        set_target_properties(agc_driver_visual_test PROPERTIES EXCLUDE_FROM_ALL OFF)
+        add_test(NAME agc_driver_visual COMMAND agc_driver_visual_test --verify)
+        set_tests_properties(agc_driver_visual PROPERTIES
+                ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" TIMEOUT 60)
+        if(WIN32)
+            set_tests_properties(agc_driver_visual PROPERTIES ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endif()
+
     if(WIN32)
-        set(visualRuntimeFiles "$<TARGET_FILE:libc>")
+        set(visualRuntimeFiles
+                "$<TARGET_FILE:libSceAgcDriver>"
+                "$<TARGET_FILE:libkernel>"
+                "$<TARGET_FILE:libc>"
+        )
 
         if(MINGW)
             get_filename_component(visualCompilerDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
@@ -801,7 +841,7 @@ if(AGC_BUILD_VISUAL_TEST)
                 COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 ${visualRuntimeFiles}
                 "$<TARGET_FILE_DIR:agc_driver_visual_test>"
-                DEPENDS libc
+                DEPENDS libSceAgcDriver libkernel libc
                 COMMAND_EXPAND_LISTS
                 VERBATIM
         )

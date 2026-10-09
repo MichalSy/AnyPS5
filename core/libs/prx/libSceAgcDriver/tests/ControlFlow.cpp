@@ -208,6 +208,36 @@ std::size_t recompile(const std::string& name, std::span<const std::uint32_t> co
     return result.spirv.size();
 }
 
+void verifyImageStoreContinue() {
+    const std::array<std::uint32_t, 8> storeCode{
+        0xbe880380u, 0xbf0a8208u, 0xbf840004u, 0xf0200108u,
+        0x00000000u, 0x80088108u, 0xbf82fffau, 0xbf810000u
+    };
+    const std::array<std::uint32_t, 10> loadCode{
+        0xbe8c0380u, 0xbf0a820cu, 0xbf840006u, 0xf0000108u, 0x00000000u,
+        0xe0700000u, 0x80020000u, 0x800c810cu, 0xbf82fff8u, 0xbf810000u
+    };
+    const std::array<std::uint32_t, 16> userData{0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0x10000000u, 0x00100000u, 0x40u, 0x00027facu};
+    const auto verify = [&](const std::string& name, std::span<const std::uint32_t> code) {
+        static_cast<void>(verifyGraph(name, code));
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
+        request.context.waveSize = 64;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00403000u;
+        request.target.spirvVersion = 0x00010600u;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = false;
+        for (const auto subgroupSize : {32u, 64u}) {
+            request.target.subgroupSize = subgroupSize;
+            require(!Recompile(request).spirv.empty(), name + ": no SPIR-V");
+        }
+    };
+    verify("image store inside a loop", storeCode);
+    verify("image load used inside a loop", loadCode);
+}
+
 void verifyProgram(const Program& program) {
     const std::string name(program.name);
     const auto result = verifyGraph(name, program.code);
@@ -934,6 +964,7 @@ done:
     }
     try {
         verifyNullSwappc();
+        verifyImageStoreContinue();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         ++failures;

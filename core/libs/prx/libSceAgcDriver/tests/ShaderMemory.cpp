@@ -13,6 +13,7 @@
 #endif
 #include "CacheKey.hpp"
 #include "BdaAbi.hpp"
+#include "PipelineSpecialization.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -206,11 +207,12 @@ void verifyBindlessTable() {
     constexpr std::uint32_t Format8888UNorm = 56;
     constexpr std::uint32_t Type2D = 9;
     const std::uint32_t slots = ResourceMaterializer::BindlessSlots();
+    require(slots == 16u && RuntimeAbi::BindlessTableCapacity == 16u, "bindless: the table capacity did not remain sixteen");
 
     struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
     static Texture textures[2];
     struct alignas(4096) GuestTables {
-        std::array<std::array<std::uint32_t, 8>, 4> heap{};
+        std::array<std::array<std::uint32_t, 8>, 17> heap{};
         std::array<std::array<std::uint32_t, 4>, 3> materials{};
         std::array<std::uint32_t, 4> output{};
         std::array<std::uint32_t, 16> srt{};
@@ -318,6 +320,7 @@ void verifyBindlessTable() {
     require(staticImages.size() == direct + slots - 1u, "bindless: the static interface needs runtime descriptors");
     const auto staticRoot = std::ranges::find_if(staticImages, [](const ImageResource& image) { return image.indirectSearchIterations != 0u; });
     require(staticRoot != staticImages.end() && staticRoot->indirectResources.size() == slots && staticRoot->indirectMappingOffset == plan->srtReads.size(), "bindless: the static table interface is incomplete");
+    require(staticRoot->indirectSearchIterations == 5u, "bindless: a sixteen-slot table changed the binary search depth");
 
     AgcDriver::ShaderMemory memory({});
     const auto capture = memory.Capture(request);
@@ -325,6 +328,7 @@ void verifyBindlessTable() {
     require(capture->snapshot.images[root].dwords == heap[0] && capture->snapshot.images[direct].dwords == heap[1] && capture->snapshot.images[direct + 1u].dwords == heap[3], "bindless: the slots do not hold the keyed entries");
     for (std::uint32_t i = direct + 2u; i < capture->snapshot.images.size(); i++) require(capture->snapshot.images[i].dwords == heap[2], "bindless: a pad slot is not null");
     const auto mapping = mappingOf(capture->snapshot);
+    require(mapping.size() == 33u, "bindless: a sixteen-slot table changed the mapping block size");
     require(std::vector<std::uint32_t>(mapping.begin(), mapping.begin() + 7) == std::vector<std::uint32_t>{3u, 0u, 0u, 1u, 1u, 3u, 2u}, "bindless: the (key, slot) mapping is wrong");
     require(capture->plan->srtReads.size() + mapping.size() == capture->snapshot.flattenedSrt.size(), "bindless: the mapping offset does not name the block");
     auto regions = memory.Regions();
@@ -419,6 +423,22 @@ void verifyBindlessTable() {
     require(wholeCapture->snapshot.images[wholeRoot].dwords == heap[0] && wholeCapture->snapshot.images[wholeDirect].dwords == heap[1] && wholeCapture->snapshot.images[wholeDirect + 1u].dwords == heap[2] && wholeCapture->snapshot.images[wholeDirect + 2u].dwords == heap[3], "bindless: mode T slots are wrong");
     whole.context.memory = wholeMemory.Regions();
     require(!Recompile(whole, *wholeCapture)->spirv.empty(), "bindless: mode T did not compile");
+
+    const auto fourEntryHeap = heap;
+    for (std::uint32_t entry = 0u; entry < 17u; ++entry) heap[entry] = heap[0];
+    fillSrt(16u);
+    AgcDriver::ShaderMemory fullMemory({});
+    const auto fullCapture = fullMemory.Capture(whole);
+    const auto fullMapping = mappingOf(fullCapture->snapshot);
+    require(fullMapping.size() == 33u && fullMapping.front() == 16u, "bindless: a whole sixteen-entry table was not mapped");
+    for (std::uint32_t key = 0u; key < 16u; ++key) {
+        const auto resource = key == 0u ? wholeRoot : wholeDirect + key - 1u;
+        require(fullMapping[1u + 2u * key] == key && fullMapping[2u + 2u * key] == resource && fullCapture->snapshot.images[resource].dwords == heap[key], "bindless: a full table key names the wrong slot");
+    }
+    fillSrt(17u);
+    AgcDriver::ShaderMemory overflowMemory({});
+    expectFailure([&] { static_cast<void>(overflowMemory.Capture(whole)); }, "bindless image table has 17 entries (0 materials), limit 16", "bindless: a whole seventeen-entry table was bound");
+    heap = fourEntryHeap;
 
     // A table wider than the slots without a material pattern is rejected.
     fillSrt(100u);
@@ -1453,6 +1473,56 @@ void verifyUnusedUnnormalizedSampler() {
     require(normalized[0].imageUnnormalized == std::vector<bool>{false} && normalized[1].samplerUnnormalized == std::vector<bool>{false}, "unnormalized samplers: a normalized S# was flagged");
 }
 
+void verifySrgbColorComparison() {
+    using namespace ShaderRecompiler;
+    ImageResource image{};
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.numericClass = IrTextureNumericClass::Float;
+    image.dimension = RdnaImageDimension::Dim2D;
+    image.depthCompare = true;
+    image.read = true;
+    ShaderInfo info;
+    info.images = {image};
+    info.samplers = {SamplerResource{}};
+    info.sampledPairs = {{0u, 0u, 0u}};
+    info.runtimeImageModes = {ResourceMaterializer::RuntimeImageModes(image)};
+    ResourceSnapshot snapshot;
+    snapshot.images = {DescriptorValue{{0x00001000u, 130u << 20u, 0x0000c000u, 0x90000facu, 0u, 0u, 0u, 0u}, 8u}};
+    snapshot.samplers = {DescriptorValue{{0x00003092u, 0u, 0u, 0u}, 4u}};
+    const auto state = [&] { return ResourceMaterializer::EmulatedCompareState(info, snapshot, 0u); };
+    const auto point = state();
+    require((point & EmulatedCompare::Enabled) != 0u && (point & EmulatedCompare::Linear) == 0u && (point & EmulatedCompare::SingleLevel) != 0u && EmulatedCompare::Reference(point) == EmulatedCompare::ReferenceUnorm && EmulatedCompare::Function(point) == 3u, "sRGB comparison: point sampling has incorrect reference or filter state");
+    snapshot.samplers[0].dwords[2] = 0x00500000u;
+    require(state() == (point | EmulatedCompare::Linear), "sRGB comparison: bilinear sampling changed more than the filter state");
+    const auto mode = info.runtimeImageModes[0].at(ResourceMaterializer::RuntimeImageMode(image, snapshot.images[0], info.runtimeImageModes[0]));
+    require(!mode.depthCompare && !mode.srgbDecode && mode.numericClass == IrTextureNumericClass::Float && (mode.emulatedCompare & EmulatedCompare::Enabled) != 0u, "sRGB comparison: native sRGB decoding was replaced by depth comparison or a second gamma conversion");
+    const auto prepared = DescriptorBindingBuilder{}.Prepare({}, info, IrShaderStage::Compute, snapshot);
+    require(std::find(prepared.specialization.begin(), prepared.specialization.end(), PipelineSpecializationConstant{PipelineSpecialization::CompareBase + 4u, EmulatedCompare::ReferenceUnorm}) != prepared.specialization.end(), "sRGB comparison: reference clamp was not passed to shader specialization");
+    for (const auto flag : {1u << 20u, 1u << 31u}) {
+        snapshot.samplers[0].dwords[0] |= flag;
+        expectFailure([&] { static_cast<void>(state()); }, "forced or disabled degamma", "sRGB comparison: an unsupported sampler gamma mode was accepted");
+        snapshot.samplers[0].dwords[0] &= ~flag;
+    }
+    for (const auto format : {IrBufferFormat::Format8_8_8_8UInt, IrBufferFormat::Format8Srgb, IrBufferFormat::Format8_8Srgb, IrBufferFormat::Bc1Srgb}) {
+        snapshot.images[0].dwords[1] = static_cast<std::uint32_t>(format) << 20u;
+        expectFailure([&] { static_cast<void>(state()); }, "comparison sampling of a color texture is implemented only", "sRGB comparison: another unsupported format was accepted");
+    }
+    for (const auto [format, reference] : {std::pair{IrBufferFormat::Format8_8_8_8UNorm, EmulatedCompare::ReferenceUnorm}, std::pair{IrBufferFormat::Format8_8_8_8SNorm, EmulatedCompare::ReferenceSnorm}, std::pair{IrBufferFormat::Format16_16Float, EmulatedCompare::ReferenceFloat}}) {
+        snapshot.images[0].dwords[1] = static_cast<std::uint32_t>(format) << 20u;
+        require(EmulatedCompare::Reference(state()) == reference, "sRGB comparison: an existing format changed reference clamp");
+    }
+    snapshot.images[0].dwords[1] = static_cast<std::uint32_t>(IrBufferFormat::Format32Float) << 20u;
+    require(state() == 0u, "sRGB comparison: R32 float left native depth comparison");
+    snapshot.images[0].dwords[1] = 130u << 20u;
+    info.images[0].indirectRoot = 0u;
+    expectFailure([&] { static_cast<void>(state()); }, "unsupported color comparison image instructions", "sRGB comparison: an indirect image was accepted");
+    info.images[0].indirectRoot = ImageResource::NoIndirectImage;
+    snapshot.images[0].dwords[3] = 0xa0000facu;
+    expectFailure([&] { static_cast<void>(state()); }, "only for 2D and 2D array views", "sRGB comparison: a 3D view was accepted");
+    snapshot.images[0].dwords[3] = 0x90000fadu;
+    expectFailure([&] { static_cast<void>(state()); }, "X channel is red", "sRGB comparison: a non-red comparison channel was accepted");
+}
+
 void verifyWaveUniformValues() {
     using namespace ShaderRecompiler;
     IrProgram program;
@@ -1789,6 +1859,7 @@ int main(int argc, char** argv) {
         verifyShaderClockScopes();
         verifyUnnormalizedSamplers();
         verifyUnusedUnnormalizedSampler();
+        verifySrgbColorComparison();
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
         verifyBdaReadFallbackFunctions();

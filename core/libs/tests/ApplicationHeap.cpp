@@ -33,6 +33,7 @@ std::size_t lastAlignment = 0;
 unsigned posixCalls = 0;
 unsigned initializes = 0;
 unsigned frees = 0;
+unsigned usableSizeCalls = 0;
 bool fail = false;
 bool recurse = false;
 bool nullPosixResult = false;
@@ -93,6 +94,12 @@ int APS5_VABI posixAlign(void** pointer, std::size_t alignment, std::size_t byte
     return 0;
 }
 
+std::size_t APS5_VABI usableSize(const void* pointer) {
+    require(pointer == storage.data());
+    ++usableSizeCalls;
+    return storage.size();
+}
+
 template<typename TValue, std::size_t TSize>
 void write(std::array<std::byte, TSize>& data, std::size_t offset, TValue value) {
     require(offset <= data.size() && sizeof(value) <= data.size() - offset);
@@ -123,6 +130,7 @@ int main(int argc, char** argv) {
     write(replacement, 0x40, &align);
     write(replacement, 0x48, &realign);
     write(replacement, 0x50, &posixAlign);
+    write(replacement, 0x68, &usableSize);
     if (argc > 1 && std::strcmp(argv[1], "exit-order") == 0) {
         require(atexit_nid_postfix(exitCallbackAllocates) == 0);
         ApplicationHeapInitialize_nid_no_patch(process.data());
@@ -137,11 +145,16 @@ int main(int argc, char** argv) {
         ApplicationHeapInitialize_nid_no_patch(process.data());
         require(initializes == 1);
         auto* pointer = static_cast<unsigned char*>(ApplicationHeapCalloc_nid_no_patch(7, 9));
+        require(ApplicationHeapUsableSize_nid_no_patch(nullptr) == 0);
+        require(ApplicationHeapUsableSize_nid_no_patch(pointer) == 63);
+        reject([] { ApplicationHeapUsableSize_nid_no_patch(storage.data()); });
         for (unsigned i = 0; i < 63; ++i) require(pointer[i] == 0);
         std::memset(pointer, 0x5a, 63);
         pointer = static_cast<unsigned char*>(ApplicationHeapReallocate_nid_no_patch(pointer, 150));
+        require(ApplicationHeapUsableSize_nid_no_patch(pointer) == 150);
         for (unsigned i = 0; i < 63; ++i) require(pointer[i] == 0x5a);
         pointer = static_cast<unsigned char*>(ApplicationHeapReallocate_nid_no_patch(pointer, 11));
+        require(ApplicationHeapUsableSize_nid_no_patch(pointer) == 11);
         for (unsigned i = 0; i < 11; ++i) require(pointer[i] == 0x5a);
         require(ApplicationHeapReallocate_nid_no_patch(pointer, 0) == nullptr);
         pointer = static_cast<unsigned char*>(ApplicationHeapReallocate_nid_no_patch(nullptr, 32));
@@ -149,6 +162,7 @@ int main(int argc, char** argv) {
         ApplicationHeapFree_nid_no_patch(pointer);
         for (std::size_t alignment : {16, 64, 4096}) {
             auto* aligned = ApplicationHeapAlign_nid_no_patch(alignment, 37);
+            require(ApplicationHeapUsableSize_nid_no_patch(aligned) == 37);
             require(reinterpret_cast<std::uintptr_t>(aligned) % alignment == 0);
             _ZdlPvSt11align_val_t_nid_postfix(aligned, alignment);
         }
@@ -181,6 +195,8 @@ int main(int argc, char** argv) {
     require(frees == 1);
     pointer = ApplicationHeapAllocate_nid_no_patch(32);
     require(pointer == storage.data() && lastSize == 32);
+    require(ApplicationHeapUsableSize_nid_no_patch(nullptr) == 0 && usableSizeCalls == 0);
+    require(ApplicationHeapUsableSize_nid_no_patch(pointer) == storage.size() && usableSizeCalls == 1);
     require(ApplicationHeapReallocate_nid_no_patch(pointer, 96) == storage.data() && lastSize == 96);
     ApplicationHeapFree_nid_no_patch(pointer);
     require(frees == 2);

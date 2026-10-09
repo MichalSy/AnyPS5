@@ -1,5 +1,6 @@
 #include "SceTypes.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -7,6 +8,8 @@
 
 extern "C" int APS5_VABI sceSystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance);
 extern "C" int APS5_VABI sceSystemServiceParamGetString(int paramId, char* buf, std::size_t bufSize);
+extern "C" int APS5_VABI sceSystemServiceLaunchWebBrowser(const char* uri, const void* options);
+extern "C" int APS5_VABI sceSystemServiceLoadExec(const char* path, const char* const* arguments);
 
 namespace {
 
@@ -29,6 +32,17 @@ extern "C" int APS5_VABI sceSystemServiceDisableMusicPlayer(void);
 extern "C" int APS5_VABI sceSystemServiceReenableMusicPlayer(void);
 
 int main() {
+    const char* arguments[] = {"+set", "developer", "1", nullptr};
+    const char* emptyArguments[] = {nullptr};
+    Require(sceSystemServiceLoadExec(nullptr, nullptr) == SYSTEM_SERVICE_ERROR_PARAMETER);
+    Require(sceSystemServiceLoadExec("", arguments) == SYSTEM_SERVICE_ERROR_PARAMETER);
+    Require(sceSystemServiceLoadExec("/app0/another.bin", nullptr) == SCE_KERNEL_ERROR_EOPNOTSUPP);
+    Require(sceSystemServiceLoadExec("/app0/another.bin", arguments) == SCE_KERNEL_ERROR_EOPNOTSUPP);
+    Require(sceSystemServiceLoadExec("another.bin", emptyArguments) == SCE_KERNEL_ERROR_EOPNOTSUPP);
+    Require(sceSystemServiceLaunchWebBrowser(nullptr, nullptr) == SYSTEM_SERVICE_ERROR_PARAMETER);
+    Require(sceSystemServiceLaunchWebBrowser("", nullptr) == SYSTEM_SERVICE_ERROR_PARAMETER);
+    Require(sceSystemServiceLaunchWebBrowser("https://example.org", nullptr) == SCE_KERNEL_ERROR_EOPNOTSUPP);
+    Require(sceSystemServiceLaunchWebBrowser("https://example.org", reinterpret_cast<const void*>(1)) == SCE_KERNEL_ERROR_EOPNOTSUPP);
     Require(sceSystemServicePowerTick() == SYSTEM_SERVICE_OK);
     Require(sceSystemServicePowerTick() == SYSTEM_SERVICE_OK);
     Require(sceSystemServiceReportAbnormalTermination(nullptr) == SYSTEM_SERVICE_OK);

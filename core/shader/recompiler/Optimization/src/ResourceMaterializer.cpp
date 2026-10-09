@@ -504,6 +504,7 @@ std::uint32_t colorCompareReference(IrBufferFormat format) {
     case IrBufferFormat::Format8UNorm: case IrBufferFormat::Format8_8UNorm: case IrBufferFormat::Format16_16UNorm:
     case IrBufferFormat::Format11_11_10UNorm: case IrBufferFormat::Format10_11_11UNorm: case IrBufferFormat::Format2_10_10_10UNorm:
     case IrBufferFormat::Format10_10_10_2UNorm: case IrBufferFormat::Format8_8_8_8UNorm: case IrBufferFormat::Format16_16_16_16UNorm:
+    case IrBufferFormat::Format8_8_8_8Srgb:
         return EmulatedCompare::ReferenceUnorm;
     case IrBufferFormat::Format8SNorm: case IrBufferFormat::Format16SNorm: case IrBufferFormat::Format8_8SNorm: case IrBufferFormat::Format16_16SNorm:
     case IrBufferFormat::Format11_11_10SNorm: case IrBufferFormat::Format10_11_11SNorm: case IrBufferFormat::Format2_10_10_10SNorm:
@@ -513,7 +514,7 @@ std::uint32_t colorCompareReference(IrBufferFormat format) {
     case IrBufferFormat::Format10_11_11Float: case IrBufferFormat::Format32_32Float: case IrBufferFormat::Format16_16_16_16Float:
         return EmulatedCompare::ReferenceFloat;
     default:
-        throw std::runtime_error("comparison sampling of a color texture is implemented only for float, unorm and snorm formats (format " + std::to_string(static_cast<std::uint32_t>(format)) + ")");
+        throw std::runtime_error("comparison sampling of a color texture is implemented only for float, unorm, snorm and RGBA8 sRGB formats (format " + std::to_string(static_cast<std::uint32_t>(format)) + ")");
     }
 }
 
@@ -534,6 +535,7 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
         if (pair.image != index) continue;
         if (pair.sampler >= snapshot.samplers.size() || snapshot.samplers[pair.sampler].dwordCount != 4u) throw std::runtime_error("comparison sampling of a color texture has no sampler descriptor");
         const auto& words = snapshot.samplers[pair.sampler].dwords;
+        if (format == IrBufferFormat::Format8_8_8_8Srgb && (words[0] & ((1u << 20u) | (1u << 31u))) != 0u) throw std::runtime_error("comparison sampling of an sRGB color texture does not implement forced or disabled degamma");
         const auto clampX = words[0] & 0x7u;
         const auto clampY = (words[0] >> 3u) & 0x7u;
         const auto function = (words[0] >> 12u) & 0x7u;
@@ -925,7 +927,7 @@ std::uint64_t ResourceMaterializer::SpecializationNanoseconds() {
 }
 
 std::uint32_t ResourceMaterializer::BindlessSlots() {
-    return RuntimeAbi::SampledHeapCapacity;
+    return RuntimeAbi::BindlessTableCapacity;
 }
 
 void ResourceMaterializer::CountBindlessRejection(BindlessRejection reason) {

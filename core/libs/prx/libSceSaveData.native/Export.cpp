@@ -25,6 +25,8 @@ static constexpr char SAVE_DIR[] = "_sd";
 
 static std::atomic<std::int32_t> g_transaction_counter{1};
 static std::atomic<int> g_initializations{0};
+static bool g_initialized_once = false;
+static bool g_initial_cleanup_consumed = false;
 
 static std::string save_root() {
     return std::string(SAVE_DIR);
@@ -412,7 +414,9 @@ int APS5_VABI sceSaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 
 int APS5_VABI sceSaveDataInitialize3(const void* init) {
     (void)init;
+    std::lock_guard lock(g_slots_mutex);
     ++g_initializations;
+    g_initialized_once = true;
     return SAVE_DATA_OK;
 }
 
@@ -674,6 +678,16 @@ int APS5_VABI sceSaveDataSyncSaveDataMemory(const void* sync_param) {
 int APS5_VABI sceSaveDataTerminate(void) {
     std::lock_guard lock(g_slots_mutex);
     if (g_initializations == 0) {
+        static const bool allowInitialCleanup = [] {
+            const auto* value = std::getenv("ANYPS5_SAVEDATA_INITIAL_CLEANUP");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        if (allowInitialCleanup && !g_initialized_once &&
+            !g_initial_cleanup_consumed && !any_slot_used()) {
+            g_initial_cleanup_consumed = true;
+            SAVEDATA_TRACE("terminate: allowed initial cleanup with zero initializations");
+            return SAVE_DATA_OK;
+        }
         return SAVE_DATA_ERROR_NOT_INITIALIZED;
     }
     if (g_initializations == 1 && any_slot_used()) {

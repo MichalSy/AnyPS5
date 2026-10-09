@@ -8,6 +8,7 @@
 #include <array>
 #include "SceTypes.hpp"
 #include <chrono>
+#include <cerrno>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -952,6 +953,90 @@ static std::string BackingOf(const void* address) {
     return {};
 }
 
+static void CheckAutomaticGuestMappingPlacement() {
+    constexpr std::uintptr_t guestStart = 0x200000000ull;
+    constexpr std::uintptr_t guestEnd = 0xfc00000000ull;
+    constexpr std::uintptr_t systemReservedStart = 0x7ffffc000ull;
+    constexpr std::uintptr_t systemReservedEnd = 0x1000000000ull;
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t alignment = 0x200000;
+    void* occupied = MAP_FAILED;
+    for (std::uintptr_t index = 0; index < 64; ++index) {
+        void* const candidate = reinterpret_cast<void*>(guestStart + index * alignment);
+        occupied = mmap(candidate, page, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (occupied != MAP_FAILED) {
+            Require(occupied == candidate);
+            break;
+        }
+        Require(errno == EEXIST);
+    }
+    Require(occupied != MAP_FAILED);
+    auto* sentinel = static_cast<volatile unsigned char*>(occupied);
+    sentinel[0] = 0x6d;
+    sentinel[page - 1] = 0xa7;
+    const auto inGuestRange = [&](const void* mapping, std::size_t length) {
+        const auto address = reinterpret_cast<std::uintptr_t>(mapping);
+        Require(address >= guestStart && address <= guestEnd - length);
+        Require((address & (page - 1)) == 0);
+        Require(address + length <= systemReservedStart || address >= systemReservedEnd);
+        Require(address + length <= reinterpret_cast<std::uintptr_t>(occupied) ||
+                address >= reinterpret_cast<std::uintptr_t>(occupied) + page);
+    };
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2, 0, 0, &physical) == 0);
+    void* direct = nullptr;
+    Require(sceKernelMapDirectMemory(&direct, page * 2, 3, 0, physical, alignment) == 0);
+    inGuestRange(direct, page * 2);
+    Require((reinterpret_cast<std::uintptr_t>(direct) & (alignment - 1)) == 0);
+    static_cast<unsigned char*>(direct)[page + 5] = 0x39;
+    void* alias = nullptr;
+    Require(sceKernelMapDirectMemory(&alias, page * 2, 3, 0, physical, 0) == 0);
+    inGuestRange(alias, page * 2);
+    Require(alias != direct && static_cast<unsigned char*>(alias)[page + 5] == 0x39);
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, page, 3, 0) == 0);
+    inGuestRange(flexible, page);
+    static_cast<unsigned char*>(flexible)[0] = 0x51;
+    void* reserved = nullptr;
+    Require(sceKernelReserveVirtualRange(&reserved, page, 0, alignment) == 0);
+    inGuestRange(reserved, page);
+    Require((reinterpret_cast<std::uintptr_t>(reserved) & (alignment - 1)) == 0);
+    constexpr std::size_t largeLength = 0x800000000ull;
+    void* largeReserved = nullptr;
+    Require(sceKernelReserveVirtualRange(&largeReserved, largeLength, 0, alignment) == 0);
+    inGuestRange(largeReserved, largeLength);
+    Require(reinterpret_cast<std::uintptr_t>(largeReserved) >= systemReservedEnd);
+    VirtualQueryInfo largeInfo{};
+    Require(sceKernelVirtualQuery(largeReserved, 0, &largeInfo, sizeof(largeInfo)) == 0);
+    Require(!largeInfo.is_committed && largeInfo.end - largeInfo.start == largeLength);
+    Require(sceKernelMunmap(largeReserved, largeLength) == 0);
+    for (const auto [length, requestedAlignment] : std::array<std::pair<std::size_t, std::size_t>, 3>{{
+             {guestEnd - guestStart + page, 0},
+             {std::numeric_limits<std::size_t>::max() & ~(page - 1), 0},
+             {page, std::size_t{1} << 63}}}) {
+        void* invalid = nullptr;
+        bool rejected = false;
+        try { sceKernelReserveVirtualRange(&invalid, length, 0, requestedAlignment); }
+        catch (const std::runtime_error&) { rejected = true; }
+        Require(rejected && invalid == nullptr);
+    }
+    constexpr std::uintptr_t highHint = 0x10000000000ull;
+    void* hinted = reinterpret_cast<void*>(highHint);
+    Require(sceKernelMapFlexibleMemory(&hinted, page, 3, 0) == 0);
+    Require(reinterpret_cast<std::uintptr_t>(hinted) >= highHint);
+    static_cast<unsigned char*>(hinted)[0] = 0x72;
+    Require(sentinel[0] == 0x6d && sentinel[page - 1] == 0xa7);
+    Require(static_cast<unsigned char*>(flexible)[0] == 0x51);
+    Require(sceKernelMunmap(hinted, page) == 0);
+    Require(sceKernelMunmap(reserved, page) == 0);
+    Require(sceKernelMunmap(flexible, page) == 0);
+    Require(sceKernelMunmap(alias, page * 2) == 0);
+    Require(sceKernelMunmap(direct, page * 2) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, page * 2) == 0);
+    Require(munmap(occupied, page) == 0);
+}
+
 static void CheckDirectMemoryBackingNeedsNoFilesystem() {
     constexpr std::size_t page = 0x4000;
     std::int64_t phys = 0;
@@ -1089,6 +1174,7 @@ int main() {
     CheckReadsIntoSharedWriteTracking();
     CheckPinnedSharedPages();
 #if defined(__linux__)
+    CheckAutomaticGuestMappingPlacement();
     CheckWriteWatch();
     CheckDirectMemoryWriteWatch();
     CheckDirectMemoryBackingNeedsNoFilesystem();
