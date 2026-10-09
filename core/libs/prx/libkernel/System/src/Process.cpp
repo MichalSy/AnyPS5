@@ -138,6 +138,26 @@ int APS5_VABI getpid_nid_postfix(void) {
     return static_cast<int>(pid);
 }
 
+int APS5_VABI getuid_nid_postfix(void) {
+    return 0;
+}
+
+int APS5_VABI geteuid_nid_postfix(void) {
+    return 0;
+}
+
+int APS5_VABI getgid_nid_postfix(void) {
+    return 0;
+}
+
+int APS5_VABI getegid_nid_postfix(void) {
+    return 0;
+}
+
+int APS5_VABI issetugid_nid_postfix(void) {
+    return 0;
+}
+
 void APS5_VABI exit_nid_postfix(int code) {
     LibcExit_nid_no_patch(code);
 }
