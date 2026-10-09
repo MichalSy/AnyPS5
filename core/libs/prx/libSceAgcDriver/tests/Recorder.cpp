@@ -1,9 +1,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
@@ -136,8 +138,8 @@ public:
             std::vector<VkQueueFamilyProperties> families(count);
             queues(context.physical, &count, families.data());
             std::uint32_t family = 0;
-            while (family < count && (families[family].queueFlags & VK_QUEUE_COMPUTE_BIT) == 0) ++family;
-            Require(family < count, "no Vulkan compute queue");
+            while (family < count && (families[family].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) != (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) ++family;
+            Require(family < count, "no Vulkan graphics and compute queue");
             const float priority = 1;
             VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
             queue.queueFamilyIndex = family;
@@ -147,6 +149,17 @@ public:
             enabled.shaderInt64 = VK_TRUE;
             address.pNext = &bytes;
             std::vector<const char*> extensionsEnabled{VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_8BIT_STORAGE_EXTENSION_NAME};
+            VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+            if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                context.nullDescriptors = robustness.nullDescriptor;
+                robustness.robustBufferAccess2 = VK_FALSE;
+                robustness.robustImageAccess2 = VK_FALSE;
+                robustness.pNext = address.pNext;
+                address.pNext = &robustness;
+                extensionsEnabled.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+            }
             VkPhysicalDeviceDriverProperties driverProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
             if (hasExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
                 extensionsEnabled.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
@@ -187,6 +200,7 @@ public:
             context.limits = properties.limits;
             context.bufferDeviceAddress = true;
             context.formatProperties = function<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
+            context.imageFormatProperties = function<PFN_vkGetPhysicalDeviceImageFormatProperties>("vkGetPhysicalDeviceImageFormatProperties");
             context.Function<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(context.device, family, 0, &context.queue);
             VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
             pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1055,6 +1069,143 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
     }
     // The import is retired by the next reconcile; the block itself is left to the process.
     HostImportFor(context, address, bytes);
+}
+
+void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    constexpr std::uint32_t side = 64;
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(bytes, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the depth proof block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        Recorder& recorder;
+        ~Unregister() {
+            recorder.Sync();
+            ClearDepthSurfaces(context.device);
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } unregister{base, block, recorder};
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    TextureCache cache(context);
+    context.textureCache = &cache;
+    DepthTarget target{address, 0, {side, side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    target.surfaceExtent = {side, side};
+    target.mipCount = 3;
+    Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "the depth proof surface has no view");
+    const std::array<std::uint32_t, 8> words{
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (22u << 20u) | (((side - 1u) & 3u) << 30u),
+        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+        0xfacu | (1u << 12u) | (1u << 16u) | (0x18u << 20u) | (9u << 28u),
+        0u, (target.mipCount - 1u) << 4u, 0u, 0u
+    };
+    const VkComponentMapping components{VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + 2u;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageSamplers = {0};
+    binding.guestDescriptor.assign(words.begin(), words.end());
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    {
+        ShaderResources resources(context, compute);
+        Require(resources.Reusable(), "a set sampling only a depth surface is not reusable");
+        const auto requireFast = [&](const char* message) {
+            ShaderResources::ProofReport report{};
+            Require(resources.Revalidate(compute, &report), message);
+            Require(report.path == ShaderResources::ProofPath::Fast, "an unchanged depth mip view took the full resource proof");
+        };
+        requireFast("the first unchanged depth proof failed");
+        requireFast("the second unchanged depth proof failed");
+        const auto texture = DepthSurfaceTexture(context, words, DecodeTextureResource(words), components);
+        Require(texture != nullptr && DepthSurfaceHolds(context, words, components, texture.get()), "the sampled depth mip is not held by its active surface");
+        auto attachment = target;
+        attachment.extent = {side >> 2u, side >> 2u};
+        attachment.mip = 2;
+        Require(DepthSurfaceView(context, attachment) != VK_NULL_HANDLE, "the second depth attachment mip has no view");
+        Require(DepthSurfaceTexture(context, words, DecodeTextureResource(words), components) == texture, "binding another attachment mip replaced the sampled view");
+        requireFast("binding another attachment mip invalidated the unchanged depth proof");
+
+        auto otherWords = words;
+        otherWords[3] &= ~0x000ff000u;
+        const auto otherMip = DepthSurfaceTexture(context, otherWords, DecodeTextureResource(otherWords), components);
+        Require(otherMip != nullptr && otherMip != texture, "different depth mip ranges share one sampled view");
+        Require(DepthSurfaceHolds(context, otherWords, components, otherMip.get()), "the second depth mip view is not held");
+        Require(!DepthSurfaceHolds(context, otherWords, components, texture.get()), "another depth mip range proves the previous view");
+        Require(!DepthSurfaceHolds(context, words, components, otherMip.get()), "the original depth mip range proves another view");
+        auto otherComponents = components;
+        otherComponents.r = VK_COMPONENT_SWIZZLE_G;
+        const auto swizzled = DepthSurfaceTexture(context, words, DecodeTextureResource(words), otherComponents);
+        Require(swizzled != nullptr && swizzled != texture, "different depth swizzles share one sampled view");
+        Require(DepthSurfaceHolds(context, words, otherComponents, swizzled.get()), "the swizzled depth view is not held");
+        Require(!DepthSurfaceHolds(context, words, otherComponents, texture.get()), "another depth swizzle proves the previous view");
+        auto arrayWords = words;
+        arrayWords[3] = (arrayWords[3] & 0x0fffffffu) | (13u << 28u);
+        Require(!DepthSurfaceHolds(context, arrayWords, components, texture.get()), "a depth array lookup takes the fast proof");
+        arrayWords[4] = 1u | (1u << 16u);
+        Require(!DepthSurfaceHolds(context, arrayWords, components, texture.get()), "a layered depth lookup takes the fast proof");
+        auto multisampleWords = words;
+        multisampleWords[3] = (multisampleWords[3] & 0x0fffffffu) | (14u << 28u);
+        Require(!DepthSurfaceHolds(context, multisampleWords, components, texture.get()), "a multisampled depth lookup takes the fast proof");
+        Require(!DepthSurfaceHolds(context, words, components, nullptr), "a null depth view is held");
+        Require(!DepthSurfaceHolds(context, std::span<const std::uint32_t>(words).first(7), components, texture.get()), "a truncated depth descriptor takes the fast proof");
+
+        RetireDepthSurfaces(context.device, address, bytes);
+        Require(!DepthSurfaceHolds(context, words, components, texture.get()), "a retired depth surface still holds the sampled view");
+        ShaderResources::ProofReport retiredReport{};
+        Require(!resources.Revalidate(compute, &retiredReport), "a retired depth surface leaves the old resource set reusable");
+        Require(retiredReport.path == ShaderResources::ProofPath::Full, "a retired depth surface passed the fast proof");
+        DepthSurfaceView(context, target);
+        Require(DepthSurfaceHolds(context, words, components, texture.get()), "rebinding the same live depth surface did not restore its view");
+        requireFast("rebinding the same depth surface did not restore the resource proof");
+        auto replacement = target;
+        replacement.mipCount = 2;
+        DepthSurfaceView(context, replacement);
+        const auto newest = DepthSurfaceTexture(context, words, DecodeTextureResource(words), components);
+        Require(newest != nullptr && newest != texture, "a different depth mip chain reused the previous sampled view");
+        Require(!DepthSurfaceHolds(context, words, components, texture.get()), "a replaced depth surface still proves its old sampled view");
+        Require(DepthSurfaceHolds(context, words, components, newest.get()), "the newest active depth surface does not prove its exact view");
+        ShaderResources::ProofReport replacedReport{};
+        Require(!resources.Revalidate(compute, &replacedReport), "a replaced depth surface leaves the old resource set reusable");
+        Require(replacedReport.path == ShaderResources::ProofPath::Full, "a replaced depth surface passed the fast proof");
+        {
+            ShaderResources updated(context, compute);
+            Require(updated.Reusable(), "the replacement depth resource set is not reusable");
+            ShaderResources::ProofReport report{};
+            Require(updated.Revalidate(compute, &report) && report.path == ShaderResources::ProofPath::Fast, "the replacement depth resource set did not take the fast proof");
+        }
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    }
 }
 
 void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
@@ -2886,6 +3037,11 @@ int main(int argc, char** argv) {
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--depth-proof-only") {
+            depthSurfaceProofTests(device, recorder);
+            std::cout << "Depth surface fast proof tests passed\n";
+            return 0;
+        }
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
@@ -2898,6 +3054,7 @@ int main(int argc, char** argv) {
         closeRaceTests(device, recorder);
         keyProofTests(device, recorder);
         resourceReadTests(device, recorder);
+        depthSurfaceProofTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
         drawSnapshotEvictionTests(device);

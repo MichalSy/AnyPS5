@@ -176,6 +176,18 @@ public:
         return texture;
     }
 
+    bool Holds(std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, const Texture* texture) const {
+        if (target.samples != VK_SAMPLE_COUNT_1_BIT || !SampledAccepts(words, resource)) return false;
+        std::array<std::uint32_t, 12> key{};
+        std::copy(words.begin(), words.end(), key.begin());
+        key[8] = components.r;
+        key[9] = components.g;
+        key[10] = components.b;
+        key[11] = components.a;
+        const auto found = textures.find(key);
+        return found != textures.end() && found->second.get() == texture;
+    }
+
     bool Overlaps(std::uint64_t address, std::uint64_t bytes) const {
         const auto overlaps = [&](std::uint64_t plane, std::uint64_t planeBytes) {
             return plane != 0 && bytes != 0 && (address >= plane ? address - plane < planeBytes : plane - address < bytes);
@@ -327,6 +339,19 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         return nullptr;
     }
     return (*found)->Sampled(words, resource, components);
+}
+
+bool DepthSurfaceHolds(const Context& context, std::span<const std::uint32_t> words, VkComponentMapping components, const Texture* texture) {
+    if (texture == nullptr || words.size() != 8u || (words[3] >> 28u) != 9u) return false;
+    const auto resource = DecodeTextureResource(words);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::lock_guard lock(surfacesMutex());
+    const auto& list = surfaces();
+    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
+        return !surface->retired && surface->context.device == context.device && (surface->target.address == resource.baseAddress ||
+            (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
+    });
+    return found != list.rend() && (*found)->Holds(words, resource, components, texture);
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {
