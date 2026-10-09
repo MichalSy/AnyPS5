@@ -166,42 +166,6 @@ int APS5_VABI system_nid_postfix(const char* command) {
     return command ? Failure(45) : 0;
 }
 
-std::uint32_t APS5_VABI getuid_nid_postfix() {
-#ifdef _WIN32
-    Failure(45);
-    return std::numeric_limits<std::uint32_t>::max();
-#else
-    return ::getuid();
-#endif
-}
-
-std::uint32_t APS5_VABI geteuid_nid_postfix() {
-#ifdef _WIN32
-    Failure(45);
-    return std::numeric_limits<std::uint32_t>::max();
-#else
-    return ::geteuid();
-#endif
-}
-
-std::uint32_t APS5_VABI getgid_nid_postfix() {
-#ifdef _WIN32
-    Failure(45);
-    return std::numeric_limits<std::uint32_t>::max();
-#else
-    return ::getgid();
-#endif
-}
-
-std::uint32_t APS5_VABI getegid_nid_postfix() {
-#ifdef _WIN32
-    Failure(45);
-    return std::numeric_limits<std::uint32_t>::max();
-#else
-    return ::getegid();
-#endif
-}
-
 int APS5_VABI getrlimit_nid_postfix(int resource, GuestResourceLimit* limit) {
     if (!limit) return Failure(14);
     if (resource < 0 || resource > 14) return Failure(22);

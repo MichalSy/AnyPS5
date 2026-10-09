@@ -32,11 +32,12 @@ int main() {
     Require(system_nid_postfix(command.c_str()) == -1 && *__error_nid_postfix() == 45, "shell command is explicitly unsupported");
     Require(!std::filesystem::exists(marker), "unsupported command must not execute");
 
-#ifndef _WIN32
     *__error_nid_postfix() = 13;
-    Require(getuid_nid_postfix() == ::getuid() && geteuid_nid_postfix() == ::geteuid(), "native user identities");
-    Require(getgid_nid_postfix() == ::getgid() && getegid_nid_postfix() == ::getegid(), "native group identities");
+    Require(getuid_nid_postfix() == 0 && geteuid_nid_postfix() == 0, "guest user identities");
+    Require(getgid_nid_postfix() == 0 && getegid_nid_postfix() == 0, "guest group identities");
+    Require(issetugid_nid_postfix() == 0, "guest credentials have not changed");
     Require(*__error_nid_postfix() == 13, "identity queries preserve errno");
+#ifndef _WIN32
     rlimit native{};
     Require(::getrlimit(RLIMIT_NOFILE, &native) == 0, "native descriptor limit");
     GuestResourceLimit limit{};
@@ -48,7 +49,6 @@ int main() {
     Require(limit.current == expected(native.rlim_cur) && limit.maximum == expected(native.rlim_max), "guest limits preserve values and translate infinity");
     Require(*__error_nid_postfix() == 13, "resource query preserves errno");
 #else
-    Require(getuid_nid_postfix() == std::numeric_limits<std::uint32_t>::max() && *__error_nid_postfix() == 45, "Windows POSIX identity is explicitly unavailable");
     GuestResourceLimit limit{};
 #endif
     Require(getrlimit_nid_postfix(0, nullptr) == -1 && *__error_nid_postfix() == 14, "null limit rejected");

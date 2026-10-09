@@ -239,29 +239,6 @@ extern "C" void CopyGuestSignalMask_nid_no_patch(const void* nativeMask, std::ui
 #endif
 
 extern "C" {
-int APS5_VABI sigemptyset_nid_postfix(GuestSignalSet* set) {
-    if (!set) return Fail(guestFault);
-    *set = {};
-    return 0;
-}
-int APS5_VABI sigfillset_nid_postfix(GuestSignalSet* set) {
-    if (!set) return Fail(guestFault);
-    for (auto& word : set->bits) word = UINT32_MAX;
-    return 0;
-}
-int APS5_VABI sigaddset_nid_postfix(GuestSignalSet* set, int guest) {
-    if (!set) return Fail(guestFault);
-    if (!ValidSetSignal(guest)) return Fail(guestInvalid);
-    SetAdd(*set, guest);
-    return 0;
-}
-int APS5_VABI sigdelset_nid_postfix(GuestSignalSet* set, int guest) {
-    if (!set) return Fail(guestFault);
-    if (!ValidSetSignal(guest)) return Fail(guestInvalid);
-    const unsigned index = static_cast<unsigned>(guest - 1);
-    set->bits[index / 32] &= ~(std::uint32_t{1} << (index % 32));
-    return 0;
-}
 int APS5_VABI sigaction_nid_postfix(int guest, const GuestSignalAction* action, GuestSignalAction* previous) {
 #ifdef _WIN32
     (void)guest;

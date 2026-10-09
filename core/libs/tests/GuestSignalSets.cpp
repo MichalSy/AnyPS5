@@ -97,6 +97,22 @@ int main() {
         Require(Equals(set, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu));
     }
 
+    for (const auto initialize : {sigemptyset_nid_postfix, sigfillset_nid_postfix}) {
+        *__error_nid_postfix() = Untouched;
+        Require(initialize(nullptr) == -1 && *__error_nid_postfix() == 14);
+    }
+    for (const auto modify : {sigaddset_nid_postfix, sigdelset_nid_postfix}) {
+        for (const int signal : {1, 0, 129}) {
+            *__error_nid_postfix() = Untouched;
+            Require(modify(nullptr, signal) == -1 && *__error_nid_postfix() == 14);
+        }
+    }
+    for (const int signal : {1, 0, 129}) {
+        *__error_nid_postfix() = Untouched;
+        Require(sigismember_nid_postfix(nullptr, signal) == -1 && *__error_nid_postfix() == 14);
+    }
+    Require(Equals(set, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu));
+
     const GuestSignalSet empty{{0, 0, 0, 0}};
     Require(sigismember_nid_postfix(&empty, 1) == 0);
     Require(sigismember_nid_postfix(&empty, 128) == 0);
