@@ -156,6 +156,29 @@ void InertDepthTests() {
     }
 }
 
+void InitialHtileDefaultTests() {
+    constexpr std::uint32_t sdkDefault = 0x00040000u;
+    const auto initial = AgcDriver::InitialContextRegisters();
+    Require(initial.contains(0x2af) && initial.at(0x2af) == sdkDefault, "initial context omits the SDK DB_HTILE_SURFACE default");
+    AgcDriver::QueueState queue;
+    Require(queue.context.contains(0x2af) && queue.context.at(0x2af) == sdkDefault, "new queue does not inherit DB_HTILE_SURFACE");
+    queue.context[0x2af] = 0;
+    Require(queue.context.contains(0x2af) && queue.context.at(0x2af) == 0, "explicit disabled DB_HTILE_SURFACE was replaced with a default");
+    queue.ClearContext();
+    Require(queue.context.contains(0x2af) && queue.context.at(0x2af) == sdkDefault, "ClearContext did not restore the SDK HTILE default");
+    queue.context.erase(0x2af);
+    queue.ClearContext();
+    Require(queue.context.contains(0x2af) && queue.context.at(0x2af) == sdkDefault, "ClearContext did not restore HTILE register presence");
+    const auto configured = Queue(0);
+    queue.shader = configured.shader;
+    queue.userConfig = configured.userConfig;
+    for (const auto& [offset, value] : configured.context) queue.context[offset] = value;
+    queue.context[0x010] = 3u | (24u << 4u) | (1u << 29u);
+    queue.context[0x005] = 0x1000;
+    queue.context[0x01e] = 0;
+    Require(DecodeState(queue).depth->htileAddress == 0x100000ull, "the inherited SDK default does not enable supported HTILE without an explicit surface-register packet");
+}
+
 void HtileTests() {
     Require(HtileSliceBytes({1920, 1080}) == 196608u, "HTILE misses hardware padding for 1920x1080");
     Require(HtileSliceBytes({1804, 732}) == 131072u, "HTILE misses hardware padding for 1804x732");
@@ -238,6 +261,7 @@ int main() {
         RegisterTests();
         InertDepthTests();
         LayoutTests();
+        InitialHtileDefaultTests();
         HtileTests();
         std::puts("depth mip register decoding, slice strides and padded chain layout tests passed");
         return 0;
