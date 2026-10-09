@@ -397,27 +397,36 @@ void CheckDepthExportAbi(AgcDriver::VulkanDevice& device) {
             rejected = true;
         }
         Require(rejected, "enabled depth artifact accepted a different static depth ABI");
-        for (const auto capacity : {128u, 0u}) {
-            request.layout.pushConstantSizeBytes = capacity;
-            snapshot->prepared->entries.push_back({0, PrepareShader(request)});
+        for (const std::uint32_t drawZOrder : {0u, 1u}) {
+            context[0x203] = (context[0x203] & ~0x30u) | (drawZOrder << 4u);
+            request.context.pixel = AgcDriver::Graphics::DecodePixelStageInfo(context, {});
+            for (const auto capacity : {128u, 0u}) {
+                request.layout.pushConstantSizeBytes = capacity;
+                snapshot->prepared->entries.push_back({0, PrepareShader(request)});
+            }
         }
-        for (const bool exportDepth : {true, false}) {
-            request.context.pixel = exportDepth ? enabled : disabled;
-            for (const auto layout : {BindingLayout{0, 0, 0, 128}, BindingLayout{0, 0, 20, 108}, BindingLayout{0, 0, 0, 0}}) {
-                request.layout = layout;
-                const auto handle = SourceHandleFor(*snapshot, 0, request);
-                const auto& words = GetPreparedArtifact(*handle).spirv.Words();
-                Require(HasExecutionMode(words, spv::ExecutionModeDepthReplacing) == exportDepth, "prepared pixel retained the wrong depth export execution mode");
-                Require(HasExecutionMode(words, spv::ExecutionModeEarlyFragmentTests) == (!exportDepth && zOrder == 1u), "prepared pixel retained the wrong early depth execution mode");
-                const auto invocation = InvocationFor(*snapshot, 0, request);
-                Require(invocation.Request().layout.pushConstantOffsetBytes == layout.pushConstantOffsetBytes, "prepared pixel lost its actual preceding-stage push offset");
+        for (const std::uint32_t drawZOrder : {0u, 1u}) {
+            for (const bool exportDepth : {true, false}) {
+                context[0x203] = (context[0x203] & ~0x31u) | (drawZOrder << 4u) | static_cast<std::uint32_t>(exportDepth);
+                request.context.pixel = AgcDriver::Graphics::DecodePixelStageInfo(context, {});
+                for (const auto layout : {BindingLayout{0, 0, 0, 128}, BindingLayout{0, 0, 20, 108}, BindingLayout{0, 0, 0, 0}}) {
+                    request.layout = layout;
+                    const auto handle = SourceHandleFor(*snapshot, 0, request);
+                    const auto& words = GetPreparedArtifact(*handle).spirv.Words();
+                    Require(HasExecutionMode(words, spv::ExecutionModeDepthReplacing) == exportDepth, "prepared pixel retained the wrong depth export execution mode");
+                    Require(HasExecutionMode(words, spv::ExecutionModeEarlyFragmentTests) == (!exportDepth && drawZOrder == 1u), "prepared pixel retained the wrong early depth execution mode");
+                    const auto invocation = InvocationFor(*snapshot, 0, request);
+                    Require(invocation.Request().layout.pushConstantOffsetBytes == layout.pushConstantOffsetBytes, "prepared pixel lost its actual preceding-stage push offset");
+                }
             }
         }
         for (const bool changeInterpolator : {true, false}) {
-            request.context.pixel = disabled;
+            auto invalid = context;
+            invalid[0x203] = (invalid[0x203] & ~0x31u) | (zOrder << 4u);
+            if (changeInterpolator) invalid[0x191] = 0;
+            else invalid[0x203] |= 0x40u;
+            request.context.pixel = AgcDriver::Graphics::DecodePixelStageInfo(invalid, {});
             request.layout = {0, 0, 0, 128};
-            if (changeInterpolator) request.context.pixel->interpolatorSettings[0] = 0;
-            else request.context.pixel->earlyZ = !disabled.earlyZ;
             rejected = false;
             try {
                 static_cast<void>(SourceHandleFor(*snapshot, 0, request));
@@ -431,7 +440,7 @@ void CheckDepthExportAbi(AgcDriver::VulkanDevice& device) {
     std::cout << "prepared depth export, early fragment tests, push offsets and strict pixel ABI passed\n";
 }
 
-void CheckRegisteredDepthExport(std::uint32_t zOrder) {
+void CheckRegisteredDepthExport(std::uint32_t zOrder, bool registeredDepth = true) {
     {
         GuestAllocations::Mutation mutation;
         mutation.Add(Pixels.data(), Pixels.size(), true, true);
@@ -454,7 +463,7 @@ void CheckRegisteredDepthExport(std::uint32_t zOrder) {
     exportQueue.context[0x1b6] = 0x8001;
     exportQueue.context[0x191] = 32;
     exportQueue.context[0x1c4] = 1;
-    exportQueue.context[0x203] = 0x801u | (zOrder << 4u);
+    exportQueue.context[0x203] = 0x800u | (zOrder << 4u) | static_cast<std::uint32_t>(registeredDepth);
     Header<3, 7> pixel;
     pixel.Initialize(1, PixelDepthCode.data(), sizeof(PixelDepthCode));
     pixel.registers = {{{0x8, exportQueue.shader.at(0x8)}, {0x9, exportQueue.shader.at(0x9)}, {0xb, exportQueue.shader.at(0xb)}}};
@@ -478,19 +487,22 @@ void CheckRegisteredDepthExport(std::uint32_t zOrder) {
         Require(std::all_of(Pixels.begin(), Pixels.begin() + Width * Height * 4u, [&](std::byte value) { return value == expected; }), "registered depth variant produced the wrong stored depth");
         Require(std::all_of(Pixels.begin() + Width * Height * 4u, Pixels.end(), [](std::byte value) { return value == std::byte{0x40}; }), "depth verification draw changed color padding");
     };
-    for (const bool exportDepth : {true, false, true, false}) {
-        for (auto& position : Vertices) position[2] = 0.25f;
-        Submit(queue);
-        verifyDepth(0.25f, VK_COMPARE_OP_EQUAL, true);
-        for (auto& position : Vertices) position[2] = 0.25f;
-        auto draw = exportQueue;
-        if (!exportDepth) draw.context[0x203] &= ~1u;
-        const auto pixelInfo = AgcDriver::Graphics::DecodePixelStageInfo(draw.context, {});
-        Require(pixelInfo.depthExportEnable == exportDepth && pixelInfo.earlyZ == (!exportDepth && zOrder == 1u), "registered depth fixture decoded the wrong pixel controls");
-        Submit(draw);
-        verifyDepth(exportDepth ? 0.75f : 0.25f, VK_COMPARE_OP_EQUAL, true);
-        verifyDepth(0.5f, VK_COMPARE_OP_LESS, exportDepth);
-        Require(pixel.context[4].value == (0x801u | (zOrder << 4u)) && pixel.context[6].value == 0, "preparing a depth variant changed the registered shader header");
+    for (const std::uint32_t drawZOrder : {0u, 1u}) {
+        for (const bool exportDepth : {true, false}) {
+            if (exportDepth && !registeredDepth) continue;
+            for (auto& position : Vertices) position[2] = 0.25f;
+            Submit(queue);
+            verifyDepth(0.25f, VK_COMPARE_OP_EQUAL, true);
+            for (auto& position : Vertices) position[2] = 0.25f;
+            auto draw = exportQueue;
+            draw.context[0x203] = (draw.context[0x203] & ~0x31u) | (drawZOrder << 4u) | static_cast<std::uint32_t>(exportDepth);
+            const auto pixelInfo = AgcDriver::Graphics::DecodePixelStageInfo(draw.context, {});
+            Require(pixelInfo.depthExportEnable == exportDepth && pixelInfo.earlyZ == (!exportDepth && drawZOrder == 1u), "registered depth fixture decoded the wrong pixel controls");
+            Submit(draw);
+            verifyDepth(exportDepth ? 0.75f : 0.25f, VK_COMPARE_OP_EQUAL, true);
+            verifyDepth(0.5f, VK_COMPARE_OP_LESS, exportDepth);
+            Require(pixel.context[4].value == (0x800u | (zOrder << 4u) | static_cast<std::uint32_t>(registeredDepth)) && pixel.context[6].value == 0, "preparing a depth variant changed the registered shader header");
+        }
     }
     {
         GuestAllocations::Mutation mutation;
@@ -498,7 +510,7 @@ void CheckRegisteredDepthExport(std::uint32_t zOrder) {
         mutation.Remove(Depth.data());
         mutation.Remove(Pixels.data());
     }
-    std::cout << "registered enabled/disabled depth export and resolved interpolants passed: zOrder=" << zOrder << '\n';
+    std::cout << "registered enabled/disabled depth export and resolved interpolants passed: zOrder=" << zOrder << " depth=" << registeredDepth << '\n';
 }
 
 }
@@ -521,6 +533,8 @@ int main(int argc, char** argv) {
         if (argc == 1 || std::string_view(argv[1]) == "--depth-variants") {
             CheckRegisteredDepthExport(0u);
             CheckRegisteredDepthExport(1u);
+            CheckRegisteredDepthExport(0u, false);
+            CheckRegisteredDepthExport(1u, false);
         }
         if (argc == 1 || std::string_view(argv[1]) != "--abi") AgcDriverShutdown_nid_postfix();
         return 0;

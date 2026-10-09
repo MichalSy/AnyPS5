@@ -532,10 +532,13 @@ PreparedRegistration PrepareRegistered(const ShaderSnapshot& snapshot, const Vul
     } else if (pixel) {
         request.layout.pushConstantSizeBytes = 0;
         append();
-        if (pixel->depthExportEnable) {
-            auto context = state.context;
-            context[0x203] &= ~1u;
+        auto context = state.context;
+        std::vector<std::uint64_t> key;
+        for (const std::uint32_t zOrder : {0u, 1u}) {
+            context[0x203] = (context[0x203] & ~0x31u) | (zOrder << 4u);
             request.context.pixel = Graphics::DecodePixelStageInfo(context, {});
+            ShaderRecompiler::BuildPreparedShaderKey(request, key);
+            if (std::ranges::any_of(prepared.entries, [&](const auto& entry) { return entry.handle->staticKey == key; })) continue;
             request.layout.pushConstantSizeBytes = 128;
             append();
             request.layout.pushConstantSizeBytes = 0;
