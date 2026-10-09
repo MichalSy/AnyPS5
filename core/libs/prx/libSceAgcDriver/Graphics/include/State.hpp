@@ -67,6 +67,9 @@ struct DepthTarget {
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     std::vector<VkSampleLocationEXT> sampleLocations;
     VkExtent2D sampleLocationsGrid{1, 1};
+    VkExtent2D surfaceExtent{};
+    std::uint32_t mipCount = 1;
+    std::uint32_t mip = 0;
 };
 
 struct State {

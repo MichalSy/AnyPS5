@@ -111,6 +111,13 @@ constexpr std::uint32_t ScreenOffsetMask = ~0x01ff01ffu;
 // Bits 26/27 (ZCLIP_NEAR/FAR_DISABLE) become depth clamping; bit 19 selects the [0, 1] clip space.
 constexpr std::uint32_t ClipControlMask = ~(0x80000u | 0x01000000u | 0x0c000000u);
 
+bool inertDepth(const Registers& cx, std::uint32_t depthControl) {
+    if ((depthControl & 0xfu) != 2u || ((depthControl >> 4u) & 7u) != 7u || (depthControl & 0xc0000000u) != 0) return false;
+    const auto renderControl = find(cx, 0x000);
+    const auto raster = find(cx, 0x205);
+    return renderControl != cx.end() && renderControl->second == 0 && raster != cx.end() && (raster->second & 0x1800u) == 0;
+}
+
 std::string multisampleRejection(const Registers& cx, State* output = nullptr, bool complete = false) {
     const auto word = [&](std::uint32_t offset) -> std::optional<std::uint32_t> {
         const auto found = find(cx, offset);
@@ -129,7 +136,7 @@ std::string multisampleRejection(const Registers& cx, State* output = nullptr, b
         const auto depthControl = optional(0x200);
         const auto z = optional(0x010);
         const auto stencil = optional(0x011);
-        if (depthControl && (*depthControl & 0xbu) != 0 && z && stencil && ((*z & 3u) != 0 || (*stencil & 1u) != 0)) {
+        if (depthControl && !inertDepth(cx, *depthControl) && (*depthControl & 0xbu) != 0 && z && stencil && ((*z & 3u) != 0 || (*stencil & 1u) != 0)) {
             if (static_cast<VkSampleCountFlagBits>(1u << ((*z >> 2u) & 3u)) != samples) return "depth and rasterization sample counts differ";
             const auto view = optional(0x002);
             if (samples != VK_SAMPLE_COUNT_1_BIT && view && *view != 0) return "multisampled read-only, mipmapped or array depth views are unsupported";
@@ -281,17 +288,32 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     zero(cx, 0x000, 0x00001f9du, "depth clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
     const bool stencilClear = (read(cx, 0x000) & 2u) != 0;
     const auto view = read(cx, 0x002);
-    zero(cx, 0x002, 0x3c000000u, "depth mips (DB_DEPTH_VIEW MIP_LEVEL)");
-    zero(cx, 0x010, 0x000f1000u, "partially resident or mipmapped depth (DB_Z_INFO)");
-    const auto depthSamples = (read(cx, 0x010) >> 2u) & 3u;
+    zero(cx, 0x010, 0x00001000u, "partially resident depth (DB_Z_INFO)");
+    const auto zInfo = read(cx, 0x010);
+    const auto mipCount = ((zInfo >> 16u) & 0xfu) + 1u;
+    const auto mip = (view >> 26u) & 0xfu;
+    const auto requireMip = [&](bool condition, const char* message) {
+        if (condition) return;
+        const auto word = [&](std::uint32_t offset) { const auto it = find(cx, offset); return it != cx.end() ? it->second : 0u; };
+        char detail[768];
+        std::snprintf(detail, sizeof(detail), "%s (DB_DEPTH_VIEW=0x%08x, DB_Z_INFO=0x%08x, DB_STENCIL_INFO=0x%08x, DB_DEPTH_SIZE=0x%08x, DB_DEPTH_CONTROL=0x%08x, DB_RENDER_CONTROL=0x%08x, depth read=0x%08x:%08x write=0x%08x:%08x, stencil read=0x%08x:%08x write=0x%08x:%08x)",
+            message, view, zInfo, word(0x011), word(0x007), depthControl, word(0x000), word(0x01a), word(0x012), word(0x01c), word(0x014), word(0x01b), word(0x013), word(0x01d), word(0x015));
+        throw std::runtime_error(detail);
+    };
+    requireMip(mip < mipCount, "depth view mip exceeds its surface mip chain");
+    const auto depthSamples = (zInfo >> 2u) & 3u;
     Require(depthSamples == 0u || depthSamples == 3u, "depth sample count other than one or eight is unsupported");
     const auto samples = static_cast<VkSampleCountFlagBits>(1u << depthSamples);
     Require(samples == result.rasterizationSamples, "depth and rasterization sample counts differ");
-    Require(samples == VK_SAMPLE_COUNT_1_BIT || view == 0u, "multisampled read-only, mipmapped or array depth views are unsupported");
+    requireMip(samples == VK_SAMPLE_COUNT_1_BIT || (view == 0u && mipCount == 1u), "multisampled read-only, mipmapped or array depth views are unsupported");
     zero(cx, 0x011, 0x00001000u, "partially resident stencil (DB_STENCIL_INFO)");
-    const auto zFormat = read(cx, 0x010) & 3u;
+    const auto zFormat = zInfo & 3u;
     const bool stencil = (read(cx, 0x011) & 1u) != 0;
     Require(zFormat != 2, "Z_24 depth is unsupported");
+    if (mipCount > 1u) {
+        requireMip(zFormat == 0 || ((zInfo >> 4u) & 0x1fu) == 24u, "mipmapped depth requires SW_64KB_Z_X");
+        requireMip(!stencil || ((read(cx, 0x011) >> 4u) & 0x1fu) == 24u, "mipmapped stencil requires SW_64KB_Z_X");
+    }
     if (zFormat == 0) depthControl &= ~6u;
     if (!stencil) depthControl &= ~1u;
     const auto base = [&](std::uint32_t low, std::uint32_t highOffset) {
@@ -301,6 +323,8 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     const bool depthReadOnly = (view & 0x01000000u) != 0;
     const bool stencilReadOnly = (view & 0x02000000u) != 0;
     DepthTarget depth{};
+    depth.mipCount = mipCount;
+    depth.mip = mip;
     depth.samples = samples;
     depth.sampleLocations = result.sampleLocations;
     depth.sampleLocationsGrid = result.sampleLocationsGrid;
@@ -309,10 +333,15 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     Require(zFormat == 0 || depthReadOnly || base(0x014, 0x01c) == depth.address, "depth read and written at different addresses is unsupported");
     Require(!stencil || stencilReadOnly || base(0x015, 0x01d) == depth.stencilAddress, "stencil read and written at different addresses is unsupported");
     const auto size = read(cx, 0x007);
-    depth.extent = {(size & 0x3fffu) + 1u, ((size >> 16u) & 0x3fffu) + 1u};
-    if (const auto slice = view & 0x1fffu; slice != 0) {
-        if (depth.address != 0) depth.address += static_cast<std::uint64_t>(slice) * DepthSliceBytes(depth.extent, zFormat == 1 ? 2u : 4u);
-        if (depth.stencilAddress != 0) depth.stencilAddress += static_cast<std::uint64_t>(slice) * DepthSliceBytes(depth.extent, 1u);
+    depth.surfaceExtent = {(size & 0x3fffu) + 1u, ((size >> 16u) & 0x3fffu) + 1u};
+    requireMip(mipCount <= std::bit_width(std::max(depth.surfaceExtent.width, depth.surfaceExtent.height)), "depth mip chain exceeds its surface dimensions");
+    depth.extent = {std::max(depth.surfaceExtent.width >> mip, 1u), std::max(depth.surfaceExtent.height >> mip, 1u)};
+    const auto slice = view & 0x1fffu;
+    const auto lastSlice = ((view >> 13u) & 0x7ffu) | ((view >> 30u) << 11u);
+    Require(slice == lastSlice, "depth views of several array slices are unsupported");
+    if (slice != 0) {
+        if (depth.address != 0) depth.address += static_cast<std::uint64_t>(slice) * DepthMipChainBytes(depth.surfaceExtent, zFormat == 1 ? 2u : 4u, mipCount);
+        if (depth.stencilAddress != 0) depth.stencilAddress += static_cast<std::uint64_t>(slice) * DepthMipChainBytes(depth.surfaceExtent, 1u, mipCount);
     }
     depth.format = zFormat == 1 ? (stencil ? VK_FORMAT_D16_UNORM_S8_UINT : VK_FORMAT_D16_UNORM) : (stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT);
     depth.clearDepth = readFloat(cx, 0x00b);
@@ -640,7 +669,7 @@ State DecodeState(const QueueState& queue) {
     zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
     {
         const auto depthControl = read(cx, 0x200);
-        if ((depthControl & 0xbu) != 0 && depthSurfaceBound(cx)) {
+        if (!inertDepth(cx, depthControl) && (depthControl & 0xbu) != 0 && depthSurfaceBound(cx)) {
             decodeDepth(cx, depthControl, result);
         } else if (depthPassThrough(depthControl) || ((depthControl & 3u) != 0 && depthPlanesAbsent(cx))) {
             static bool reported = false;

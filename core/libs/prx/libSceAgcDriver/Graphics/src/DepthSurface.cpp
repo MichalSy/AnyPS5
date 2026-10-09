@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
@@ -19,10 +20,23 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+VkExtent2D surfaceExtent(const DepthTarget& target) {
+    Require((target.surfaceExtent.width == 0) == (target.surfaceExtent.height == 0), "incomplete depth surface extent");
+    return target.surfaceExtent.width != 0 ? target.surfaceExtent : target.extent;
+}
+
+VkExtent2D validatedSurfaceExtent(const DepthTarget& target) {
+    const auto extent = surfaceExtent(target);
+    Require(extent.width != 0 && extent.height != 0 && target.mipCount != 0 && target.mipCount <= 16u && target.mipCount <= std::bit_width(std::max(extent.width, extent.height)), "invalid depth surface mip chain");
+    Require(target.mip < target.mipCount && target.extent.width == std::max(extent.width >> target.mip, 1u) && target.extent.height == std::max(extent.height >> target.mip, 1u), "depth view extent does not match its mip");
+    return extent;
+}
+
 class DepthSurface {
 public:
     DepthSurface(const Context& context, const DepthTarget& target) : context(context), target(target) {
         this->context.bufferPool.reset();
+        const auto extent = validatedSurfaceExtent(target);
         VkFormatProperties properties{};
         context.formatProperties(context.physical, target.format, &properties);
         Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0, "depth/stencil format " + std::to_string(target.format) + " cannot be an attachment on this device");
@@ -31,6 +45,7 @@ public:
         const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
         const auto usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         Require(target.samples == VK_SAMPLE_COUNT_1_BIT || target.samples == VK_SAMPLE_COUNT_8_BIT, "depth sample count other than one or eight is unsupported");
+        Require(target.samples == VK_SAMPLE_COUNT_1_BIT || target.mipCount == 1u, "multisampled depth mip chains are unsupported");
         Require((context.limits.framebufferDepthSampleCounts & target.samples) != 0, "depth sample count exceeds framebuffer capabilities");
         Require(target.stencilAddress == 0 || (context.limits.framebufferStencilSampleCounts & target.samples) != 0, "stencil sample count exceeds framebuffer capabilities");
         if (target.samples != VK_SAMPLE_COUNT_1_BIT) {
@@ -50,14 +65,15 @@ public:
         Check(context.imageFormatProperties(context.physical, target.format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage,
             target.sampleLocations.empty() ? 0u : VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT, &supported), "vkGetPhysicalDeviceImageFormatProperties depth");
         Require((supported.sampleCounts & target.samples) != 0, "depth/stencil image usage does not support the requested sample count");
-        Require(target.extent.width <= supported.maxExtent.width && target.extent.height <= supported.maxExtent.height, "depth target exceeds format extent limits");
+        Require(extent.width <= supported.maxExtent.width && extent.height <= supported.maxExtent.height, "depth target exceeds format extent limits");
+        Require(target.mipCount <= supported.maxMipLevels, "depth target exceeds format mip limits");
         try {
             VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             info.flags = target.sampleLocations.empty() ? 0u : VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
             info.imageType = VK_IMAGE_TYPE_2D;
             info.format = target.format;
-            info.extent = {target.extent.width, target.extent.height, 1};
-            info.mipLevels = 1;
+            info.extent = {extent.width, extent.height, 1};
+            info.mipLevels = target.mipCount;
             info.arrayLayers = 1;
             info.samples = target.samples;
             info.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -76,8 +92,11 @@ public:
             viewInfo.image = image;
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
             viewInfo.format = target.format;
-            viewInfo.subresourceRange = {aspects, 0, 1, 0, 1};
-            Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth");
+            views.resize(target.mipCount, VK_NULL_HANDLE);
+            for (std::uint32_t mip = 0; mip < target.mipCount; ++mip) {
+                viewInfo.subresourceRange = {aspects, mip, 1, 0, 1};
+                Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &views[mip]), "vkCreateImageView depth");
+            }
             auto* recorder = Recorder::Active();
             std::unique_ptr<CommandBatch> batch;
             if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
@@ -95,7 +114,7 @@ public:
             toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             toGeneral.image = image;
-            toGeneral.subresourceRange = viewInfo.subresourceRange;
+            toGeneral.subresourceRange = {aspects, 0, target.mipCount, 0, 1};
             const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
             barrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
             const VkClearDepthStencilValue clear{target.clearDepth, target.clearStencil};
@@ -112,13 +131,20 @@ public:
     DepthSurface(const DepthSurface&) = delete;
     DepthSurface& operator=(const DepthSurface&) = delete;
 
+    VkImageView View(std::uint32_t mip) const {
+        Require(mip < views.size(), "depth attachment mip is outside its surface");
+        return views[mip];
+    }
+
     bool SampledAccepts(std::span<const std::uint32_t> words, const GuestTextureResource& resource) const {
         const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
         const auto format = ResolveTextureFormat(resource.format);
         const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
-        return (format == expected || depthBits) && resource.dimension == TextureDimension::k2D && resource.width == target.extent.width && resource.height == target.extent.height && resource.baseLevel == 0 && resource.lastLevel == 0 && resource.baseArray == 0;
+        const auto extent = surfaceExtent(target);
+        return (format == expected || depthBits) && resource.dimension == TextureDimension::k2D && resource.width == extent.width && resource.height == extent.height &&
+            resource.baseLevel <= resource.lastLevel && resource.lastLevel < target.mipCount && resource.baseArray == 0 && (target.mipCount == 1u || resource.tileMode == TextureTileMode::kZ64KBX);
     }
 
     std::shared_ptr<Texture> Sampled(std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
@@ -145,7 +171,7 @@ public:
                           static_cast<unsigned>(resource.tileMode), static_cast<int>(resource.dimension), resource.baseLevel, resource.lastLevel, resource.baseArray, key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
             throw std::runtime_error(text);
         }
-        auto texture = std::make_shared<Texture>(context, image, target.format, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components);
+        auto texture = std::make_shared<Texture>(context, image, target.format, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components, resource.baseLevel, resource.lastLevel - resource.baseLevel + 1u);
         textures.emplace(key, texture);
         return texture;
     }
@@ -183,37 +209,39 @@ public:
     const Context context;
     const DepthTarget target;
     VkImage image = VK_NULL_HANDLE;
-    VkImageView view = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     bool retired = false;
 
 private:
+    std::vector<VkImageView> views;
     std::map<std::array<std::uint32_t, 12>, std::shared_ptr<Texture>> textures;
     std::uint64_t depthWritten = 0;
     std::uint64_t stencilWritten = 0;
 
     std::uint64_t depthBytes() const {
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
-        return DepthSliceBytes(target.extent, d16 ? 2u : 4u);
+        return DepthMipChainBytes(surfaceExtent(target), d16 ? 2u : 4u, target.mipCount);
     }
 
     std::uint64_t stencilBytes() const {
-        return DepthSliceBytes(target.extent, 1u);
+        return DepthMipChainBytes(surfaceExtent(target), 1u, target.mipCount);
     }
 
     void release() noexcept {
         textures.clear();
-        if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
+        for (const auto view : views) if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
-        view = VK_NULL_HANDLE;
+        views.clear();
         image = VK_NULL_HANDLE;
         memory = VK_NULL_HANDLE;
     }
 };
 
 bool sameSurface(const DepthTarget& a, const DepthTarget& b) {
-    return a.address == b.address && a.stencilAddress == b.stencilAddress && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.samples == b.samples;
+    const auto aExtent = surfaceExtent(a);
+    const auto bExtent = surfaceExtent(b);
+    return a.address == b.address && a.stencilAddress == b.stencilAddress && aExtent.width == bExtent.width && aExtent.height == bExtent.height && a.mipCount == b.mipCount && a.format == b.format && a.samples == b.samples;
 }
 
 std::mutex& surfacesMutex() {
@@ -236,7 +264,15 @@ std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
     return width * height * bytesPerTexel;
 }
 
+std::uint64_t DepthMipChainBytes(VkExtent2D extent, std::uint32_t bytesPerTexel, std::uint32_t mipCount) {
+    Require(bytesPerTexel == 1u || bytesPerTexel == 2u || bytesPerTexel == 4u, "unsupported depth plane element size");
+    Require(extent.width != 0 && extent.height != 0 && mipCount != 0 && mipCount <= 16u && mipCount <= std::bit_width(std::max(extent.width, extent.height)), "invalid depth plane mip chain");
+    if (mipCount == 1u) return DepthSliceBytes(extent, bytesPerTexel);
+    return ComputeSurfaceSize(ComputeElementMipLayout(TextureTileMode::kZ64KBX, bytesPerTexel, extent.width, extent.height, mipCount), 1u);
+}
+
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
+    static_cast<void>(validatedSurfaceExtent(target));
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     DepthSurface* bound = nullptr;
@@ -258,7 +294,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         if (surface.get() != bound && surface->context.device == context.device && surface->Overlaps(*bound)) surface->retired = true;
     }
     bound->NoteWritten();
-    return bound->view;
+    return bound->View(target.mip);
 }
 
 void ClearDepthSurfaces(VkDevice device) {

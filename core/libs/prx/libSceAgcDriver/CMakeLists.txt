@@ -586,6 +586,25 @@ target_link_libraries(agc_driver_graphics_tests PRIVATE
 set_target_properties(agc_driver_graphics_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_graphics_tests)
 
+add_test_executable(agc_driver_depth_mips_state_tests EXCLUDE_FROM_ALL tests/DepthMips.cpp)
+target_include_directories(agc_driver_depth_mips_state_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
+        ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
+)
+target_link_libraries(agc_driver_depth_mips_state_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_driver_depth_mips_state_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_driver_depth_mips_state_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_driver_depth_mips_state_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_driver_depth_mips_state COMMAND agc_driver_depth_mips_state_tests)
+    set_tests_properties(agc_driver_depth_mips_state PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_driver_depth_mips_state PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_driver_bda_device_tests EXCLUDE_FROM_ALL
         tests/BdaDevice.cpp
         tests/BdaShader.cpp
@@ -637,6 +656,9 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     configure_windows_unwind(${agcExecutionTest})
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
+
+target_sources(agc_driver_depth_mips_tests PRIVATE ${agcSampleLodShaderHeader})
+target_include_directories(agc_driver_depth_mips_tests PRIVATE ${agcTestShaderGeneratedRoot})
 
 target_include_directories(agc_driver_deferred_compute_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
