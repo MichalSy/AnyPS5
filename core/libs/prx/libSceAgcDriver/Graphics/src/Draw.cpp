@@ -492,10 +492,16 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
         add(state.topology);
         add(state.cullMode);
         add(state.blends.size());
+        add(state.colors.size());
+        for (const auto& color : state.colors) {
+            add(color.exportIndex);
+            add(color.uintExport);
+        }
         add(context.subgroup.subgroupSize);
         add(context.subgroup.supportedStages);
         add(context.subgroup.supportedOperations);
         add(context.fragmentShaderBarycentric);
+        add(context.bufferInt64Atomics);
         add(state.stages.mesh.has_value());
         if (state.stages.mesh) {
             const auto& mesh = *state.stages.mesh;
@@ -547,7 +553,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
     }
     std::set<std::uint32_t> outputs;
     try {
-        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading);
+        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics);
     } catch (const std::exception& error) {
         if (keyed) {
             std::lock_guard lock(validationMutex());

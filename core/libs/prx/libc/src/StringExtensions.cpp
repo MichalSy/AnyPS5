@@ -55,6 +55,12 @@ std::size_t APS5_VABI strlcat_nid_postfix(char* destination, const char* source,
     return destinationLength + sourceLength;
 }
 
+char* APS5_VABI stpcpy_nid_postfix(char* destination, const char* source) {
+    const auto length = std::strlen(source);
+    std::memcpy(destination, source, length + 1);
+    return destination + length;
+}
+
 char* APS5_VABI strtok_r_nid_postfix(char* text, const char* delimiters, char** state) {
     if (text == nullptr) text = *state;
     if (text == nullptr) return nullptr;

@@ -142,6 +142,7 @@ struct Context {
     bool geometryShader = false;
     bool sampleRateShading = false;
     bool nullDescriptors = false;
+    bool bufferInt64Atomics = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;

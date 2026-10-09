@@ -55,6 +55,7 @@ struct ColorTarget {
     std::uint32_t depthSlice = 0;
     std::uint32_t exportIndex = 0;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    bool uintExport = false;
 };
 
 struct DepthTarget {
