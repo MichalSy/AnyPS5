@@ -16,6 +16,10 @@ int APS5_VABI sceSystemGestureAppendTouchRecognizer(std::int32_t, SystemGestureT
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceNpEntitlementAccessGetEntitlementKey(
     std::uint32_t, const NpUnifiedEntitlementLabel*, NpEntitlementAccessEntitlementKey*);
+int APS5_VABI sceNpEntitlementAccessRequestUnifiedEntitlementInfoList();
+int APS5_VABI sceNpEntitlementAccessPollUnifiedEntitlementInfoList();
+int APS5_VABI sceNpEntitlementAccessRequestServiceEntitlementInfoList();
+int APS5_VABI sceNpEntitlementAccessPollServiceEntitlementInfoList();
 int APS5_VABI sceRudpInit_nid_postfix(void*, int);
 int APS5_VABI sceRudpGetStatus(void*, std::size_t);
 int APS5_VABI sceRudpTerminate();
@@ -95,6 +99,12 @@ int main() {
         Require(sceNpEntitlementAccessGetEntitlementKey(serviceLabel, &label, &output.key) == noEntitlement);
         Require(std::memcmp(&output, original.data(), sizeof(output)) == 0);
     }
+
+    constexpr int signedOut = static_cast<int>(0x80550006);
+    Require(sceNpEntitlementAccessRequestUnifiedEntitlementInfoList() == signedOut);
+    Require(sceNpEntitlementAccessPollUnifiedEntitlementInfoList() == signedOut);
+    Require(sceNpEntitlementAccessRequestServiceEntitlementInfoList() == signedOut);
+    Require(sceNpEntitlementAccessPollServiceEntitlementInfoList() == signedOut);
 
     std::array<unsigned char, 248> status;
     status.fill(0x5a);
