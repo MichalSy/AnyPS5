@@ -10,6 +10,7 @@
 #include "SpirvBackend/SpirvSpecialization.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "ShaderDiskCache.hpp"
+#include "SpecializedDiskCache.hpp"
 #include <list>
 #include <map>
 #include <set>
@@ -408,8 +409,22 @@ struct SpecializedModule {
     bool pushData = false;
 };
 
-std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, bool useDiskCache) {
     auto source = SpecializeVertexInputTypes(artifact, classes);
+    std::vector<std::byte> diskKey;
+    const bool disk = useDiskCache && SpecializedDiskCache::Enabled();
+    if (disk) {
+        SpecializedDiskCache::BuildKey(artifact, source.Words(), classes, constants, target, diskKey);
+        SpecializedDiskCache::Module loaded;
+        if (SpecializedDiskCache::Load(diskKey, target, loaded)) {
+            auto module = std::make_shared<SpecializedModule>();
+            module->spirv = std::move(loaded.spirv);
+            module->bindings = std::move(loaded.bindings);
+            module->pushData = loaded.pushData;
+            module->specializationId = constants.empty() ? 0u : nextVariantId();
+            return module;
+        }
+    }
     std::map<std::uint32_t, std::uint32_t> supplied;
     for (const auto& constant : constants) {
         if (!supplied.emplace(constant.id, constant.value).second) throw std::runtime_error("duplicate prepared specialization ID");
@@ -490,6 +505,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     }
     module->spirv = std::move(materialized);
     module->specializationId = constants.empty() ? 0u : nextVariantId();
+    if (disk) SpecializedDiskCache::Store(diskKey, module->spirv.Words());
     return module;
 }
 
@@ -562,11 +578,21 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     return plan;
 }
 
-std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, bool useDiskCache) {
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
     key.clear();
     key.push_back(artifact.variantId);
+    key.push_back(classes.size());
+    for (const auto value : classes) key.push_back(value);
+    RecompileRequest targetRequest{};
+    targetRequest.shader.stage = ShaderStage::Compute;
+    targetRequest.target = target;
+    std::vector<std::uint64_t> targetKey;
+    RecompileCacheKey::BuildInterface(targetRequest, targetKey);
+    key.push_back(targetKey.size());
+    key.insert(key.end(), targetKey.begin(), targetKey.end());
+    key.push_back(constants.size());
     for (const auto& constant : constants) key.push_back((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
     static std::shared_mutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<SpecializedModuleEntry>> modules;
@@ -580,7 +606,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
         const auto found = modules.find(key);
         entry = found != modules.end() ? found->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
     }
-    std::call_once(entry->ready, [&] { entry->module = buildSpecializedModule(artifact, classes, constants, target); });
+    std::call_once(entry->ready, [&] { entry->module = buildSpecializedModule(artifact, classes, constants, target, useDiskCache); });
     return entry->module;
 }
 
@@ -663,7 +689,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
-            const auto module = specializeModule(variant.artifact, vertexClasses, constants, request.target);
+            const auto module = specializeModule(variant.artifact, vertexClasses, constants, request.target, request.useCache);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);

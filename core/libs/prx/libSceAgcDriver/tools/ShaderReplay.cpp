@@ -7,6 +7,8 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#include "ShaderDiskCache.hpp"
+#include "SpecializedDiskCache.hpp"
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "spirv-tools/libspirv.hpp"
@@ -44,6 +46,7 @@ bool g_spirv = false;
 bool g_graph = false;
 bool g_maintenance8 = false;
 bool g_code = false;
+bool g_cacheStats = false;
 
 bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
@@ -117,6 +120,12 @@ bool Replay(const char* path) {
         if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
+        if (g_cacheStats) {
+            const auto generic = ShaderRecompiler::ShaderDiskCache::Totals();
+            const auto specialized = ShaderRecompiler::SpecializedDiskCache::Totals();
+            std::printf("  generic cache: %llu hits, %llu misses, %llu writes\n", static_cast<unsigned long long>(generic.hits), static_cast<unsigned long long>(generic.misses), static_cast<unsigned long long>(generic.writes));
+            std::printf("  specialized cache: %llu hits, %llu misses, %llu rejected, %llu writes\n", static_cast<unsigned long long>(specialized.hits), static_cast<unsigned long long>(specialized.misses), static_cast<unsigned long long>(specialized.rejected), static_cast<unsigned long long>(specialized.writes));
+        }
         if (g_spirv) {
             std::string name(path);
             name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
@@ -152,11 +161,15 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--cache-stats] [--maintenance8] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     int failures = 0;
     for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--cache-stats") {
+            g_cacheStats = true;
+            continue;
+        }
         if (std::string(argv[i]) == "--dis") {
             g_disassemble = true;
             continue;
