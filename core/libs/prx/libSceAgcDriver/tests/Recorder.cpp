@@ -2745,6 +2745,120 @@ void expectRed(float got, float want, const char* what) {
     if (std::abs(got - want) > 1.5f / 255.0f) throw std::runtime_error(std::string(what) + ": read " + std::to_string(got) + ", expected " + std::to_string(want));
 }
 
+void pendingAliasTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.width = 512;
+    resource.height = 512;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    auto middleResource = resource;
+    middleResource.mipCount = 2;
+    middleResource.lastLevel = 1;
+    auto longResource = resource;
+    longResource.mipCount = 3;
+    longResource.lastLevel = 2;
+    const auto shortBytes = DescribeSurface(resource).guestBytes;
+    const auto middleBytes = DescribeSurface(middleResource).guestBytes;
+    const auto longBytes = DescribeSurface(longResource).guestBytes;
+    Require(shortBytes < middleBytes && middleBytes < longBytes, "the pending alias fixture does not have distinct mip footprints");
+    const auto bytes = static_cast<std::size_t>((longBytes + 65535u) / 65536u * 65536u);
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the pending alias block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::uint64_t address;
+        std::size_t bytes;
+        ~Unregister() {
+            StorageTexture::FlushPending(address, bytes);
+            recorder.Sync();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } unregister{context, recorder, block, address, bytes};
+    resource.baseAddress = address;
+    middleResource.baseAddress = address;
+    longResource.baseAddress = address;
+    auto longer = std::make_shared<StorageTexture>(context, detiler, longResource, 0);
+    auto middle = std::make_shared<StorageTexture>(context, detiler, middleResource, 0);
+    auto exact = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+    SampleProgram program(context, recorder);
+    const VkComponentMapping identity{};
+    const auto write = [&](const std::shared_ptr<StorageTexture>& image, float red) {
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearColorValue value{{red, 0.0f, 0.0f, 1.0f}};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, image->Descriptor().mipCount, 0, 1};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+    };
+    const auto check = [&](std::uint64_t queryBytes, const std::shared_ptr<StorageTexture>& expected, const StorageTexture* except, bool overlaps) {
+        auto found = StorageTexture::FindPending(address, queryBytes);
+        Require(found == expected, "the pending alias lookup chose the wrong mip footprint");
+        std::array<StorageTexture::PendingQuery, 1> queries{{{address, address + queryBytes, except, expected.get(), false}}};
+        Require(StorageTexture::ScanPending(queries), "the pending alias scan rejected the lookup identity");
+        Require(queries[0].found == found.get(), "the pending alias scan and lookup chose different images");
+        Require(queries[0].overlaps == overlaps, "the pending alias preference changed overlap detection");
+    };
+    const auto sample = [&](const std::shared_ptr<StorageTexture>& source, float red, const char* what) {
+        Texture texture(context, source, resource, identity);
+        Require(texture.StorageSource() == source.get(), "the pending alias sample changed its source image");
+        expectRed(program.Red(texture.View(), texture.Layout(), 0), red, what);
+    };
+    write(longer, 0.25f);
+    write(middle, 0.5f);
+    check(shortBytes, longer, longer.get(), true);
+    sample(StorageTexture::FindPending(address, shortBytes), 0.25f, "pending alias fallback did not sample the first containing image");
+    write(exact, 0.75f);
+    check(shortBytes, exact, exact.get(), true);
+    check(middleBytes, middle, middle.get(), true);
+    check(longBytes, longer, longer.get(), true);
+    sample(StorageTexture::FindPending(address, shortBytes), 0.75f, "pending alias exact match sampled a larger mip chain");
+    std::array<StorageTexture::PendingQuery, 1> stale{{{address, address + shortBytes, nullptr, longer.get(), false}}};
+    Require(!StorageTexture::ScanPending(stale) && stale[0].found == exact.get(), "the pending alias scan retained the containing image's stale identity");
+    check(longBytes + 1u, {}, nullptr, true);
+    Require(StorageTexture::FindPending(address + 256u, shortBytes) == nullptr, "the pending alias lookup accepted a different base address");
+    std::array<StorageTexture::PendingQuery, 1> offset{{{address + 256u, address + shortBytes, nullptr, nullptr, false}}};
+    Require(StorageTexture::ScanPending(offset) && offset[0].found == nullptr && offset[0].overlaps, "the pending alias scan confused overlap with a matching base address");
+    exact->Flush();
+    check(shortBytes, longer, longer.get(), true);
+    sample(StorageTexture::FindPending(address, shortBytes), 0.25f, "pending alias fallback after the exact image's flush changed its source");
+    middle->Flush();
+    longer->Flush();
+    recorder.Sync();
+    check(shortBytes, {}, nullptr, false);
+}
+
 void minLodTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (!context.imageViewMinLod) {
@@ -3037,6 +3151,11 @@ int main(int argc, char** argv) {
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--pending-alias-only") {
+            pendingAliasTests(device, recorder);
+            std::cout << "Pending alias exact footprint and fallback sampling tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--depth-proof-only") {
             depthSurfaceProofTests(device, recorder);
             std::cout << "Depth surface fast proof tests passed\n";
@@ -3075,6 +3194,7 @@ int main(int argc, char** argv) {
         importWindowTests(device, recorder);
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
+        pendingAliasTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
         singleCubeTests(device, recorder);

@@ -2504,12 +2504,15 @@ void StorageTexture::FlushAllPending(const char* reason) {
 std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t address, std::uint64_t bytes) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
+    StorageTexture* containing = nullptr;
     for (auto* texture : pending.textures) {
+        if (texture->descriptor.baseAddress != address || texture->guestBytes < bytes) continue;
+        if (texture->guestBytes == bytes) return texture->weak_from_this().lock();
         // Containment, not equality: a descriptor of a chain's first mips (its own guestBytes are
         // shorter) is served by the chain's image; CanCopyFrom then checks the geometry.
-        if (texture->descriptor.baseAddress == address && texture->guestBytes >= bytes) return texture->weak_from_this().lock();
+        if (containing == nullptr) containing = texture;
     }
-    return nullptr;
+    return containing != nullptr ? containing->weak_from_this().lock() : nullptr;
 }
 
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except) {
@@ -2726,7 +2729,7 @@ bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
         if (query.end <= query.begin) continue;
         const auto bytes = static_cast<std::size_t>(query.end - query.begin);
         for (const auto* texture : pending.textures) {
-            if (query.found == nullptr && texture->descriptor.baseAddress == query.begin && texture->guestBytes >= bytes) query.found = texture;
+            if (texture->descriptor.baseAddress == query.begin && texture->guestBytes >= bytes && (query.found == nullptr || (query.found->guestBytes != bytes && texture->guestBytes == bytes))) query.found = texture;
             if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;
         }
         for (const auto* texture : pending.flushing) {
