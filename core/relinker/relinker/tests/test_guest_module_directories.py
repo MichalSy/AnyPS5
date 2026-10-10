@@ -23,6 +23,12 @@ def module_with_symbol(exported):
     return image
 
 
+def sony_module(image):
+    image[7] = 9
+    struct.pack_into("<H", image, 16, 0xfe18)
+    return image
+
+
 def needed_libraries(image):
     loads = elf_loads(image)
 
@@ -92,6 +98,51 @@ def main():
                     consumer = case / "app0" / "prx" / "consumer.prx.guest.prx"
                     needed = needed_libraries(consumer.read_bytes())
                     assert needed == [f"$ORIGIN/{'../' + standard + '/' if standard else ''}provider.prx.guest.prx"], needed
+
+            case = work / f"{windows}-dynamic"
+            for name in ("sce_module", "Media/Modules", "Media/Plugins", "sce_sys/about"):
+                (case / name).mkdir(parents=True)
+            consumer = sony_module(module_with_symbol(False))
+            names = b"Shared.prx\0libScePad.prx\0"
+            consumer[0x80c:0x80c + len(names)] = names
+            struct.pack_into("<Q", consumer, 0x618, 12 + len(names))
+            struct.pack_into("<qQqQqQ", consumer, 0x680, 1, 12, 1, 23, 0, 0)
+            struct.pack_into("<QQ", consumer, 176 + 32, 176, 176)
+            originals = {"sce_module/static.prx": guest_fixture(PLAIN_SITE),
+                         "Media/Modules/Shared.prx": sony_module(module_with_symbol(True)),
+                         "Media/Plugins/Dynamic.prx": consumer,
+                         "Media/Plugins/native.prx": guest_fixture(PLAIN_SITE),
+                         "Media/Plugins/old.prx.guest.prx": sony_module(guest_fixture(PLAIN_SITE)),
+                         "sce_sys/about/right.sprx": b"\x4f\x15\x3d\x1d" + bytes(0x1000)}
+            for name, data in originals.items():
+                (case / name).write_bytes(data)
+            result, output = convert(case, windows)
+            assert result.returncode == 0, result.stderr
+            assert {path.name for path in (case / "app0").rglob("*.guest.prx")} == {"static.prx.guest.prx"}
+            previous = output.read_bytes()
+            result, output = convert(case, windows, ("--recursive-module-search",))
+            artifacts = {path.relative_to(case / "app0").as_posix() for path in (case / "app0").rglob("*.guest.prx")}
+            if windows:
+                assert result.returncode == 2 and "Dynamically loaded guest modules are unsupported on Windows" in result.stderr, result.stderr
+                assert output.read_bytes() == previous and artifacts == {"sce_module/static.prx.guest.prx"}
+            else:
+                assert result.returncode == 0, (result.stdout, result.stderr)
+                assert artifacts == {"sce_module/static.prx.guest.prx", "Media/Modules/Shared.prx.guest.prx",
+                                     "Media/Plugins/Dynamic.prx.guest.prx"}, artifacts
+                assert needed_libraries(output.read_bytes()) == ["$ORIGIN/app0/sce_module/static.prx.guest.prx"]
+                assert needed_libraries((case / "app0/sce_module/static.prx.guest.prx").read_bytes()) == []
+                assert needed_libraries((case / "app0/Media/Modules/Shared.prx.guest.prx").read_bytes()) == []
+                assert needed_libraries((case / "app0/Media/Plugins/Dynamic.prx.guest.prx").read_bytes()) == [
+                    "$ORIGIN/../Modules/Shared.prx.guest.prx", "libScePad.prx"]
+            assert all((case / name).read_bytes() == data for name, data in originals.items())
+
+            case = work / f"{windows}-dynamic-invalid"
+            for name in ("sce_module", "Media/Plugins"):
+                (case / name).mkdir(parents=True)
+            (case / "Media/Plugins/Broken.prx").write_bytes(b"\x4f\x15\x3d\x1d" + bytes(0x1000))
+            result, output = convert(case, windows, ("--recursive-module-search",))
+            assert result.returncode == 2 and "Unsupported SELF header" in result.stderr, result.stderr
+            assert not output.exists() and not (case / "app0").exists(), output
 
             case = work / f"{windows}-exclude"
             for name in ("sce_module", "prx"):

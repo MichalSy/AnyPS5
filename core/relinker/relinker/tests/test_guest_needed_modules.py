@@ -6,7 +6,7 @@ import sys
 import tempfile
 
 from test_guest_intel_trampolines import PLAIN_SITE, guest_fixture, main_fixture
-from test_guest_module_directories import module_with_symbol, needed_libraries
+from test_guest_module_directories import module_with_symbol, needed_libraries, sony_module
 
 
 NEEDED = b"needed.prx"
@@ -113,9 +113,10 @@ def main():
             nested = case / "Media" / "Modules"
             nested.mkdir(parents=True)
             module = nested / "needed.prx"
-            original = module_with_symbol(True)
+            original = sony_module(module_with_symbol(True))
             module.write_bytes(original)
-            (nested / "unrelated.prx").write_bytes(original)
+            unrelated = module_with_symbol(True)
+            (nested / "unrelated.prx").write_bytes(unrelated)
             result, output = convert(case, windows)
             assert result.returncode == 0 and not (case / "app0").exists(), result.stderr
             if not windows:
@@ -125,9 +126,20 @@ def main():
             artifact = case / "app0" / "Media" / "Modules" / "needed.prx.guest.prx"
             assert list((case / "app0").rglob("*.guest.prx")) == [artifact], artifact
             assert artifact.read_bytes().startswith(b"MZ" if windows else b"\x7fELF"), artifact
-            assert module.read_bytes() == original and (nested / "unrelated.prx").read_bytes() == original
+            assert module.read_bytes() == original and (nested / "unrelated.prx").read_bytes() == unrelated
             if not windows:
                 assert needed_libraries(output.read_bytes()) == ["$ORIGIN/app0/Media/Modules/needed.prx.guest.prx"]
+
+            case = work / f"{windows}-recursive-debug"
+            nested = case / "Media/Modules"
+            nested.mkdir(parents=True)
+            (nested / "needed.debug_prx").write_bytes(sony_module(guest_fixture(PLAIN_SITE)))
+            result, output = convert(case, windows, b"needed.debug_prx", options=("--recursive-module-search",))
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            artifact = case / "app0/Media/Modules/needed.debug_prx.guest.prx"
+            assert list((case / "app0").rglob("*.guest.prx")) == [artifact], artifact
+            if not windows:
+                assert needed_libraries(output.read_bytes()) == ["$ORIGIN/app0/Media/Modules/needed.debug_prx.guest.prx"]
 
             for label, dependency, filename, soname in (
                     ("filename-case", b"Party.prx", "party.prx", None),
@@ -237,7 +249,7 @@ def main():
             case = work / f"{windows}-ambiguous"
             for name in ("first", "second"):
                 (case / name).mkdir(parents=True)
-                (case / name / "needed.prx").write_bytes(module_with_symbol(True))
+                (case / name / "needed.prx").write_bytes(sony_module(module_with_symbol(True)))
             result, output = convert(case, windows)
             assert result.returncode == 0, result.stderr
             assert output.exists(), output
