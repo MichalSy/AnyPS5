@@ -516,14 +516,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         return depth;
     }
+    std::shared_ptr<StorageTexture> depthStorage;
+    if (!depthCompare && DepthSurfaceAt(resource.baseAddress)) depthStorage = cachedStorageTexture(context, words, resource, 0, guestBytes);
     const auto depthBitsWidth = words.size() >= 4 ? ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) : 0u;
-    if (depthBitsWidth == 32u) {
+    const bool storageDepthBits = depthStorage != nullptr;
+    if (depthBitsWidth == 32u && !storageDepthBits) {
         char text[160];
         std::snprintf(text, sizeof(text), "AGC graphics: 32-bit integer read of the depth-layout texture 0x%llx, which is no depth surface drawn with, is not implemented", static_cast<unsigned long long>(resource.baseAddress));
         throw std::runtime_error(text);
     }
     constexpr auto unorm16 = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format16UNorm);
-    if (depthBitsWidth == 16u && resource.format != unorm16) {
+    if (depthBitsWidth == 16u && !storageDepthBits && resource.format != unorm16) {
         auto normalized = resource;
         normalized.format = unorm16;
         return cachedTexture(context, words, normalized, components, guestBytes, depthCompare);
@@ -544,7 +547,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // A storage image whose results for this surface (or for a mip chain containing it) are still on
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
-    auto source = StorageTexture::FindPending(address, guestBytes);
+    auto source = depthStorage != nullptr ? std::move(depthStorage) : StorageTexture::FindPending(address, guestBytes);
     if (source != nullptr && (depthCompare || !Texture::CanCopyFrom(*source, resource) || MetadataMoved(*source, resource))) source.reset();
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
@@ -813,12 +816,15 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
+std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes);
+
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
-    if (DepthSurfaceAt(viewed.baseAddress)) {
-        char text[112];
-        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth/stencil surface 0x%llx is not implemented", static_cast<unsigned long long>(viewed.baseAddress));
-        throw std::runtime_error(text);
-    }
+    auto texture = lookupStorageTexture(context, words, viewed, mip, guestBytes);
+    if (DepthSurfaceAt(viewed.baseAddress)) SeedStorageFromDepth(context, texture);
+    return texture;
+}
+
+std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled) return std::make_shared<StorageTexture>(context, *context.detiler, viewed, mip);
     static_cast<void>(words);
@@ -2091,6 +2097,11 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& image) {
+            return image != nullptr && DepthSurfaceAt(image->Descriptor().baseAddress);
+        }) || std::any_of(validatedTextures.begin(), validatedTextures.end(), [](const auto& image) {
+            return !image.depth && DepthSurfaceAt(image.resource.baseAddress);
+        })) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;

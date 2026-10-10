@@ -8,6 +8,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "VulkanTestDevice.hpp"
+#include "SampleLod_spv.h"
 #include <SDL_loadso.h>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -242,6 +243,110 @@ GuestTextureResource View(std::uint32_t width, std::uint32_t height, std::uint64
 
 constexpr VkComponentMapping Identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
 
+class SampleProgram {
+public:
+    explicit SampleProgram(const Context& context) : context(context), result(context, sizeof(float) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
+        try {
+            const VkDescriptorSetLayoutBinding bindings[]{
+                {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+            };
+            VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            layoutInfo.bindingCount = 2;
+            layoutInfo.pBindings = bindings;
+            Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &setLayout), "vkCreateDescriptorSetLayout");
+            const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float)};
+            VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            pipelineLayoutInfo.setLayoutCount = 1;
+            pipelineLayoutInfo.pSetLayouts = &setLayout;
+            pipelineLayoutInfo.pushConstantRangeCount = 1;
+            pipelineLayoutInfo.pPushConstantRanges = &push;
+            Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &pipelineLayoutInfo, nullptr, &pipelineLayout), "vkCreatePipelineLayout");
+            VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            moduleInfo.codeSize = sizeof(SAMPLE_LOD_SPV);
+            moduleInfo.pCode = SAMPLE_LOD_SPV;
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
+            VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+            pipelineInfo.layout = pipelineLayout;
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines");
+            VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            samplerInfo.magFilter = samplerInfo.minFilter = VK_FILTER_NEAREST;
+            samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            Check(context.Function<PFN_vkCreateSampler>("vkCreateSampler")(context.device, &samplerInfo, nullptr, &sampler), "vkCreateSampler");
+            const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.maxSets = 1;
+            poolInfo.poolSizeCount = 2;
+            poolInfo.pPoolSizes = sizes;
+            Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool");
+            VkDescriptorSetAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            allocateInfo.descriptorPool = pool;
+            allocateInfo.descriptorSetCount = 1;
+            allocateInfo.pSetLayouts = &setLayout;
+            Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocateInfo, &set), "vkAllocateDescriptorSets");
+        } catch (...) {
+            release();
+            throw;
+        }
+    }
+    ~SampleProgram() { release(); }
+    SampleProgram(const SampleProgram&) = delete;
+    SampleProgram& operator=(const SampleProgram&) = delete;
+
+    std::uint32_t RedBits(const Texture& texture) {
+        const VkDescriptorImageInfo image{sampler, texture.View(), texture.Layout()};
+        const VkDescriptorBufferInfo buffer{result.Handle(), 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet writes[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        writes[0].dstSet = set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].pImageInfo = &image;
+        writes[1].dstSet = set;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &buffer;
+        context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 2, writes, 0, nullptr);
+        CommandBatch batch(context);
+        const auto commands = batch.Handle();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &set, 0, nullptr);
+        const float lod = 0;
+        context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lod), &lod);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        std::uint32_t value;
+        std::memcpy(&value, result.Bytes().data(), sizeof(value));
+        return value;
+    }
+
+private:
+    void release() noexcept {
+        if (pool) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+        if (sampler) context.Function<PFN_vkDestroySampler>("vkDestroySampler")(context.device, sampler, nullptr);
+        if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+        if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        if (pipelineLayout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, pipelineLayout, nullptr);
+        if (setLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, setLayout, nullptr);
+    }
+    const Context& context;
+    Buffer result;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+};
+
 std::shared_ptr<Texture> Sample(const Context& context, const GuestTextureResource& resource) {
     const std::array<std::uint32_t, 8> words{0, 0, 0, 0, resource.width, resource.height, 0, 0};
     return DepthSurfaceTexture(context, words, resource, Identity);
@@ -249,11 +354,10 @@ std::shared_ptr<Texture> Sample(const Context& context, const GuestTextureResour
 
 bool Refused(const Context& context, const GuestTextureResource& resource) {
     try {
-        Sample(context, resource);
+        return Sample(context, resource) == nullptr && DepthSurfaceAt(resource.baseAddress);
     } catch (const std::runtime_error& error) {
-        return std::string(error.what()).find("is not implemented") != std::string::npos;
+        return std::string(error.what()).find("is not implemented") != std::string::npos && DepthSurfaceAt(resource.baseAddress);
     }
-    return false;
 }
 
 alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{
@@ -380,6 +484,58 @@ void RemappedColorTest(const Device& device) {
     ClearCachedTextures(device.GetContext().device);
 }
 
+void StorageRoundTripTest(const Context& context) {
+    GuestBlock memory(DepthSliceBytes(Extent, 4));
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearCachedTextures(device); ClearDepthSurfaces(device); }
+    } cleanup{context.device};
+    std::memset(memory.data, 0xcd, DepthSliceBytes(Extent, 4));
+    AgcDriver::GuestMemory::MarkWritten(memory.Address(), DepthSliceBytes(Extent, 4));
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    auto target = Depth(memory.Address());
+    target.clearDepth = 0.25f;
+    DepthSurfaceView(context, target);
+    auto resource = View(Extent.width, Extent.height, memory.Address());
+    resource.tileMode = TextureTileMode::kZ64KBX;
+    SampleProgram sampler(context);
+    const auto initial = Sample(context, resource);
+    Require(initial != nullptr && sampler.RedBits(*initial) == std::bit_cast<std::uint32_t>(target.clearDepth),
+        "the depth round trip did not start with the GPU clear value");
+
+    auto writer = CachedStorageSurface(context, resource);
+    {
+        Texture sampledStorage(context, writer, resource, Identity);
+        Require(sampler.RedBits(sampledStorage) == std::bit_cast<std::uint32_t>(target.clearDepth),
+            "the storage image did not receive the depth clear's pixel bits");
+    }
+    constexpr float writtenDepth = 0.75f;
+    {
+        CommandBatch batch(context);
+        const auto commands = batch.Handle();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkClearColorValue clear{};
+        clear.float32[0] = writtenDepth;
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, writer->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        batch.SubmitAndWait();
+    }
+    writer->MarkDirty();
+    const std::weak_ptr<StorageTexture> retained = writer;
+    ClearCachedTextures(context.device);
+    Check(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device), "vkDeviceWaitIdle");
+    writer.reset();
+    Require(!retained.expired(), "cache eviction and the last external reference destroyed the depth surface's storage writer");
+    DepthSurfaceView(context, target);
+    const auto rebound = Sample(context, resource);
+    Require(rebound != nullptr && sampler.RedBits(*rebound) == std::bit_cast<std::uint32_t>(writtenDepth),
+        "rebinding depth did not import the retained storage writer's GPU pixel bits");
+    Require(retained.expired(), "a completed depth rebind retained the consumed storage writer");
+}
+
 void MultisampleRefusalTest(const Context& context) {
     if (!context.sampleLocations || (context.sampleLocationProperties.sampleLocationSampleCounts & VK_SAMPLE_COUNT_8_BIT) == 0 ||
         (context.limits.framebufferDepthSampleCounts & VK_SAMPLE_COUNT_8_BIT) == 0 || context.sampleLocationProperties.sampleLocationSubPixelBits < 4) {
@@ -495,6 +651,7 @@ int main() {
         std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
         Run(device->GetContext());
         RemappedColorTest(*device);
+        StorageRoundTripTest(device->GetContext());
         MultisampleRefusalTest(device->GetContext());
         std::puts("depth surface last writer tests passed");
         return 0;
