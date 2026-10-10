@@ -81,7 +81,7 @@ public:
 #endif
         Require(block != nullptr, "one-slice alias: cannot allocate the guest block");
         Require(!watched || AgcDriver::GuestMemory::Watched(AddressOf(block), BlockBytes), "one-slice alias: the guest block is not write-watched");
-        GuestAllocations::Mutation().Add(block, BlockBytes, true, true);
+        GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
     }
 
     ~GuestBlock() {

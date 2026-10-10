@@ -46,7 +46,7 @@ struct GuestBlock {
         bytes = static_cast<std::uint8_t*>(std::aligned_alloc(BlockBytes, BlockBytes));
 #endif
         Require(bytes != nullptr, "guest image allocation failed");
-        GuestAllocations::Mutation().Add(bytes, BlockBytes, true, true);
+        GuestAllocations::Mutation().Add(bytes, BlockBytes, true, true, true);
     }
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(bytes);
