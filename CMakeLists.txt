@@ -57,6 +57,11 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_exports.py)
         add_test(NAME nid_database_cache COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_nid_names.py)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_test(NAME run_game COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_run_game.py ${CMAKE_CXX_COMPILER})
+            set_tests_properties(run_game PROPERTIES TIMEOUT 30)
+        endif()
         if(UNIX)
             add_test(NAME stage_guest_runtime COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_stage_guest_runtime.py $<TARGET_FILE:relinker>)

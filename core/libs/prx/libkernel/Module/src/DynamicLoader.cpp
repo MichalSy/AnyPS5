@@ -122,11 +122,10 @@ char* APS5_VABI dlerror_nid_postfix() {
     pendingError = false;
     return loaderError.data();
 }
-static std::filesystem::path RelinkedModulePath(const std::filesystem::path& path) {
-    auto relinked = path;
-    relinked += ".guest.prx";
+static std::filesystem::path RelinkedModulePath(const char* path) {
+    const auto relinked = ResolveModulePath_nid_no_patch((std::string(path) + ".guest.prx").c_str());
     std::error_code error;
-    return std::filesystem::is_regular_file(relinked, error) ? relinked : path;
+    return std::filesystem::is_regular_file(relinked, error) ? relinked : ResolveModulePath_nid_no_patch(path);
 }
 
 static void* OpenModule(const char* path, int flags, ModuleStartContext* start) {
@@ -143,7 +142,7 @@ static void* OpenModule(const char* path, int flags, ModuleStartContext* start) 
             module->owned = false;
         } else {
             if (!*path) { Error("dlopen: empty module path"); return nullptr; }
-            const auto resolved = RelinkedModulePath(ResolvePath_nid_no_patch(path));
+            const auto resolved = RelinkedModulePath(path);
             module->native = LoadLibraryExW(resolved.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         }
         if (!module->native) {
@@ -152,7 +151,7 @@ static void* OpenModule(const char* path, int flags, ModuleStartContext* start) 
             Error(message); return nullptr;
         }
 #else
-        const auto resolved = path ? RelinkedModulePath(ResolvePath_nid_no_patch(path)).string() : std::string{};
+        const auto resolved = path ? RelinkedModulePath(path).string() : std::string{};
         const int nativeFlags = ((flags & 3) == 1 ? RTLD_LAZY : RTLD_NOW) |
             ((flags & 0x100) ? RTLD_GLOBAL : RTLD_LOCAL);
         if (start && path) start->path = std::filesystem::weakly_canonical(resolved);

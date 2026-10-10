@@ -67,17 +67,16 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     if (hasPrx) directories.push_back(prx);
     std::vector<std::filesystem::path> paths;
     std::set<std::string> unmatchedExclusions = excludedModules;
-    const auto isElf = [](const std::filesystem::path& path) {
+    const auto isGuestImage = [](const std::filesystem::path& path) {
         std::ifstream stream(path, std::ios::binary);
         if (!stream) throw Domain::RelinkerException("Cannot read guest candidate: " + path.string());
-        char magic[4]{};
-        stream.read(magic, 4);
+        unsigned char magic[4]{};
+        stream.read(reinterpret_cast<char*>(magic), 4);
         if (stream.bad()) throw Domain::RelinkerException("Cannot read guest candidate magic: " + path.string());
         if (stream.gcount() != 4) return false;
-        const auto byte = [&](const std::size_t index) { return static_cast<unsigned char>(magic[index]); };
-        const bool self = (byte(0) == 0x4f && byte(1) == 0x15 && byte(2) == 0x3d && byte(3) == 0x1d) || (byte(0) == 0x54 && byte(1) == 0x14 && byte(2) == 0xf5 && byte(3) == 0xee);
-        if (self) throw Domain::RelinkerException("Guest module is a SELF container, not an ELF: " + path.string());
-        return byte(0) == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
+        return (magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') ||
+               (magic[0] == 0x4f && magic[1] == 0x15 && magic[2] == 0x3d && magic[3] == 0x1d) ||
+               (magic[0] == 0x54 && magic[1] == 0x14 && magic[2] == 0xf5 && magic[3] == 0xee);
     };
     for (const auto& directory : directories) {
         if (!std::filesystem::is_directory(directory)) throw Domain::RelinkerException("Guest module path is not a directory: " + directory.string());
@@ -88,7 +87,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 continue;
             }
             if (!entry.is_regular_file()) continue;
-            if (isElf(entry.path())) paths.push_back(entry.path());
+            if (isGuestImage(entry.path())) paths.push_back(entry.path());
         }
     }
     const auto neededNames = ReadNeededNames(dynamic);

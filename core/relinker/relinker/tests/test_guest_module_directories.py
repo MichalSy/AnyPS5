@@ -110,14 +110,15 @@ def main():
             assert result.returncode == 2 and "not a directory" in result.stderr, result.stderr
             assert not output.exists(), output
 
-            for magic in (b"\x4f\x15\x3d\x1d", b"\x54\x14\xf5\xee"):
+            for magic, message in ((b"\x4f\x15\x3d\x1d", "Unsupported SELF header"),
+                                   (b"\x54\x14\xf5\xee", "Encrypted PS5 SELF containers are unsupported")):
                 case = work / f"{windows}-self-{magic.hex()}"
                 for name in ("sce_module", "prx"):
                     (case / name).mkdir(parents=True)
                 (case / "sce_module" / "libc.prx").write_bytes(magic + bytes(0x1000))
                 (case / "prx" / "provider.prx").write_bytes(module_with_symbol(True))
                 result, output = convert(case, windows)
-                assert result.returncode == 2 and "Guest module is a SELF container, not an ELF" in result.stderr, result.stderr
+                assert result.returncode == 2 and message in result.stderr, result.stderr
                 assert str(case / "sce_module" / "libc.prx") in result.stderr, result.stderr
                 assert not output.exists() and not (case / "app0").exists(), output
                 result, output = convert(case, windows, ["--exclude-sce-module", "libc.prx"])
