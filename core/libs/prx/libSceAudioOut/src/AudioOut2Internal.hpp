@@ -14,6 +14,11 @@
 #include "SceTypes.hpp"
 #include "AudioOut2PadMix.hpp"
 
+#if defined(__ELF__)
+__attribute__((visibility("hidden")))
+#endif
+bool AudioOutEnsureSdlAudio();
+
 // Shared by the AudioOut2 context and port files.
 //
 // APS5_TRACE_AUDIOOUT2=1 prints the title's use of the API to stderr: context and port parameters, every
