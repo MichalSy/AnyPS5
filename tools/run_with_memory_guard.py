@@ -39,6 +39,28 @@ def group_path(unit):
     return path if (path / "memory.max").exists() else None
 
 
+def inspect_missing_group(unit, process):
+    state = {}
+    try:
+        result = subprocess.run(["systemctl", "--user", "show", unit, "--property=ActiveState",
+                                 "--property=Result", "--property=LoadState"],
+                                capture_output=True, text=True, timeout=3)
+        if result.returncode == 0:
+            state = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if state.get("Result") == "oom-kill":
+        return "The kernel OOM killer terminated the game's memory cgroup", state
+    if process.poll() is None and state.get("ActiveState") in ("inactive", "failed"):
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    if process.poll() is None:
+        return "The memory cgroup disappeared while the game was running", state
+    return None, state
+
+
 def memory_sample(path):
     sample = {}
     if path is None:
@@ -136,8 +158,10 @@ def main():
                         if int((path / "memory.max").read_text().strip()) != budget:
                             reason = "The requested memory limit is not active"
                     except FileNotFoundError:
-                        if process.poll() is None:
-                            reason = "The memory cgroup disappeared while the game was running"
+                        reason, state = inspect_missing_group(unit, process)
+                        record("cgroup_missing", systemd_unit_state=state, launcher_returncode=process.poll())
+                        if reason is None:
+                            break
                 available = available_memory()
                 if available < stop_below:
                     reason = "Available system RAM fell below the safety reserve"
