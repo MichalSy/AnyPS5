@@ -7,8 +7,10 @@
 #include <array>
 #include <optional>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -17,6 +19,10 @@
 
 namespace ShaderRecompiler {
 class ShaderPreparationContext;
+}
+
+namespace AgcDriver {
+class VulkanDevice;
 }
 
 namespace AgcDriver::DriverDetail {
@@ -61,6 +67,9 @@ struct PreparedShaderState {
 };
 struct PreparedShaders : PreparedShaderState {
     std::mutex mutex;
+    std::condition_variable settled;
+    std::exception_ptr failure;
+    bool pending = false;
 };
 
 struct RegisteredShaderState {
@@ -85,6 +94,7 @@ std::shared_ptr<const ShaderSnapshot> ReadRawComputeShader(std::uint64_t address
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation = nullptr);
 
 std::uint64_t NullPixelProgramAddress();
+ShaderSnapshot PrepareNullPixelProgram(const VulkanDevice& device);
 std::optional<ShaderRecompiler::ShaderFloatMode> RegisteredFloatMode(const ShaderSnapshot& snapshot);
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot);
 

@@ -126,7 +126,7 @@ void CheckAbi() {
     Reject([] { ShaderRecompiler::RuntimeAbi::RequireVersion(12u); }, "incompatible version");
     ShaderRecompiler::RuntimeAbi::RequireVersion(ShaderRecompiler::RuntimeAbi::Version);
     using namespace ShaderRecompiler;
-    Require(RuntimeAbi::Version == 13u && RuntimeAbi::SampledHeapCapacity == 32u && RuntimeAbi::BindlessTableCapacity == 16u, "sampled and bindless heap capacities are not independent");
+    Require(RuntimeAbi::Version == 13u && RuntimeAbi::SampledHeapCapacity == 64u && RuntimeAbi::BindlessTableCapacity == 16u, "sampled and bindless heap capacities are not independent");
     Require(RuntimeAbi::StorageHeapCapacity == 16u && RuntimeAbi::SamplerHeapCapacity == 32u, "storage or sampler heap capacity changed");
     Require(PipelineSpecialization::DescriptorIndexStride == 128u && RuntimeAbi::SampledHeapCapacity < PipelineSpecialization::DescriptorIndexStride, "sampled heap exceeds the descriptor specialization stride");
     std::set<std::uint32_t> indices;
@@ -166,7 +166,10 @@ void CheckHeaps() {
     for (std::uint32_t slot = 0u; slot < sampled.size(); ++slot) Require(sampled[slot] == slot, "direct sampled image slots were reordered");
     Require(single.layout.ShaderDataDwords() == full.layout.ShaderDataDwords() && single.layout.memoryOffsetDword == full.layout.memoryOffsetDword && !full.layout.UsesPushData(), "runtime layout depends on resource count");
     Require(full.layout.memoryOffsetDword == 0u && full.layout.DispatchThreadLimitDword() == 0u && full.layout.ShaderDataDwords() == 0u, "direct image resources allocated runtime metadata");
-    Reject([&] { allocate(image, 33u); }, "heap capacity exceeded");
+    Reject([&] { allocate(image, RuntimeAbi::SampledHeapCapacity + 1u); }, "heap capacity exceeded");
+    Require(BindingAllocator{}.FindBinding(allocate(image, 40u).layout, DescriptorBindingForImage(image)).resources.size() == 40u, "a sampled heap does not hold 40 images of one class");
+    Require(BindingAllocator{}.FindBinding(allocate(image, RuntimeAbi::SampledHeapCapacity).layout, DescriptorBindingForImage(image)).resources.size() == RuntimeAbi::SampledHeapCapacity, "a sampled heap does not hold a full class of images");
+    Require(ResourceMaterializer::BindlessSlots() == 16u, "bindless image tables changed size with the sampled heap");
     Reject([&] { allocate(image, 1u, RuntimeAbi::SamplerHeapCapacity + 1u); }, "metadata capacity");
     image.resourceClass = ImageResourceClass::Storage;
     const auto directStorage = allocate(image, 4u);

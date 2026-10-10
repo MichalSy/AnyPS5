@@ -126,7 +126,13 @@ struct Fixture {
 };
 void CheckCases() {
     Fixture base; base.Check(true, "aliased image read-prefix/single-injective-store should certify");
-    Fixture plain2D(false); plain2D.Check(true, "2D output should certify");
+    Fixture plain2D(false); plain2D.program.Info().images.front().fmaskCompatible = false;
+    plain2D.Check(true, "2D read/write output with no projected modes should certify");
+    Fixture projectedLine(false); projectedLine.program.Info().images.front().fmaskCompatible = false;
+    projectedLine.program.Info().images.front().read = false;
+    projectedLine.Check(false, "written-only 2D output can emit a 1D mode that discards certified y");
+    Fixture writtenArray; writtenArray.program.Info().images.front().read = false;
+    writtenArray.Check(true, "written-only 2D array modes preserve both certified x/y coordinates");
     Fixture orderedEntry(true, false); orderedEntry.Check(true, "certificate must use the emitter's ordered entry block");
     Fixture diamond; diamond.Diamond(); diamond.Check(true, "fully remasked pure EXECz skip diamond should certify");
     Fixture folded; folded.Diamond(true); folded.Check(true, "exact complement retained in remask after branch double-not fold should certify");

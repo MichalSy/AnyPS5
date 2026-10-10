@@ -242,6 +242,7 @@ function(add_shader_recompiler target runtimeTarget)
             SrgbDecodeBit
             SrgbUnormFormat
             ThreadOwned
+            UnresolvableSwappcTarget
                     WriteFileAtomically
     )
     set(shaderCacheManifest)

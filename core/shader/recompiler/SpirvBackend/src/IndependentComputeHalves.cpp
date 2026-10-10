@@ -1,4 +1,5 @@
 #include "SpirvBackend/IndependentComputeHalves.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
@@ -265,6 +266,9 @@ const IrValue* IndependentComputeHalfStore(const IrProgram& program, const Shade
     if ((!array && memory.imageDimension != RdnaImageDimension::Dim2D) || memory.imageAddressComponents != (array ? 3u : 2u) || memory.imageSampleFlags != 0u || memory.imageHasMip || memory.imageByElements != 0u ||
         image.dimension != memory.imageDimension || image.mipMode != ImageMipMode::None || image.indirectRoot != ImageResource::NoIndirectImage || image.atomic ||
         (array && !Uniform(coordinates->Argument(2), uniform))) return nullptr;
+    for (const auto& mode : ResourceMaterializer::RuntimeImageModes(image)) {
+        if (mode.dimension != RdnaImageDimension::Dim2D && mode.dimension != RdnaImageDimension::Dim2DArray) return nullptr;
+    }
     return store;
 }
 

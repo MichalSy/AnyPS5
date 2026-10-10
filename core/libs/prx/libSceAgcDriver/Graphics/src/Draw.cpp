@@ -742,7 +742,7 @@ bool MovableBuffers() {
     return enabled;
 }
 
-ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
+ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
     ResourceCache::Key key{0xffffffffu};
     const auto append64 = [&](std::uint64_t value) {
         key.push_back(static_cast<std::uint32_t>(value));
@@ -755,6 +755,7 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         key.push_back(static_cast<std::uint32_t>(part.size()));
         key.insert(key.end(), part.begin(), part.end());
     }
+    key.push_back(colorAttachments);
     if (ranges) {
         append64(target.address);
         append64(target.bytes);
@@ -911,6 +912,17 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     }
     copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
+    return copy;
+}
+
+DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes) {
+    Require(validBytes <= bytes, "the valid bytes of a vertex fetch exceed the fetch");
+    GuestMemory::FlushGpuWrites(address, bytes);
+    DrawInputCopy copy;
+    copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    const auto span = copy.buffer->Bytes();
+    GuestMemory::Read(address, span.subspan(0, validBytes), 1);
+    std::fill(span.begin() + static_cast<std::ptrdiff_t>(validBytes), span.end(), std::byte{0});
     return copy;
 }
 
@@ -1077,12 +1089,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.maxIndex += draw.firstVertex;
     }
     std::vector<VertexFetch> fetches;
+    std::vector<std::size_t> fetchValid;
     fetches.reserve(attributes.size());
+    fetchValid.reserve(attributes.size());
     std::vector<std::size_t> fetchOf(attributes.size(), 0);
     std::vector<std::shared_ptr<Buffer>> zeroed(attributes.size());
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
-        if (VertexFetchOutOfRange(attribute)) {
+        if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) {
             zeroed[i] = zeroVertexBuffer(context, attribute);
             continue;
         }
@@ -1091,10 +1105,24 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto& fields = attribute.resource.fields;
         const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
         Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address, "vertex buffer aliases the render target");
+        const auto stride = (fields[1] >> 16u) & 0x3fffu;
         fetchOf[i] = fetches.size();
-        fetches.push_back({address, address + bytes, (fields[1] >> 16u) & 0x3fffu, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
+        fetches.push_back({address, address + bytes, stride, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
+        const auto recordBytes = static_cast<std::uint64_t>(fields[2]) * stride;
+        fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
-    const auto plan = PlanVertexCopies(fetches);
+    const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
+    std::vector<bool> isSolo(fetches.size(), false);
+    for (const auto f : soloFetches) isSolo[f] = true;
+    std::vector<VertexFetch> plannedFetches;
+    plannedFetches.reserve(fetches.size());
+    std::vector<std::size_t> plannedOf(fetches.size(), 0);
+    for (std::size_t f = 0; f < fetches.size(); ++f) {
+        if (isSolo[f]) continue;
+        plannedOf[f] = plannedFetches.size();
+        plannedFetches.push_back(fetches[f]);
+    }
+    const auto plan = PlanVertexCopies(plannedFetches);
     std::vector<VkBuffer> rangeHandles;
     std::vector<VkDeviceSize> rangeOffsets;
     rangeHandles.reserve(plan.copies.size());
@@ -1115,6 +1143,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
+    std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    for (const auto f : soloFetches) {
+        const auto begin = fetches[f].begin;
+        const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
+        auto copy = CopyZeroPaddedDrawInput(context, begin, bytes, fetchValid[f]);
+        soloHandles[f] = copy.buffer->Handle();
+        inputs.vertexBuffers.push_back(std::move(copy.buffer));
+    }
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         if (zeroed[i] != nullptr) {
             inputs.vertexHandles.push_back(zeroed[i]->Handle());
@@ -1122,8 +1158,15 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.vertexBuffers.push_back(std::move(zeroed[i]));
             continue;
         }
-        inputs.vertexHandles.push_back(rangeHandles[plan.copyOf[fetchOf[i]]]);
-        inputs.vertexOffsets[i] = rangeOffsets[plan.copyOf[fetchOf[i]]] + plan.offsets[fetchOf[i]];
+        const auto f = fetchOf[i];
+        if (isSolo[f]) {
+            inputs.vertexHandles.push_back(soloHandles[f]);
+            inputs.vertexOffsets[i] = 0;
+            continue;
+        }
+        const auto j = plannedOf[f];
+        inputs.vertexHandles.push_back(rangeHandles[plan.copyOf[j]]);
+        inputs.vertexOffsets[i] = rangeOffsets[plan.copyOf[j]] + plan.offsets[j];
     }
     timer.phase(PhaseVertex);
     return inputs;
@@ -1188,7 +1231,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; });
     if (resolved.cacheable) {
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
+        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
             const bool valid = cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
@@ -1212,7 +1255,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
-        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
@@ -1949,7 +1992,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
     const bool lean = recorded && !drawTransitions;
     if (!lean && !resolved.moved.empty()) {
-        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
     }
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");

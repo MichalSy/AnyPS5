@@ -36,6 +36,20 @@ static std::uintptr_t Descend(std::uintptr_t floor) {
     return deepest;
 }
 
+#ifndef _WIN32
+static void HostCallback() {
+    volatile unsigned char frame[512 * 1024];
+    for (std::size_t offset = 0; offset < sizeof(frame); offset += FRAME_SIZE)
+        frame[offset] = static_cast<unsigned char>(offset / FRAME_SIZE);
+    frame[sizeof(frame) - 1] = 0xa5;
+    for (std::size_t offset = 0; offset < sizeof(frame); offset += FRAME_SIZE)
+        Require(frame[offset] == static_cast<unsigned char>(offset / FRAME_SIZE));
+    Require(frame[sizeof(frame) - 1] == 0xa5);
+}
+
+static void (*volatile hostCallback)() = HostCallback;
+#endif
+
 static void* APS5_VABI Worker(void* arg) {
     const auto requested = *static_cast<const std::size_t*>(arg);
     threadLocalBlock[0] = 1;
@@ -56,6 +70,10 @@ static void* APS5_VABI Worker(void* arg) {
     Require(local - begin + FRAME_SIZE >= requested);
     const auto deepest = Descend(begin);
     Require(deepest >= begin && deepest < begin + FRAME_MARGIN);
+
+#ifndef _WIN32
+    hostCallback();
+#endif
 
     Require(threadLocalBlock[0] == 1 && threadLocalBlock[sizeof(threadLocalBlock) - 1] == 2);
     return arg;

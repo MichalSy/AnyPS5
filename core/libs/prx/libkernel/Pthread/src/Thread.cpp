@@ -485,7 +485,10 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
     pthread_attr_t nativeAttr;
     if (const int result = pthread_attr_init(&nativeAttr); result != 0)
         throw std::system_error(result, std::generic_category(), "Creating guest thread");
-    int created = pthread_attr_setstacksize(&nativeAttr, nativeStack);
+    std::size_t hostStackSize = 0;
+    int created = pthread_attr_getstacksize(&nativeAttr, &hostStackSize);
+    if (created == 0)
+        created = pthread_attr_setstacksize(&nativeAttr, std::max(hostStackSize, nativeStack));
     if (created == 0)
         created = pthread_create(&p->hostThread, &nativeAttr, StartNativeThread, native.get());
     pthread_attr_destroy(&nativeAttr);
@@ -632,11 +635,7 @@ int APS5_VABI scePthreadGetprio(Pthread thread, int* prio) {
 }
 
 int APS5_VABI scePthreadGetthreadid(void) {
-#ifdef _WIN32
-    return static_cast<int>(GetCurrentThreadId());
-#else
-    return static_cast<int>(std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0x7fffffff);
-#endif
+    return static_cast<int>(scePthreadSelf()->tid);
 }
 
 int APS5_VABI scePthreadRename(Pthread thread, const char* name) {

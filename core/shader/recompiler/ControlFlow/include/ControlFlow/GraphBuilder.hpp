@@ -5,6 +5,7 @@
 #include "RdnaDecoder/RdnaProgram.hpp"
 #include "UnresolvedScalarCallRequirement.hpp"
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -34,6 +35,8 @@ struct SwappcCall {
     std::uint32_t returnIndex = 0;
     std::uint32_t returnTargetProgramCounter = 0;
 };
+
+[[nodiscard]] std::optional<std::uint32_t> UnresolvableSwappcTarget(const RdnaProgram& program, const SwappcInfo* swappc);
 
 class GraphBuilder {
 public:

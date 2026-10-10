@@ -11,6 +11,7 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/File/include/FileLock.hpp"
+#include "prx/libkernel/File/include/RandomDevice.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include <cerrno>
@@ -272,6 +273,7 @@ static std::int64_t TransferPositioned(int descriptor, void* buffer, std::size_t
     }
     const GuestArena::HostWrite destination(buffer, bytes);
     if (!destination.Open()) return SceErrorFromGuest(GUEST_EFAULT);
+    if (File::ReadRandomDevice(native, buffer, bytes)) return static_cast<std::int64_t>(bytes);
     const auto result = NativePread(native, buffer, bytes, offset);
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
@@ -570,6 +572,18 @@ static int CheckIovecs(const KernelIovec* iov, int iovcnt) {
     return 0;
 }
 
+static std::int64_t ReadRandomIovecs(int native, const KernelIovec* iov, int iovcnt) {
+    std::int64_t total = 0;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (iov[i].length > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max() - total))
+            return SceErrorFromGuest(GUEST_EINVAL);
+        total += static_cast<std::int64_t>(iov[i].length);
+    }
+    for (int i = 0; i < iovcnt; ++i)
+        File::ReadRandomDevice(native, iov[i].base, iov[i].length);
+    return total;
+}
+
 static bool OpenIovecs(const KernelIovec* iov, int iovcnt, std::deque<GuestArena::HostWrite>& destinations) {
     for (int i = 0; i < iovcnt; ++i) {
         if (!destinations.emplace_back(iov[i].base, iov[i].length).Open()) return false;
@@ -603,6 +617,7 @@ static std::int64_t TransferIovecs(int d, const KernelIovec* iov, int iovcnt, co
     if (offset != nullptr && total > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max() - *offset)) return SceErrorFromGuest(GUEST_EINVAL);
     std::deque<GuestArena::HostWrite> destinations;
     if (!write && !OpenIovecs(iov, iovcnt, destinations)) return SceErrorFromGuest(GUEST_EFAULT);
+    if (!write && File::IsRandomDevice(native)) return ReadRandomIovecs(native, iov, iovcnt);
     if (total == 0) {
         char none = 0;
         const auto result = offset != nullptr ? NativePositioned_nid_no_patch(native, &none, 0, *offset, write) : NativeTransfer(native, &none, 0, write);
@@ -658,6 +673,7 @@ int64_t APS5_VABI sceKernelReadv(int d, const KernelIovec* iov, int iovcnt) {
     if (const int error = CheckIovecs(iov, iovcnt)) return error;
     std::deque<GuestArena::HostWrite> destinations;
     if (!OpenIovecs(iov, iovcnt, destinations)) return SceErrorFromGuest(GUEST_EFAULT);
+    if (File::IsRandomDevice(native)) return ReadRandomIovecs(native, iov, iovcnt);
     const auto result = static_cast<std::int64_t>(::readv(native, NativeIovecs(iov), iovcnt));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
@@ -681,6 +697,7 @@ int64_t APS5_VABI sceKernelPreadv(int d, const KernelIovec* iov, int iovcnt, int
     if (offset < 0) return SceErrorFromGuest(GUEST_EINVAL);
     std::deque<GuestArena::HostWrite> destinations;
     if (!OpenIovecs(iov, iovcnt, destinations)) return SceErrorFromGuest(GUEST_EFAULT);
+    if (File::IsRandomDevice(native)) return ReadRandomIovecs(native, iov, iovcnt);
     const auto result = static_cast<std::int64_t>(::preadv(native, NativeIovecs(iov), iovcnt, static_cast<off_t>(offset)));
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }

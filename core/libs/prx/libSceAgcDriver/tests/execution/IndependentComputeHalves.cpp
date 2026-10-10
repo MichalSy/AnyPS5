@@ -99,13 +99,17 @@ struct OracleProgram {
         ImageResource readImage{}; readImage.resourceClass = ImageResourceClass::Sampled; readImage.numericClass = IrTextureNumericClass::Uint;
         readImage.dimension = RdnaImageDimension::Dim2D; readImage.read = true; readImage.fmaskCompatible = false;
         ImageResource storage = readImage; storage.resourceClass = ImageResourceClass::Storage; storage.read = false; storage.written = true;
+        storage.dimension = RdnaImageDimension::Dim2DArray;
         if (seedOnly) program.Info().images = {storage};
         else program.Info().images = {readImage, storage};
         for (const auto& image : program.Info().images) program.Info().runtimeImageModes.push_back(ResourceMaterializer::RuntimeImageModes(image));
         MemoryInfo memory{}; memory.kind = ResourceKind::Image; memory.imageDimension = RdnaImageDimension::Dim2D;
         memory.imageAddressComponents = 2u; memory.dmask = 1u;
-        if (seedOnly) program.Resources().memoryInfo = {memory};
-        else { program.Resources().memoryInfo = {memory, memory}; program.Resources().memoryInfo[1u].resource = 1u; }
+        auto storageMemory = memory;
+        storageMemory.imageDimension = RdnaImageDimension::Dim2DArray;
+        storageMemory.imageAddressComponents = 3u;
+        if (seedOnly) program.Resources().memoryInfo = {storageMemory};
+        else { program.Resources().memoryInfo = {memory, storageMemory}; program.Resources().memoryInfo[1u].resource = 1u; }
         auto& shiftedY = ir.Emit(IrOpcode::ShiftLeftLogical32, IrType::U32, {&y, &ir.Constant(3u)});
         auto& index = ir.IAdd(x, shiftedY);
         IrValue* value = nullptr;

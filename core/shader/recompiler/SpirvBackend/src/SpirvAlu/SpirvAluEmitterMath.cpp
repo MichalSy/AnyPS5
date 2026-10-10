@@ -820,16 +820,31 @@ std::uint32_t EmitFPLog2(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitExt(state, TypeF32(state), GLSLstd450Log2, {EmitFlushF32DenormToSignedZero(state, arg0)});
 }
 
+std::uint32_t TrigLinearNearZero(SpirvEmitterState& state, std::uint32_t value, std::uint32_t distance, std::uint32_t linearConstant) {
+    const auto linear = Binary(state, spv::OpFMul, TypeF32(state), distance, linearConstant);
+    const auto magnitude = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Unary(state, spv::OpBitcast, TypeU32(state), distance), ConstantU32(state, 0x7fffffffu));
+    const auto near = Binary(state, spv::OpULessThan, TypeBool(state), magnitude, ConstantU32(state, 0x39800000u));
+    return Select(state, TypeF32(state), near, linear, value);
+}
+
 std::uint32_t EmitFPSin(SpirvEmitterState& state, std::uint32_t arg0) {
     const auto cycle = EmitTrigCycleF32(state, arg0, true);
-    const auto source = Binary(state, spv::OpFMul, TypeF32(state), cycle, ConstantF32(state, 0x40c90fdbu));
-    return EmitExt(state, TypeF32(state), GLSLstd450Sin, {source});
+    const auto absolute = EmitExt(state, TypeF32(state), GLSLstd450FAbs, {cycle});
+    const auto signBits = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Unary(state, spv::OpBitcast, TypeU32(state), cycle), ConstantU32(state, 0x80000000u));
+    const auto value = EmitExt(state, TypeF32(state), GLSLstd450Sin, {Binary(state, spv::OpFMul, TypeF32(state), absolute, ConstantF32(state, 0x40c90fdbu))});
+    const auto nearHalf = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), absolute, ConstantF32(state, 0x3e800000u));
+    const auto distance = Select(state, TypeF32(state), nearHalf, Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3f000000u), absolute), absolute);
+    const auto linearConstant = Select(state, TypeF32(state), nearHalf, ConstantF32(state, 0x40c90fdbu), ConstantF32(state, 0x40c90fd5u));
+    const auto result = TrigLinearNearZero(state, value, distance, linearConstant);
+    return Unary(state, spv::OpBitcast, TypeF32(state), Binary(state, spv::OpBitwiseOr, TypeU32(state), Unary(state, spv::OpBitcast, TypeU32(state), result), signBits));
 }
 
 std::uint32_t EmitFPCos(SpirvEmitterState& state, std::uint32_t arg0) {
     const auto cycle = EmitTrigCycleF32(state, arg0, false);
-    const auto source = Binary(state, spv::OpFMul, TypeF32(state), cycle, ConstantF32(state, 0x40c90fdbu));
-    return EmitExt(state, TypeF32(state), GLSLstd450Cos, {source});
+    const auto absolute = EmitExt(state, TypeF32(state), GLSLstd450FAbs, {cycle});
+    const auto value = EmitExt(state, TypeF32(state), GLSLstd450Cos, {Binary(state, spv::OpFMul, TypeF32(state), absolute, ConstantF32(state, 0x40c90fdbu))});
+    const auto distance = Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3e800000u), absolute);
+    return TrigLinearNearZero(state, value, distance, ConstantF32(state, 0x40c90fdbu));
 }
 
 std::uint32_t EmitIdentity(SpirvValueEmitContext&, std::uint32_t value) {
@@ -1357,25 +1372,6 @@ std::uint32_t EmitFPFma32(SpirvEmitterState& state, std::uint32_t arg0, std::uin
 
 std::uint32_t EmitFPMad32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
     return EmitFPAdd32(state, EmitFPMul32(state, arg0, arg1), arg2);
-}
-
-std::uint32_t EmitFPNanResultFma32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t result, std::uint32_t lhs, std::uint32_t rhs, std::uint32_t addend) {
-    const auto u32 = TypeU32(state);
-    const auto boolean = TypeBool(state);
-    const auto bits = [&](std::uint32_t value) { return Unary(state, spv::OpBitcast, u32, value); };
-    const auto magnitude = [&](std::uint32_t value) { return Binary(state, spv::OpBitwiseAnd, u32, bits(value), ConstantU32(state, 0x7fffffffu)); };
-    const auto isNan = [&](std::uint32_t value) { return Binary(state, spv::OpUGreaterThan, boolean, magnitude(value), ConstantU32(state, 0x7f800000u)); };
-    const bool quiet = (inst.Flags<std::uint64_t>() & 1u) != 0u;
-    return EmitValueOrDefaultIfCondition(state, isNan(result), TypeF32(state), result, [&] {
-        const auto equals = [&](std::uint32_t value, std::uint32_t constant) { return Binary(state, spv::OpIEqual, boolean, value, ConstantU32(state, constant)); };
-        const auto infZero = [&](std::uint32_t inf, std::uint32_t zero) { return Binary(state, spv::OpLogicalAnd, boolean, equals(magnitude(inf), 0x7f800000u), equals(magnitude(zero), 0u)); };
-        const auto invalidProduct = Binary(state, spv::OpLogicalOr, boolean, infZero(lhs, rhs), infZero(rhs, lhs));
-        const auto quieted = [&](std::uint32_t value) { return quiet ? Binary(state, spv::OpBitwiseOr, u32, bits(value), ConstantU32(state, 0x00400000u)) : bits(value); };
-        auto chosen = Select(state, u32, Binary(state, spv::OpLogicalAnd, boolean, isNan(addend), Unary(state, spv::OpLogicalNot, boolean, invalidProduct)), quieted(addend), ConstantU32(state, 0xffc00000u));
-        chosen = Select(state, u32, isNan(rhs), quieted(rhs), chosen);
-        chosen = Select(state, u32, isNan(lhs), quieted(lhs), chosen);
-        return Unary(state, spv::OpBitcast, TypeF32(state), chosen);
-    });
 }
 
 std::uint32_t EmitFPRoundEven32(SpirvEmitterState& state, std::uint32_t arg0) {
