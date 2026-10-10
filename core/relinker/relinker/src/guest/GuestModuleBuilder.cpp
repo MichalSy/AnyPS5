@@ -130,7 +130,6 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         images.push_back(std::move(image));
     }
     std::map<std::string, std::size_t> guestNames;
-    std::map<std::string, std::size_t> windowsGuestFiles;
     const auto foldFilename = [](std::string name) {
         for (auto& character : name) if (character >= 'A' && character <= 'Z') character = static_cast<char>(character + ('a' - 'A'));
         return name;
@@ -141,13 +140,16 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             const auto [found, inserted] = guestNames.emplace(name, index);
             if (!inserted && found->second != index) throw Domain::RelinkerException("Ambiguous guest dependency name: " + name);
         }
-        if (windows) windowsGuestFiles.emplace(foldFilename(images[index].SourcePath.filename().string()), index);
     }
+    std::map<std::string, std::set<std::size_t>> foldedGuestNames;
+    for (const auto& [name, index] : guestNames) foldedGuestNames[foldFilename(name)].insert(index);
     const auto findGuest = [&](const std::string& name) {
         const auto exact = guestNames.find(name);
-        if (exact != guestNames.end() || !windows) return exact;
-        const auto file = windowsGuestFiles.find(foldFilename(name));
-        return file == windowsGuestFiles.end() ? guestNames.end() : guestNames.emplace(name, file->second).first;
+        if (exact != guestNames.end()) return exact;
+        const auto folded = foldedGuestNames.find(foldFilename(name));
+        if (folded == foldedGuestNames.end()) return guestNames.end();
+        if (folded->second.size() != 1) throw Domain::RelinkerException("Ambiguous guest dependency name: " + name);
+        return guestNames.emplace(name, *folded->second.begin()).first;
     };
     const auto rejectSharedImport = [&](const std::string& name, const std::string& importer) {
         const auto shared = sharedExports.find(name);
