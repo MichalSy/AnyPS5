@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <filesystem>
 #include <limits>
 #include <utility>
@@ -18,16 +19,29 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 
-static std::string NativeFileMode(const char* mode) {
-    std::string result(mode);
-#ifdef _WIN32
-    if (!result.empty() && result.find('b') == std::string::npos) result.insert(1, 1, 'b');
-#endif
-    return result;
-}
+struct GuestFileMode {
+    std::string native;
+    bool writes = false;
+    bool exclusive = false;
+};
 
-static bool WritesFile(const char* mode) {
-    return std::strpbrk(mode, "wa+") != nullptr;
+static std::optional<GuestFileMode> ParseFileMode(const char* mode) {
+    const char access = mode[0];
+    if (access != 'r' && access != 'w' && access != 'a') return std::nullopt;
+    bool update = false;
+    bool exclusive = false;
+    for (const char* flag = mode + 1; *flag != '\0' && std::strchr("b+xev", *flag) != nullptr; ++flag) {
+        if (*flag == '+') update = true;
+        if (*flag == 'x') exclusive = true;
+    }
+    if (exclusive && access == 'r' && !update) return std::nullopt;
+    GuestFileMode result{std::string(1, access), access != 'r' || update, exclusive};
+    if (update) result.native += '+';
+#ifdef _WIN32
+    result.native += 'b';
+#endif
+    if (exclusive) result.native += 'x';
+    return result;
 }
 
 extern "C" {
@@ -42,7 +56,7 @@ FileStream* APS5_VABI fdopen_nid_postfix(int descriptor, const char* mode) {
     for (const auto* candidate : supported) if (std::strcmp(mode, candidate) == 0) valid = true;
     if (!valid) { errno = 22; return nullptr; }
     std::string nativeMode;
-    try { nativeMode = NativeFileMode(mode); }
+    try { nativeMode = ParseFileMode(mode)->native; }
     catch (const std::bad_alloc&) { errno = 12; return nullptr; }
     const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(descriptor);
     if (!lease) return nullptr;
@@ -80,11 +94,10 @@ FileStream* APS5_VABI fdopen_nid_postfix(int descriptor, const char* mode) {
 FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode, FileStream* stream) {
     if (!stream || !mode) { errno = 22; return nullptr; }
     if (!filename) { errno = 45; return nullptr; } // Mode-only reopening is not supported.
-    const char* supported[] = {"r", "w", "a", "rb", "wb", "ab", "r+", "w+", "a+",
-        "rb+", "wb+", "ab+", "r+b", "w+b", "a+b"};
-    bool valid = false;
-    for (const auto* candidate : supported) if (std::strcmp(mode, candidate) == 0) valid = true;
-    if (!valid) { errno = 22; return nullptr; }
+    std::optional<GuestFileMode> parsed;
+    try { parsed = ParseFileMode(mode); }
+    catch (const std::bad_alloc&) { errno = 12; return nullptr; }
+    if (!parsed) { errno = 22; return nullptr; }
     bool reopened = false;
     const auto failure = [&](int error) -> FileStream* {
         if (reopened) {
@@ -97,9 +110,9 @@ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode
     };
     try {
         const auto path = *filename ? ResolvePath_nid_no_patch(filename).string() : std::string{};
-        if (stream->Reopen(path.c_str(), NativeFileMode(mode).c_str())) {
+        if (stream->Reopen(path.c_str(), parsed->native.c_str())) {
             reopened = true;
-            if (!path.empty() && WritesFile(mode)) RecordWrittenPath_nid_no_patch(path);
+            if (!path.empty() && parsed->writes) RecordWrittenPath_nid_no_patch(path);
             return stream;
         }
         const int error = errno;
@@ -115,13 +128,15 @@ FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) 
     if (GuestFiles::GuestFileInitializeStandards_nid_no_patch() != 0) return nullptr;
     try {
         const auto path = ResolvePath_nid_no_patch(filename);
-        const auto nativeMode = NativeFileMode(mode);
+        const auto parsed = ParseFileMode(mode);
+        if (!parsed) { errno = 22; return nullptr; }
+        const auto& nativeMode = parsed->native;
         std::unique_ptr<std::FILE, decltype(&std::fclose)> handle(std::fopen(path.string().c_str(), nativeMode.c_str()), std::fclose);
         if (!handle) { errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno); return nullptr; }
-        const int access = std::strchr(mode, '+') ? 2 : *mode == 'r' ? 0 : 1;
+        const int access = nativeMode.find('+') != std::string::npos ? 2 : *mode == 'r' ? 0 : 1;
         auto stream = std::make_unique<FileStream>(handle.get(), access, true);
         handle.release();
-        if (WritesFile(mode)) RecordWrittenPath_nid_no_patch(path);
+        if (parsed->writes) RecordWrittenPath_nid_no_patch(path);
         return stream.release();
     } catch (const std::bad_alloc&) { errno = 12; return nullptr; }
       catch (const std::filesystem::filesystem_error& error) { errno = GuestFiles::GuestFileNativeError_nid_no_patch(error.code().value()); return nullptr; }

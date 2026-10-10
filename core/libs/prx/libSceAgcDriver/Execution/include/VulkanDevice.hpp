@@ -35,6 +35,7 @@ public:
     VulkanDevice& operator=(const VulkanDevice&) = delete;
     std::string DeviceName() const;
     ShaderRecompiler::SpirvTarget Target() const;
+    std::optional<ShaderRecompiler::GeometryStageLimits> GeometryLimits() const;
     ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize) const;
     // Distinguishes this device from every earlier one in the process (a memo keyed by the device
     // cannot rely on the pointer, which a replacement may reuse).
@@ -163,6 +164,7 @@ public:
     bool PreciseOcclusionQueries() const;
     bool ProgrammableSampleLocations(VkSampleCountFlagBits samples) const;
     VkShaderStageFlags SubgroupStages() const;
+    bool ProvokingVertexLast() const;
     // A presentation is a few steps so the presenter holds GuestMemory::GpuMutex only while it
     // touches the queue. Presentations are slots (FlipInFlight() + 1, each with its own command
     // buffer, fence, kept resident image and dump buffer): RetirePresents(keep) (no mutex) retires

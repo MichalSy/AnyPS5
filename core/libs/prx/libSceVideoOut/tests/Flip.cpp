@@ -99,24 +99,21 @@ void testLifetime(bool reopen) {
         check(replacement != cfg && replacement->generation > cfg->generation, "reopen reused old port state");
     }
     gate->Release();
-    std::exception_ptr failure;
     {
         std::unique_lock lock(cfg->mutex);
-        check(cfg->vblankCond.wait_for(lock, std::chrono::seconds(10), [&] { return cfg->failure != nullptr; }), "flip failure did not wake waiters");
-        failure = cfg->failure;
-        check(cfg->flipStatus.count == 0 && cfg->flipStatus.flipPendingNum == 0, "failed flip has successful or pending status");
+        check(cfg->vblankCond.wait_for(lock, std::chrono::seconds(10), [&] { return cfg->flipStatus.flipPendingNum == 0; }), "closed port kept its pending flip");
+        check(cfg->failure == nullptr, "closing a port failed the driver");
+        check(cfg->flipStatus.count == 0, "cancelled flip has successful status");
     }
-    const auto message = expectFailure([&] { std::rethrow_exception(failure); });
-    check(message.find("closed") != std::string::npos, "flip used a closed port");
     if (replacement) {
         std::lock_guard lock(replacement->mutex);
         check(replacement->flipStatus.flipPendingNum == 0 && replacement->flipStatus.count == 0, "old request changed new port counters");
+    } else {
+        check(expectFailure([&] { sceVideoOutWaitVblank(handle); }).find("closed") != std::string::npos, "closed port accepted a vblank wait");
     }
-    check(expectFailure([&] { sceVideoOutWaitVblank(handle); }).find("closed") != std::string::npos, "VideoOut lost worker failure");
     AgcDriverUnregisterVideoOutput_nid_postfix(7, gate);
     if (reopen) sceVideoOutClose(handle);
-    const auto shutdown = expectFailure([] { LibcRunShutdown_nid_postfix(); });
-    check(shutdown.find("closed") != std::string::npos, "shutdown lost asynchronous error");
+    LibcRunShutdown_nid_postfix();
 }
 
 std::size_t tiledOffset(uint32_t x, uint32_t y, uint32_t width) {
@@ -329,6 +326,58 @@ void testPresentation() {
     }
     sceVideoOutUnregisterBuffers(handle, 0);
     sceVideoOutClose(handle);
+    LibcRunShutdown_nid_postfix();
+}
+
+void testOverlay() {
+    const int mainHandle = sceVideoOutOpen(255, 0, 0, nullptr);
+    const int overlayHandle = sceVideoOutOpen(255, 1, 0, nullptr);
+    check(mainHandle != overlayHandle, "the overlay bus shares the main port");
+    auto mainCfg = VideoOutDriver::Get().GetConfig(mainHandle);
+    auto overlayCfg = VideoOutDriver::Get().GetConfig(overlayHandle);
+    std::vector<std::byte> mainAllocation(6 * 65536 + 65535);
+    std::vector<std::byte> overlayAllocation(6 * 65536 + 65535);
+    const auto mainStorage = alignedBuffer(mainAllocation);
+    const auto overlayStorage = alignedBuffer(overlayAllocation);
+    fillBuffer(mainStorage, 259, 137);
+    fillBuffer(overlayStorage, 259, 137);
+    VideoOutBuffers mainBuffer{mainStorage.data(), nullptr, {nullptr, nullptr}};
+    VideoOutBuffers overlayBuffer{overlayStorage.data(), nullptr, {nullptr, nullptr}};
+    VideoOutBufferAttribute2 attribute{};
+    sceVideoOutSetBufferAttribute2(&attribute, 0x8000000000000000ull, 0, 259, 137, 0, 0, 0);
+    check(sceVideoOutRegisterBuffers2(mainHandle, 0, 0, &mainBuffer, 1, &attribute, 0, nullptr) == 0, "main buffer registration failed");
+    check(sceVideoOutRegisterBuffers2(overlayHandle, 0, 0, &overlayBuffer, 1, &attribute, 0, nullptr) == 0, "overlay buffer registration failed");
+    const auto flip = [](int handle, const std::shared_ptr<VideoOutConfig>& cfg, std::int64_t argument) {
+        std::uint64_t target;
+        {
+            std::lock_guard lock(cfg->mutex);
+            target = cfg->flipStatus.count + 1;
+        }
+        check(sceVideoOutSubmitFlip(handle, 0, 1, argument) == 0, "the flip was not accepted");
+        std::unique_lock lock(cfg->mutex);
+        check(cfg->vblankCond.wait_for(lock, std::chrono::seconds(15), [&] { return (cfg->failure && cfg->flipStatus.flipPendingNum == 0) || cfg->flipStatus.count == target; }), "the flip did not complete");
+        if (cfg->failure) std::rethrow_exception(cfg->failure);
+        check(cfg->flipStatus.flipArg == argument && cfg->flipStatus.currentBuffer == 0 && cfg->flipStatus.flipPendingNum == 0, "flip status is wrong");
+    };
+    const auto presentsAfter = [](std::uint64_t previous) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (AgcDriver::VulkanDevice::PresentCounts().presents == previous && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        return AgcDriver::VulkanDevice::PresentCounts().presents;
+    };
+    const auto start = AgcDriver::VulkanDevice::PresentCounts().presents;
+    flip(mainHandle, mainCfg, 1);
+    const auto afterMain = presentsAfter(start);
+    check(afterMain > start, "a main-bus flip was not presented");
+    flip(overlayHandle, overlayCfg, 2);
+    flip(overlayHandle, overlayCfg, 3);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    check(AgcDriver::VulkanDevice::PresentCounts().presents == afterMain, "an overlay-bus flip replaced the main output");
+    flip(mainHandle, mainCfg, 4);
+    check(presentsAfter(afterMain) > afterMain, "a main-bus flip after overlay flips was not presented");
+    sceVideoOutUnregisterBuffers(overlayHandle, 0);
+    sceVideoOutUnregisterBuffers(mainHandle, 0);
+    sceVideoOutClose(overlayHandle);
+    sceVideoOutClose(mainHandle);
     LibcRunShutdown_nid_postfix();
 }
 
@@ -563,6 +612,7 @@ int main(int argc, char** argv) {
         else if (argc == 2 && std::string(argv[1]) == "aftergpu") testFlipAfterGpuWork();
         else if (argc == 2 && std::string(argv[1]) == "unavailable") testUnavailable();
         else if (argc == 2 && std::string(argv[1]) == "onedevice") testOneDevice();
+        else if (argc == 2 && std::string(argv[1]) == "overlay") testOverlay();
         else testLifetime(argc == 2 && std::string(argv[1]) == "reopen");
         std::puts("VideoOut flip tests passed");
         return 0;

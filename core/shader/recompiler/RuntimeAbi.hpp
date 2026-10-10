@@ -9,7 +9,7 @@
 
 namespace ShaderRecompiler::RuntimeAbi {
 
-inline constexpr std::uint32_t Version = 12u;
+inline constexpr std::uint32_t Version = 13u;
 inline constexpr std::uint32_t DescriptorSet = 0u;
 inline constexpr std::uint32_t StageCount = 4u;
 inline constexpr std::uint32_t PushConstantDwords = 32u;
@@ -36,7 +36,8 @@ inline constexpr std::uint32_t BufferCapacity = 128u;
 inline constexpr std::uint32_t ImageCapacity = 256u;
 inline constexpr std::uint32_t SampledHeapCapacity = 32u;
 inline constexpr std::uint32_t BindlessTableCapacity = 16u;
-inline constexpr std::uint32_t StorageHeapCapacity = 4u;
+inline constexpr std::uint32_t StorageMipSlots = 4u;
+inline constexpr std::uint32_t StorageHeapCapacity = 16u;
 inline constexpr std::uint32_t SamplerHeapCapacity = 32u;
 
 static_assert(BindlessTableCapacity != 0u && BindlessTableCapacity <= SampledHeapCapacity);

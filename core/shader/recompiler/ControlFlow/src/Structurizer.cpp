@@ -791,6 +791,24 @@ void cloneBlocks(ControlFlowGraph& graph, const std::vector<std::uint32_t>& bloc
     applyBlockOrder(graph, std::move(ordered));
 }
 
+bool privatizeOneSharedReturn(ControlFlowGraph& graph) {
+    for (const auto& block : graph.blocks) {
+        if (!block.successors.empty() || block.terminator.kind != TerminatorKind::Return || block.predecessors.size() < 2u || block.estimatedSpirvWords > CloneWordFloor) {
+            continue;
+        }
+        for (const auto predecessor : block.predecessors) {
+            const auto& from = graph.FindBlock(predecessor);
+            if (from.terminator.kind != TerminatorKind::ConditionalBranch || findInnermostContainingLoop(graph, predecessor) != nullptr) {
+                continue;
+            }
+            const auto shared = block.id;
+            cloneBlocks(graph, {shared}, {{predecessor, shared}});
+            return true;
+        }
+    }
+    return false;
+}
+
 std::optional<ControlFlowGraph> privatizeMergeTail(const ControlFlowGraph& graph, std::uint32_t header, std::uint32_t merge, std::uint32_t& cost, const std::function<void(ControlFlowGraph&)>& recompute) {
     const auto& headerBlock = graph.FindBlock(header);
     if ((headerBlock.terminator.trueBlock != merge && headerBlock.terminator.falseBlock != merge) || graph.FindBlock(merge).predecessors.size() < 2u || !hasLinearPathToTerminal(graph, merge)) {
@@ -1205,8 +1223,32 @@ void tarjanVisit(TarjanState& state, std::uint32_t blockId) {
 }
 
 void Structurizer::Structurize(ControlFlowGraph& graph) const {
+    const auto original = graph;
+    try {
+        structurize(graph, false);
+    } catch (const std::runtime_error&) {
+        graph = original;
+        structurize(graph, true);
+    }
+}
+
+void Structurizer::privatizeSharedReturns(ControlFlowGraph& graph) const {
+    const auto budget = std::max<std::size_t>(16u, graph.blocks.size() * 4u);
+    for (std::size_t clones = 0; privatizeOneSharedReturn(graph); ++clones) {
+        if (clones == budget) {
+            throw std::runtime_error("CFG shared return privatization exceeded budget");
+        }
+        rebuildPredecessors(graph);
+        recomputeAnalyses(graph);
+    }
+}
+
+void Structurizer::structurize(ControlFlowGraph& graph, bool privatizeReturns) const {
     recomputeAnalyses(graph);
     verifyReducibility(graph);
+    if (privatizeReturns) {
+        privatizeSharedReturns(graph);
+    }
     canonicalizeNaturalLoops(graph);
     splitSharedMergeBlocks(graph);
     isolateSemanticLoopHeaders(graph);
@@ -1343,10 +1385,25 @@ void Structurizer::computePostDominators(ControlFlowGraph& graph) const {
         block.postDominators = block.successors.empty() ? std::vector<std::uint32_t>{block.id} : all;
     }
 
+    std::vector<std::uint32_t> order;
+    order.reserve(count);
+    std::vector<bool> ordered(count, false);
+    if (graph.entryBlock < count) {
+        const auto forward = reversePostOrder(graph);
+        for (auto it = forward.rbegin(); it != forward.rend(); ++it) {
+            order.push_back(*it);
+            ordered[*it] = true;
+        }
+    }
+    for (std::uint32_t id = 0; id < count; ++id) {
+        if (!ordered[id]) order.push_back(id);
+    }
+
     bool changed = true;
     while (changed) {
         changed = false;
-        for (auto& block : graph.blocks) {
+        for (const auto id : order) {
+            auto& block = graph.blocks[id];
             std::vector<std::uint32_t> next;
             if (block.successors.empty()) {
                 next = {block.id};

@@ -98,6 +98,7 @@ bool IsRuntimeUniformOp(IrOpcode opcode) {
         case IrOpcode::FPIsNan32:
         case IrOpcode::FPMul32:
         case IrOpcode::F32ProductIsTiny:
+        case IrOpcode::FPNanResultFma32:
         case IrOpcode::FPTrunc32: return true;
         default: return false;
     }

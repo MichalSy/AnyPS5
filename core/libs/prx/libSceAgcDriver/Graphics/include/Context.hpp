@@ -152,6 +152,8 @@ struct Context {
     bool sampleLocations = false;
     VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT};
     std::array<VkExtent2D, 7> sampleLocationGridSizes{};
+    bool provokingVertexLast = false;
+    bool provokingVertexModePerPipeline = false;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

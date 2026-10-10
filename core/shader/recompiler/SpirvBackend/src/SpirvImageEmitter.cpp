@@ -950,7 +950,10 @@ void EmitReadOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     auto& state = ctx.state;
     const auto& dimensionInfo = RdnaImageDimensionInfoFor(access.image.dimension);
     const auto numericClass = access.image.numericClass;
-    const auto condition = ctx.Arg(access.inst, 2);
+    auto condition = ctx.Arg(access.inst, 2);
+    if (access.mem.imageDimension == RdnaImageDimension::Dim3D && access.image.dimension == RdnaImageDimension::Dim2D) {
+        condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), condition, Binary(state, spv::OpIEqual, TypeBool(state), AddressU32(ctx, access, 2u), ConstantU32(state, 0u)));
+    }
     ctx.Define(access.inst, EmitValueOrDefaultIfCondition(state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4), [&]() {
         const auto descriptor = LoadSampledImageDescriptor(state, access.mem.resource, access.slot);
         const auto color = state.module.AllocateId();
@@ -1569,7 +1572,10 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
             if (inst.Opcode() == IrOpcode::ImageRead && memory.dataBits == 32u) {
                 const auto value = state.module.AllocateId();
                 state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), value, ConstantU32(state, 0x76543210u), ConstantU32(state, 0xfedcba98u), ConstantU32(state, 0u), ConstantU32(state, 0u));
-                ctx.Define(inst, Select(state, TypeU32Vector(state, 4u), ctx.Arg(inst, 2u), value, ConstantU32CompositeZero(state, 4u)));
+                const auto active = ctx.Arg(inst, 2u);
+                const auto mapped = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 4u), mapped, active, active, active, active);
+                ctx.Define(inst, Select(state, TypeU32Vector(state, 4u), mapped, value, ConstantU32CompositeZero(state, 4u)));
             } else {
                 ctx.Fail(inst, "FMASK requires a 32-bit image read");
             }
@@ -1597,9 +1603,9 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         labels[index] = state.module.AllocateId();
         words.insert(words.end(), {index, labels[index]});
     }
+    std::vector<std::uint32_t> incoming;
     state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
     state.module.AddFunction(words);
-    std::vector<std::uint32_t> incoming;
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         EmitLabel(state, labels[index]);
         std::uint32_t modeMerge = 0u;

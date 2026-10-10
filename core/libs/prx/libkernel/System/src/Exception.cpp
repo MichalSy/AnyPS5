@@ -516,7 +516,7 @@ int APS5_VABI sceKernelRaiseException(Pthread thread, int signum) {
  if (handler == nullptr) throw std::runtime_error("sceKernelRaiseException: no handler installed for the signal");
  return RaiseOn(thread, handler, signum) ? 0 : SCE_KERNEL_ERROR_ESRCH;
 #else
- if (thread->nativeHandle == std::thread::native_handle_type{}) return SCE_KERNEL_ERROR_ESRCH;
+ if (thread->hostThread == pthread_t{}) return SCE_KERNEL_ERROR_ESRCH;
  BlockCallerSignal blocked;
  if (blocked.error != 0) return NativeError(blocked.error);
  std::scoped_lock lock(handlersLock, *NativeSignalRegistration_nid_no_patch());
@@ -525,7 +525,7 @@ int APS5_VABI sceKernelRaiseException(Pthread thread, int signum) {
  if (::sigaction(SIGUSR1, nullptr, &current) != 0) return NativeError(errno);
  if (!LinuxOwnsSignal(current)) return SCE_KERNEL_ERROR_EOPNOTSUPP;
  if (thread->_finished.load(std::memory_order_acquire)) return SCE_KERNEL_ERROR_ESRCH;
- return NativeError(::pthread_kill(thread->nativeHandle, SIGUSR1));
+ return NativeError(::pthread_kill(thread->hostThread, SIGUSR1));
 #endif
 }
 

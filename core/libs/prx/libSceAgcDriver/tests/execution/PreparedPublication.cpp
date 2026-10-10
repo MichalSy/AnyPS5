@@ -106,6 +106,60 @@ void Transactions() {
     Require(!partial && front.prepared->entries.size() == 200 && pixel->prepared->entries.size() == 200, "concurrent group publication was partial or lost an update");
 }
 
+void LazyPublication(AgcDriver::VulkanDevice& device) {
+    for (const bool invocation : {false, true}) {
+        for (const bool general : {false, true}) {
+            for (const bool commit : {false, true}) {
+                ShaderSnapshot snapshot{0x40000, 0x50000, 0, {0xbf810000u}, {std::byte{0}}};
+                RecompileRequest request{{ShaderStage::Compute, snapshot.codeAddress, snapshot.code, 0, {}}, {32, 0, {}, ShaderComputeStageInfo{{1, 1, 1}, 0, {false, false, false}, false, 0, {}}, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
+                if (general) snapshot.prepared->deferred = true;
+                else {
+                    std::vector<std::uint64_t> key;
+                    BuildPreparedShaderKey(request, key);
+                    snapshot.prepared->deferredCompute.push_back({0, std::move(key), {0, 0, 0}});
+                }
+                const auto prepare = [&] {
+                    if (invocation) static_cast<void>(InvocationFor(snapshot, 0, request));
+                    else static_cast<void>(SourceHandleFor(snapshot, 0, request));
+                };
+                {
+                    ShaderPreparationTransaction transaction;
+                    transaction.Edit(snapshot).rectangleRequested = true;
+                    prepare();
+                    prepare();
+                    Require(snapshot.prepared->entries.empty() && !snapshot.prepared->rectangleRequested, "lazy preparation published before its root transaction");
+                    Require(general || snapshot.prepared->deferredCompute.size() == 1, "lazy preparation consumed a live deferred marker before commit");
+                    const auto& staged = transaction.Read(snapshot);
+                    Require(staged.entries.size() == 1 && staged.deferredCompute.empty(), "lazy preparation lost or duplicated its staged artifact or deferred transition");
+                    if (commit) transaction.Commit();
+                }
+                Require(snapshot.prepared->entries.size() == static_cast<std::size_t>(commit), "lazy preparation lost its commit or survived a rollback");
+                Require(snapshot.prepared->rectangleRequested == commit, "lazy preparation split its root transaction publication");
+                Require(general || snapshot.prepared->deferredCompute.size() == static_cast<std::size_t>(!commit), "deferred consumption did not roll back with publication");
+            }
+        }
+    }
+    ShaderSnapshot snapshot{0x60000, 0x70000, 0, {0xbf810000u}, {std::byte{0}}};
+    snapshot.prepared->deferred = true;
+    RecompileRequest request{{ShaderStage::Compute, snapshot.codeAddress, snapshot.code, 0, {}}, {32, 0, {}, ShaderComputeStageInfo{{1, 1, 1}, 0, {false, false, false}, false, 0, {}}, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
+    static_cast<void>(SourceHandleFor(snapshot, 0, request));
+    std::future<void> cached;
+    {
+        ShaderPreparationTransaction transaction;
+        std::promise<void> entered;
+        auto started = entered.get_future();
+        cached = std::async(std::launch::async, [&] {
+            entered.set_value();
+            static_cast<void>(SourceHandleFor(snapshot, 0, request));
+            static_cast<void>(InvocationFor(snapshot, 0, request));
+        });
+        started.get();
+        Require(cached.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "cached lazy invocations waited for the preparation writer");
+        cached.get();
+        transaction.Commit();
+    }
+}
+
 void Registration(AgcDriver::VulkanDevice& device) {
     const std::array<std::uint32_t, 1> code{0xbf810000u};
     RecompileRequest request{{ShaderStage::Compute, 0x10000, code, 0, {}}, {32, 0, {}, ShaderComputeStageInfo{{1, 1, 1}, 0, {false, false, false}, false, 0, {}}, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
@@ -194,6 +248,7 @@ int main() {
         Transactions();
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        LazyPublication(*device);
         Registration(*device);
         std::cout << "shader publication and lifetime tests passed\n";
     } catch (const std::exception& error) {

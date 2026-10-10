@@ -5,6 +5,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include <array>
 #include "SceTypes.hpp"
 #include <chrono>
@@ -24,6 +25,7 @@
 #include <vector>
 #if defined(__linux__)
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <fstream>
 #include <string>
 #include <sys/mman.h>
@@ -291,6 +293,19 @@ static void CheckReleaseDirectMemoryClearsMappings() {
         VirtualQueryInfo next{};
         if (sceKernelVirtualQuery(view, 1, &next, sizeof(next)) == 0) Require(next.start != reinterpret_cast<std::uintptr_t>(view));
     }
+}
+
+static void CheckReleaseDirectMemoryRejectsInvalidRanges() {
+    constexpr std::size_t page = 0x4000;
+    Require(sceKernelReleaseDirectMemory(-1, page) == SCE_KERNEL_ERROR_EINVAL);
+    Require(sceKernelReleaseDirectMemory(0, 0) == SCE_KERNEL_ERROR_EINVAL);
+    Require(sceKernelReleaseDirectMemory(0, 1) == SCE_KERNEL_ERROR_EINVAL);
+    Require(sceKernelReleaseDirectMemory(0, page - 1) == SCE_KERNEL_ERROR_EINVAL);
+    Require(sceKernelReleaseDirectMemory(1, page) == SCE_KERNEL_ERROR_EINVAL);
+    Require(sceKernelReleaseDirectMemory(0, std::numeric_limits<std::size_t>::max()) == SCE_KERNEL_ERROR_EINVAL);
+    Require(sceKernelReleaseDirectMemory(0, DIRECT_MEMORY_SIZE + page) == SCE_KERNEL_ERROR_EINVAL);
+    Require(sceKernelReleaseDirectMemory(DIRECT_MEMORY_SIZE - page, page * 2) == SCE_KERNEL_ERROR_EINVAL);
+    Require(sceKernelReleaseDirectMemory(DIRECT_MEMORY_SIZE, page) == SCE_KERNEL_ERROR_EINVAL);
 }
 
 static void CheckFixedMappingReplacesPartialOverlap() {
@@ -1226,15 +1241,16 @@ static void CheckDirectMemorySharedBacking() {
     static_cast<volatile unsigned char*>(first)[page + 5] = 0x5a;
     int file = -1;
     std::uint64_t offset = 0;
+    const auto base = static_cast<std::uint64_t>(phys);
     Require(GuestArena::GuestArenaSharedBacking_nid_postfix(address + page, page, &file, &offset));
-    Require(offset == page * 2);
+    Require(offset == base + page * 2);
     unsigned char byte = 0;
     Require(pread(file, &byte, 1, static_cast<off_t>(offset + 5)) == 1 && byte == 0x5a);
     const int seals = fcntl(file, F_GET_SEALS);
     Require(seals >= 0 && (seals & F_SEAL_SHRINK) != 0 && (seals & F_SEAL_GROW) != 0);
     Require((fcntl(file, F_GETFD) & FD_CLOEXEC) != 0);
     close(file);
-    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(address, page * 2, &file, &offset) && offset == page);
+    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(address, page * 2, &file, &offset) && offset == base + page);
     close(file);
     Require(GuestArena::GuestArenaSharedBacking_nid_postfix(address + page + 0x1000, 0x1000, &file, &offset) && offset == page * 2 + 0x1000);
     close(file);
@@ -1248,11 +1264,11 @@ static void CheckDirectMemorySharedBacking() {
     Require(sceKernelMapDirectMemory(&low, page, 3, 0x10, phys, 0) == 0);
     void* high = static_cast<unsigned char*>(flexible) + page;
     Require(sceKernelMapDirectMemory(&high, page, 3, 0x10, phys + page, 0) == 0);
-    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(flexibleAddress, page * 2, &file, &offset) && offset == 0);
+    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(flexibleAddress, page * 2, &file, &offset) && offset == base);
     close(file);
     Require(sceKernelMapDirectMemory(&high, page, 3, 0x10, phys + page * 2, 0) == 0);
     Require(!GuestArena::GuestArenaSharedBacking_nid_postfix(flexibleAddress, page * 2, &file, &offset));
-    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(flexibleAddress + page, page, &file, &offset) && offset == page * 2);
+    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(flexibleAddress + page, page, &file, &offset) && offset == base + page * 2);
     close(file);
     Require(sceKernelMunmap(high, page) == 0);
     Require(!GuestArena::GuestArenaSharedBacking_nid_postfix(flexibleAddress + page, page, &file, &offset));
@@ -1260,6 +1276,38 @@ static void CheckDirectMemorySharedBacking() {
     Require(sceKernelMunmap(first, page * 2) == 0);
     Require(!GuestArena::GuestArenaSharedBacking_nid_postfix(address, page, &file, &offset));
     Require(sceKernelReleaseDirectMemory(phys, page * 3) == 0);
+
+    std::int64_t left = 0;
+    std::int64_t right = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &left) == 0);
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &right) == 0);
+    void* leftView = nullptr;
+    void* rightView = nullptr;
+    Require(sceKernelMapDirectMemory(&leftView, page, 3, 0, left, 0) == 0);
+    Require(sceKernelMapDirectMemory(&rightView, page, 3, 0, right, 0) == 0);
+    int leftFile = -1;
+    int rightFile = -1;
+    std::uint64_t leftOffset = 0;
+    std::uint64_t rightOffset = 0;
+    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(reinterpret_cast<std::uintptr_t>(leftView), page, &leftFile, &leftOffset) && leftOffset == static_cast<std::uint64_t>(left));
+    Require(GuestArena::GuestArenaSharedBacking_nid_postfix(reinterpret_cast<std::uintptr_t>(rightView), page, &rightFile, &rightOffset) && rightOffset == static_cast<std::uint64_t>(right));
+    struct stat leftInfo {};
+    struct stat rightInfo {};
+    Require(fstat(leftFile, &leftInfo) == 0 && fstat(rightFile, &rightInfo) == 0 && leftInfo.st_ino == rightInfo.st_ino && leftInfo.st_dev == rightInfo.st_dev);
+    close(leftFile);
+    close(rightFile);
+    std::memset(leftView, 0x77, page);
+    Require(sceKernelMunmap(leftView, page) == 0);
+    Require(sceKernelReleaseDirectMemory(left, page) == 0);
+    std::int64_t again = 0;
+    Require(sceKernelAllocateDirectMemory(left, left + static_cast<std::int64_t>(page), page, 0, 0, &again) == 0 && again == left);
+    void* againView = nullptr;
+    Require(sceKernelMapDirectMemory(&againView, page, 3, 0, again, 0) == 0);
+    for (std::size_t i = 0; i < page; ++i) Require(static_cast<const unsigned char*>(againView)[i] == 0);
+    Require(sceKernelMunmap(againView, page) == 0);
+    Require(sceKernelMunmap(rightView, page) == 0);
+    Require(sceKernelReleaseDirectMemory(again, page) == 0);
+    Require(sceKernelReleaseDirectMemory(right, page) == 0);
 }
 
 static void CheckDirectMemoryWriteWatch() {
@@ -1399,6 +1447,7 @@ int main() {
     CheckAudioCoprocessorProtection();
     CheckDirectMemoryFollowsPhysicalPages();
     CheckReleaseDirectMemoryClearsMappings();
+    CheckReleaseDirectMemoryRejectsInvalidRanges();
     CheckFixedMappingReplacesPartialOverlap();
     CheckDirectMemoryGpuProtBits();
     CheckFixedVirtualReservation();
