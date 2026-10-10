@@ -40,10 +40,10 @@ struct Module {
         }
     }
 };
-std::mutex modulesMutex;
-std::map<std::uintptr_t, std::shared_ptr<Module>> modules;
+std::mutex& modulesMutex = *new std::mutex();
+std::map<std::uintptr_t, std::shared_ptr<Module>>& modules = *new std::map<std::uintptr_t, std::shared_ptr<Module>>();
 std::uintptr_t nextHandle = 0x20000000;
-std::map<const void*, std::uintptr_t> imageIds;
+std::map<const void*, std::uintptr_t>& imageIds = *new std::map<const void*, std::uintptr_t>();
 struct ModuleStartContext {
     std::filesystem::path path;
     std::size_t args = 0;
