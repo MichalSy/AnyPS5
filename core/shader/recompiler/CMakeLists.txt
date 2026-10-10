@@ -236,7 +236,7 @@ function(add_shader_recompiler target runtimeTarget)
             SrgbDecodeBit
             SrgbUnormFormat
             ThreadOwned
-            WriteFileAtomically
+                    WriteFileAtomically
     )
     set(shaderCacheManifest)
     foreach(section IN ITEMS sources guard submodules includes reviewed)

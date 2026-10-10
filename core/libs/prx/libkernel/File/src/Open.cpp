@@ -5,6 +5,7 @@
 #include "prx/libc/include/GuestFileDescriptors.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
+#include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "SceTypes.hpp"
 
@@ -108,6 +109,7 @@ static int MapFlags(int sceFlags) {
 static int SceErrorFromGuest(int error) {
     return static_cast<int>(0x80020000u | static_cast<unsigned>(error));
 }
+extern "C" int* APS5_VABI __error_nid_postfix();
 
 static int SceErrorFromErrno(int error) {
     return SceErrorFromGuest(GuestFiles::GuestFileNativeError_nid_no_patch(error));
@@ -127,7 +129,11 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
 #ifdef _WIN32
     if (fd < 0 && errno != ENOENT && (flags & SCE_KERNEL_O_ACCMODE) == SCE_KERNEL_O_RDONLY) {
         std::error_code error;
-        if (std::filesystem::is_directory(native, error)) fd = File::OpenDirectoryDescriptor(native);
+        if (std::filesystem::is_directory(native, error)) {
+            if ((flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_EXCL)) == (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_EXCL)) errno = EEXIST;
+            else if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY || (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC))) errno = EISDIR;
+            else fd = File::OpenDirectoryDescriptor(native);
+        }
     }
 #endif
     if (fd < 0) return SceErrorFromErrno(errno);
@@ -143,6 +149,10 @@ int APS5_VABI sceKernelClose(int d) {
 }
 
 std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
+    if (d >= GuestSockets::FirstDescriptor) {
+        const auto n = GuestSockets::Read(d, buf, nbytes);
+        return n < 0 ? SceKernelError(*__error_nid_postfix()) : n;
+    }
     const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(d);
     if (!lease) return SceErrorFromGuest(errno);
     if (GuestFiles::GuestFileAccessMode_nid_no_patch(lease) == 1) return SCE_KERNEL_ERROR_EBADF;
@@ -154,6 +164,10 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
 }
 
 std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes) {
+    if (d >= GuestSockets::FirstDescriptor) {
+        const auto n = GuestSockets::Write(d, buf, nbytes);
+        return n < 0 ? SceKernelError(*__error_nid_postfix()) : n;
+    }
     const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(d);
     if (!lease) return SceErrorFromGuest(errno);
     if (GuestFiles::GuestFileAccessMode_nid_no_patch(lease) == 0) return SCE_KERNEL_ERROR_EBADF;
@@ -191,6 +205,9 @@ int APS5_VABI sceKernelUnlink(const char* path) {
         throw std::invalid_argument(std::string(__func__) + ": path is null");
     }
     auto native = ResolvePath_nid_no_patch(path);
+    constexpr int GuestEperm = 1;
+    std::error_code error;
+    if (std::filesystem::is_directory(std::filesystem::symlink_status(native, error))) return SceErrorFromErrno(GuestEperm);
     if (NativeUnlink(native) != 0) {
         return SceErrorFromErrno(errno);
     }

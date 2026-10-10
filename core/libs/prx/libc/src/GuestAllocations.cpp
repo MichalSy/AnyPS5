@@ -476,4 +476,14 @@ Lease GuestAllocationsAcquireRange_nid_postfix(const void* pointer, std::size_t 
     return result;
 }
 
+Lease GuestAllocationsAcquireAll_nid_postfix() {
+    std::lock_guard lock(registry().mutex);
+    Lease result;
+    result.reserve(registry().ranges.size());
+    for (const auto& [address, range] : registry().ranges) {
+        if (range->bytes != 0) result.push_back(range);
+    }
+    return result;
+}
+
 }
