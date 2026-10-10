@@ -106,7 +106,7 @@ static std::uint32_t QueueLevel(AudioOut2Context& context, Clock::time_point now
 static void DeviceCallback(void* userdata, Uint8* stream, int length);
 
 static void OpenDevice(AudioOut2Context& context) {
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+    if (!AudioOutEnsureSdlAudio()) {
         AUDIOOUT2_TRACE("SDL audio init failed: %s\n", SDL_GetError());
         return;
     }
@@ -134,7 +134,7 @@ static void CloseDevice(SDL_AudioDeviceID device) {
 }
 
 static void OpenPadDevice(AudioOut2Context& context) {
-    if (SDL_WasInit(SDL_INIT_AUDIO) == 0 && SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) return;
+    if (!AudioOutEnsureSdlAudio()) return;
     const int count = SDL_GetNumAudioDevices(0);
     for (int index = 0; index < count; index++) {
         const char* listed = SDL_GetAudioDeviceName(index, 0);
