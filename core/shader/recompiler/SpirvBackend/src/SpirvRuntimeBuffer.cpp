@@ -48,7 +48,15 @@ std::uint32_t nonzero(SpirvEmitterState& state, std::uint32_t value) {
 
 void faultIf(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t condition, std::uint32_t address, std::uint32_t bytes, BdaAbi::FaultReason reason) {
     auto& state = context.state;
-    EmitIfCondition(state, condition, [&] { RecordBdaFault(state, address, ConstantU32(state, bytes), BdaInstructionPc(state, instruction), reason); });
+    EmitIfCondition(state, condition, [&] {
+        if (state.program.Info().usesDma) {
+            RecordBdaFault(state, address, ConstantU32(state, bytes), BdaInstructionPc(state, instruction), reason);
+        } else {
+            const auto low = Unary(state, spv::OpUConvert, TypeU32(state), address);
+            const auto high = Unary(state, spv::OpUConvert, TypeU32(state), Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), address, BdaConstant(state, 32u)));
+            RecordBdaFaultWords(state, low, high, ConstantU32(state, bytes), BdaInstructionPc(state, instruction), reason);
+        }
+    });
     StopBdaInvocationIf(state, condition);
 }
 
@@ -589,6 +597,8 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
 std::uint32_t EmitRuntimeBufferAtomic(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t bits, std::uint32_t active, const std::function<std::uint32_t(std::uint32_t)>& operation) {
     auto& state = context.state;
     if (bits != 32u && bits != 64u) context.Fail(instruction, "unsupported runtime buffer atomic width");
+    if (std::ranges::find(state.supportedCapabilities, spv::CapabilityInt64) == state.supportedCapabilities.end()) context.Fail(instruction, "runtime buffer atomic addresses require shaderInt64");
+    state.module.EmitCapability(spv::CapabilityInt64);
     if (context.Memory(instruction).gpuDescriptor && (state.bdaAtomicPointerFunction == 0u || state.bdaNoteWriteFunction == 0u)) context.Fail(instruction, "BDA atomic functions are missing");
     const auto type = bits == 64u ? TypeU64(state) : TypeU32(state);
     const auto scalar = bits == 64u ? TypeScalarU64(state) : TypeU32(state);

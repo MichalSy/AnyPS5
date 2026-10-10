@@ -1839,6 +1839,77 @@ void verifyInt64AtomicCapabilities() {
     require(declares(compile(imageAtomic, spv::CapabilityInt64ImageEXT), spv::CapabilityInt64ImageEXT), "64-bit atomics: an image_atomic_swap on a 32_32 image does not declare Int64ImageEXT");
 }
 
+void verifyDescriptorAtomicFaults() {
+    using namespace ShaderRecompiler;
+    const std::array<std::uint32_t, 12> userData{0x1000u, 0x1234u, 256u, 0x31016facu, 0u, 0u, 0u, 0u, 0x1000u, 0x1234u, 0u, 0u};
+    const std::array<std::uint32_t, 2> logicalCapabilities{spv::CapabilityShader, spv::CapabilityInt64};
+    const std::array<std::uint32_t, 4> physicalCapabilities{spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::uint32_t, 5> atomic64Capabilities{spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityInt64Atomics, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    const std::vector<std::uint32_t> descriptorCode{0x7e020281u, 0xe0c85000u, 0x80000100u, 0xbf810000u};
+    const std::vector<std::uint32_t> physicalCode{0x7e140281u, 0x7e060280u, 0xdce88000u, 0x00080a03u, 0xbf810000u};
+    const auto compile = [&](const std::vector<std::uint32_t>& code, bool physical, std::span<const std::uint32_t> capabilities, std::uint32_t abi, std::uint32_t base = 0x1000u) {
+        auto data = userData;
+        data[0] = base;
+        auto request = FrontendRequest(code, data);
+        request.context.waveSize = 32u;
+        request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.bdaAbiVersion = abi;
+        request.target.supportedCapabilities = capabilities;
+        request.target.supportedExtensions = physical ? std::span<const std::string_view>(extensions) : std::span<const std::string_view>{};
+        request.useCache = false;
+        return Recompile(request);
+    };
+    const auto inspect = [&](const RecompileResult& result, bool physical, std::uint32_t atomicBits = 32u) {
+        const auto hasRole = [&](DescriptorRole role) {
+            return std::any_of(result.bindings.begin(), result.bindings.end(), [&](const DescriptorBinding& binding) { return binding.role == role; });
+        };
+        require(hasRole(DescriptorRole::FaultBuffer) && hasRole(DescriptorRole::BdaPagetable) == physical && result.bdaAbiVersion == BdaAbi::Version, "descriptor atomics: fault and table bindings do not match the address accesses");
+        const auto& words = result.spirv.Words();
+        std::map<std::uint32_t, std::string> names;
+        std::map<std::uint32_t, std::uint32_t> integerWidths;
+        std::uint32_t entryPoint = 0u;
+        bool int64 = false;
+        bool physicalPointers = false;
+        for (std::size_t cursor = 5u; cursor < words.size();) {
+            const auto count = words[cursor] >> 16u;
+            require(count != 0u && count <= words.size() - cursor, "descriptor atomics: truncated SPIR-V instruction");
+            const auto op = words[cursor] & 0xffffu;
+            if (op == spv::OpName && count >= 3u) names[words[cursor + 1u]] = reinterpret_cast<const char*>(&words[cursor + 2u]);
+            if (op == spv::OpEntryPoint) entryPoint = words[cursor + 2u];
+            if (op == spv::OpTypeInt) integerWidths[words[cursor + 1u]] = words[cursor + 2u];
+            if (op == spv::OpCapability && words[cursor + 1u] == spv::CapabilityInt64) int64 = true;
+            if (op == spv::OpCapability && words[cursor + 1u] == spv::CapabilityPhysicalStorageBufferAddresses) physicalPointers = true;
+            cursor += count;
+        }
+        require(int64 && physicalPointers == physical, "descriptor atomics: integer or address capabilities were lost");
+        std::size_t faultCalls = 0u;
+        std::uint32_t function = 0u;
+        bool atomic = false;
+        for (std::size_t cursor = 5u; cursor < words.size(); cursor += words[cursor] >> 16u) {
+            const auto op = words[cursor] & 0xffffu;
+            if (op == spv::OpFunction) function = words[cursor + 2u];
+            if (function == entryPoint && (op == spv::OpAtomicIAdd || op == spv::OpAtomicOr) && integerWidths[words[cursor + 1u]] == atomicBits) atomic = true;
+            if (op != spv::OpFunctionCall || names[words[cursor + 3u]] != "record_bda_fault") continue;
+            require((words[cursor] >> 16u) == (physical ? 8u : 9u), "descriptor atomics: the fault address does not use the matching full-width ABI");
+            ++faultCalls;
+        }
+        require(faultCalls != 0u && atomic, "descriptor atomics: alignment fault reporting or the entrypoint atomic was dropped");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+        static_cast<void>(ValidateAndOptimizeSpirv(words, 0x00401000u, 0x00010300u));
+#endif
+    };
+    inspect(compile(descriptorCode, false, logicalCapabilities, BdaAbi::Version), false);
+    inspect(compile(physicalCode, true, physicalCapabilities, BdaAbi::Version), true);
+    for (const auto offset : {0u, 4u}) {
+        const std::vector<std::uint32_t> descriptor64Code{0x7e000280u + offset, 0x7e040281u, 0x7e060280u, 0xe1485000u, 0x80000200u, 0xbf810000u};
+        inspect(compile(descriptor64Code, true, atomic64Capabilities, BdaAbi::Version, 0x1004u), true, 64u);
+    }
+    expectFailure([&] { static_cast<void>(compile(descriptorCode, false, logicalCapabilities, 0u)); }, "fault buffer needs the BDA fault ABI", "descriptor atomics: alignment faults compiled without a fault ABI");
+    expectFailure([&] { static_cast<void>(compile(descriptorCode, false, std::span(logicalCapabilities).first(1u), BdaAbi::Version)); }, "require shaderInt64", "descriptor atomics: full guest fault addresses compiled without shaderInt64");
+    expectFailure([&] { static_cast<void>(compile(physicalCode, true, logicalCapabilities, BdaAbi::Version)); }, "BDA requires unsupported SPIR-V capability", "descriptor atomics: physical addresses compiled without their capability");
+}
+
 void verifyUnnormalizedSamplers() {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t Format8888UNorm = 56;
@@ -2045,7 +2116,7 @@ void verifySrgbColorComparison() {
     expectFailure([&] { static_cast<void>(state()); }, "unsupported color comparison image instructions", "sRGB comparison: an indirect image was accepted");
     info.images[0].indirectRoot = ImageResource::NoIndirectImage;
     snapshot.images[0].dwords[3] = 0xa0000facu;
-    expectFailure([&] { static_cast<void>(state()); }, "only for 2D and 2D array views", "sRGB comparison: a 3D view was accepted");
+    expectFailure([&] { static_cast<void>(state()); }, "only for 2D, 2D array and cube views", "sRGB comparison: a 3D view was accepted");
     snapshot.images[0].dwords[3] = 0x90000fadu;
     expectFailure([&] { static_cast<void>(state()); }, "X channel is red", "sRGB comparison: a non-red comparison channel was accepted");
 }
@@ -2654,6 +2725,7 @@ int main(int argc, char** argv) {
         verifyComputedTexelOffsets();
         verifyShaderClockScopes();
         verifyInt64AtomicCapabilities();
+        verifyDescriptorAtomicFaults();
         verifyUnnormalizedSamplers();
         verifyUnusedUnnormalizedSampler();
         verifySrgbColorComparison();
