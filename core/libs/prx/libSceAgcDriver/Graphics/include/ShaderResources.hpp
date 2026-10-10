@@ -109,7 +109,7 @@ public:
     // then no other member may be used. `compute` and `snapshots` must outlive Complete(). An
     // address-based shader (BDA tables) builds entirely in Complete(): its lease acquisition
     // reconciles imports and refreshes mirrors, which needs the lock.
-    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred);
+    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0);
     void Complete();
     bool Completed() const { return completed; }
     ~ShaderResources();
@@ -304,7 +304,7 @@ private:
     // `written` is the element's DescriptorBinding::bufferWritten: a read-only element binds the
     // same way but is left out of the write set (no write-back, no pending-write note). `atomic`
     // is its bufferAtomic (see GuestBufferMemory::AddWritable).
-    std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic);
+    std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read);
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
@@ -425,6 +425,7 @@ private:
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
     bool drawBuild = false;
+    std::uint64_t dispatchThreads = 0;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
