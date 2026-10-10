@@ -75,7 +75,7 @@ static int NativeFchmod(int descriptor, int mode) {
 }
 static int NativeFtruncate(int descriptor, std::int64_t length) {
     const int error = static_cast<int>(::_chsize_s(descriptor, length));
-    if (error != 0) errno = error;
+    if (error != 0) errno = error == EACCES ? EINVAL : error;
     return error == 0 ? 0 : -1;
 }
 static int SetTimes(HANDLE handle, const KernelTimeval* times) {
@@ -152,7 +152,7 @@ std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_
     }
     if (!ok) {
         if (!write && error == ERROR_HANDLE_EOF) return 0;
-        errno = error == ERROR_ACCESS_DENIED ? EACCES : error == ERROR_INVALID_PARAMETER ? EINVAL : EIO;
+        errno = error == ERROR_ACCESS_DENIED ? EBADF : error == ERROR_INVALID_PARAMETER ? EINVAL : EIO;
         return -1;
     }
     return done;

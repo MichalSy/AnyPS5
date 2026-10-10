@@ -61,7 +61,7 @@ bool Allowed(const IrValue& value) {
     case IrOpcode::FPOrdEqual32: case IrOpcode::FPOrdGreaterThan32: case IrOpcode::FPOrdGreaterThanEqual32:
     case IrOpcode::FPOrdLessThanEqual32: case IrOpcode::FPRecip32: case IrOpcode::FPRecipSqrt32:
     case IrOpcode::FPSaturate32: case IrOpcode::FPSin: case IrOpcode::FPSqrt: case IrOpcode::FPSub32: case IrOpcode::FPTrunc32:
-    case IrOpcode::F32ProductIsTiny: case IrOpcode::SelectF32: case IrOpcode::SelectU32:
+    case IrOpcode::F32ProductIsTiny: case IrOpcode::SelectF32: case IrOpcode::SelectU32: case IrOpcode::SelectU1:
     case IrOpcode::IAdd32: case IrOpcode::IAdd64: case IrOpcode::IAddCarry32: case IrOpcode::IEqual32:
     case IrOpcode::IMul32: case IrOpcode::INotEqual32: case IrOpcode::ISub32:
     case IrOpcode::LogicalAnd: case IrOpcode::LogicalNot: case IrOpcode::LogicalOr:

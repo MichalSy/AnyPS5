@@ -986,6 +986,8 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
         Require(maxMip == 0 && (info & 0x10000000u) == 0, "mipmapped or DCC 3D color targets are unsupported");
         Require(slice < color.depth, "the color view slice is beyond the 3D surface");
         color.depthSlice = slice;
+    } else if ((attrib3 & 0x1fffu) != 0) {
+        Require(slice <= (attrib3 & 0x1fffu), "the color view slice is beyond the array surface");
     }
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
     color.elementBytes = decoded.elementBytes;
@@ -1005,6 +1007,10 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto high = read(cx, 0x390 + slot);
     Require((high & ~0xffu) == 0, "invalid color address extension");
     color.surfaceAddress = (static_cast<std::uint64_t>(high) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x318 + stride)) << 8u);
+    if (ColorTileModeIsXor(color.tileMode)) {
+        color.pipeBankXor = static_cast<std::uint32_t>(color.surfaceAddress & (ColorTileModeBlockBytes(color.tileMode) - 1u));
+        color.surfaceAddress -= color.pipeBankXor;
+    }
     if (slice != 0 && !volume) color.surfaceAddress += slice * ComputeSurfaceSize(ComputeElementMipLayout(ColorTextureTileMode(color.tileMode), color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount), 1);
     color.address = color.surfaceAddress + mipOffset;
     color.bytes = color.samples == VK_SAMPLE_COUNT_1_BIT ? colorLayout.Bytes() : MultisampleColorLayout(color.extent.width, color.extent.height, color.elementBytes, static_cast<std::uint32_t>(color.samples)).Bytes();

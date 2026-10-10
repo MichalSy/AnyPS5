@@ -616,6 +616,32 @@ void shaderUserDataTailPaddingTests() {
     Require(!info.fetchEmbedded, "a ShaderUserData block without trailing struct padding was rejected");
 }
 
+void ColorPipeBankXorTests() {
+    constexpr std::uint32_t side = 128;
+    constexpr std::size_t blockBytes = 65536;
+    static std::vector<std::byte> storage(2 * blockBytes + side * side * 4);
+    const auto block = (reinterpret_cast<std::uintptr_t>(storage.data()) + blockBytes - 1) / blockBytes * blockBytes;
+    auto queue = makeState();
+    queue.context[0x3b8] |= static_cast<std::uint32_t>(AgcDriver::Graphics::ColorTileMode::RenderTarget) << 14u;
+    queue.context[0x3b0] = ((side - 1u) << 14u) | (side - 1u);
+    for (const auto offset : {0xdu, 0x82u, 0x91u, 0x95u}) queue.context[offset] = (side << 16u) | side;
+    for (const std::uint32_t pipeBankXor : {0u, 0x5600u, 0xff00u}) {
+        const auto address = block + pipeBankXor;
+        queue.context[0x318] = static_cast<std::uint32_t>(address >> 8u);
+        queue.context[0x390] = static_cast<std::uint32_t>(address >> 40u);
+        const auto color = AgcDriver::Graphics::DecodeState(queue).color;
+        Require(color.address == block && color.surfaceAddress == block && color.pipeBankXor == pipeBankXor, "a SW_64KB_R_X color base did not split into its block base and pipe/bank XOR " + std::to_string(pipeBankXor));
+    }
+    queue.context[0x3b8] = 0x9000000u | (0x16u << 14u) | (0x14u << 19u);
+    for (const std::uint32_t pipeBankXor : {0u, 0xa00u, 0xf00u}) {
+        const auto address = block + 0x3000u + pipeBankXor;
+        queue.context[0x318] = static_cast<std::uint32_t>(address >> 8u);
+        queue.context[0x390] = static_cast<std::uint32_t>(address >> 40u);
+        const auto color = AgcDriver::Graphics::DecodeState(queue).color;
+        Require(color.tileMode == AgcDriver::Graphics::ColorTileMode::D4KBX && color.address == block + 0x3000u && color.pipeBankXor == pipeBankXor, "a SW_4KB_D_X color base did not split into its 4 KiB block base and pipe/bank XOR " + std::to_string(pipeBankXor));
+    }
+}
+
 void PixelInputLayoutTests() {
     using ShaderRecompiler::PixelInput;
     using ShaderRecompiler::PixelInputVgpr;
@@ -961,6 +987,11 @@ void DepthStencilTests() {
     queue.context[0x31b] = 1u | (1u << 13u);
     const auto slice = AgcDriver::Graphics::DecodeState(queue);
     Require(slice.color.address == sliced + 1024u && slice.color.bytes == 1024u, "a color view of one slice did not move the target by one slice");
+    queue.context[0x3b8] = 0x09000001;
+    const auto arraySlice = AgcDriver::Graphics::DecodeState(queue);
+    Require(arraySlice.color.address == sliced + 1024u && arraySlice.color.bytes == 1024u && arraySlice.color.depth == 1u, "a color view of one slice of a 2D array target did not move the target by one slice");
+    queue.context[0x31b] = 2u | (2u << 13u);
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "beyond the array surface");
     queue.context[0x3b8] = 0x0a000003;
     queue.context[0x31b] = 2u | (2u << 13u);
     const auto volume = AgcDriver::Graphics::DecodeState(queue);
@@ -3943,6 +3974,7 @@ int main() {
         ShaderStageTests();
         TuningFieldTests();
         PixelInputLayoutTests();
+        ColorPipeBankXorTests();
         ComputeScratchTests();
         shaderUserDataTailPaddingTests();
         InitialContextTests();

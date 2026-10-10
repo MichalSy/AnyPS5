@@ -4,11 +4,14 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 extern "C" {
 FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode);
+FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode, FileStream* stream);
 int APS5_VABI fclose_nid_postfix(FileStream* stream);
 std::size_t APS5_VABI fread_nid_postfix(void* buffer, std::size_t size, std::size_t count, FileStream* stream);
 std::size_t APS5_VABI fwrite_nid_postfix(const void* buffer, std::size_t size, std::size_t count, FileStream* stream);
@@ -34,8 +37,8 @@ static void ExpectException(TAction action) {
 
 int main(int argc, char** argv) {
     Require(argc == 2);
-    Require(_Stdout_nid_postfix.GetHandle() == stdout);
-    Require(_Stderr_nid_postfix.GetHandle() == stderr);
+    Require(_Stdout_nid_postfix.GetHandle() != nullptr && _Stdout_nid_postfix.Descriptor() == 1);
+    Require(_Stderr_nid_postfix.GetHandle() != nullptr && _Stderr_nid_postfix.Descriptor() == 2);
     Require(fputs_nid_postfix("stdout object works\n", &_Stdout_nid_postfix) >= 0);
     Require(fputs_nid_postfix("stderr object works\n", &_Stderr_nid_postfix) >= 0);
     Require(fflush_nid_postfix(nullptr) == 0);
@@ -53,20 +56,44 @@ int main(int argc, char** argv) {
     Require(fread_nid_postfix(buffer.data(), 1, buffer.size(), stream) == buffer.size());
     Require(std::strcmp(buffer.data(), payload) == 0);
     Require(fread_nid_postfix(buffer.data(), 1, buffer.size(), stream) == 0);
-    ExpectException([&] { fputs_nid_postfix(nullptr, stream); });
+    errno = 0;
+    Require(fputs_nid_postfix(nullptr, stream) == EOF && errno == EINVAL);
     ExpectException([&] { fwrite_nid_postfix(nullptr, 1, sizeof(payload), stream); });
     errno = 0;
     Require(fseek_nid_postfix(stream, 0, -1) == -1);
     Require(errno == EINVAL);
     Require(fclose_nid_postfix(stream) == 0);
-    ExpectException([] { fputs_nid_postfix("invalid stream", nullptr); });
-    ExpectException([] { fopen_nid_postfix(nullptr, "r"); });
+    errno = 0;
+    Require(fputs_nid_postfix("invalid stream", nullptr) == EOF && errno == EINVAL);
+    errno = 0;
+    Require(fopen_nid_postfix(nullptr, "r") == nullptr && errno == EINVAL);
     FileStream closed(std::tmpfile());
     closed.Close();
-    ExpectException([&] { fflush_nid_postfix(&closed); });
+    errno = 0;
+    Require(fflush_nid_postfix(&closed) == EOF && errno == EBADF);
     Require(std::remove(argv[1]) == 0);
     errno = 0;
     Require(fopen_nid_postfix(argv[1], "rb") == nullptr);
     Require(errno == ENOENT);
+    const std::u8string unicodeName = u8"セーブé.tmp";
+    const std::string guestName(unicodeName.begin(), unicodeName.end());
+    const std::filesystem::path hostName(unicodeName);
+    constexpr char unicodePayload[] = "unicode";
+    stream = fopen_nid_postfix(guestName.c_str(), "wb");
+    Require(stream != nullptr);
+    Require(fwrite_nid_postfix(unicodePayload, 1, sizeof(unicodePayload), stream) == sizeof(unicodePayload));
+    Require(fclose_nid_postfix(stream) == 0);
+    Require(std::filesystem::exists(hostName));
+    Require(std::filesystem::file_size(hostName) == sizeof(unicodePayload));
+    stream = fopen_nid_postfix(guestName.c_str(), "rb");
+    Require(stream != nullptr);
+    std::array<char, sizeof(unicodePayload)> unicodeBuffer{};
+    Require(fread_nid_postfix(unicodeBuffer.data(), 1, unicodeBuffer.size(), stream) == unicodeBuffer.size());
+    Require(std::strcmp(unicodeBuffer.data(), unicodePayload) == 0);
+    stream = freopen_nid_postfix(guestName.c_str(), "wb", stream);
+    Require(stream != nullptr);
+    Require(fclose_nid_postfix(stream) == 0);
+    Require(std::filesystem::file_size(hostName) == 0);
+    std::filesystem::remove(hostName);
     std::cout << "PASS: stream objects, file operations, EOF and error handling\n";
 }

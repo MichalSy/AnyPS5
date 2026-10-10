@@ -4,7 +4,10 @@
 #include "GuestFileDescriptors.hpp"
 #include <cstdio>
 #include <cerrno>
+#include <filesystem>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <cstdint>
 #include <cstddef>
@@ -56,7 +59,7 @@ public:
     int Descriptor();
     bool IsDynamic() const { return dynamic; }
     GuestFilePrefix& GuestState() { return _guest; }
-    bool Reopen(const char* filename, const char* mode);
+    bool Reopen(const std::filesystem::path& filename, const char* mode);
     void SyncStatus();
     void SetEncodingError();
     void ClearError();

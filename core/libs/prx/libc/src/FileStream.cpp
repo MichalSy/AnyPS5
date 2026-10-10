@@ -145,11 +145,19 @@ int FileStream::Descriptor() {
     return state->descriptor;
 }
 
-bool FileStream::Reopen(const char* filename, const char* mode) {
+bool FileStream::Reopen(const std::filesystem::path& filename, const char* mode) {
+#ifdef _WIN32
+    std::wstring wideMode;
+    for (const char character : std::string_view(mode)) wideMode.push_back(static_cast<unsigned char>(character));
+#endif
     if (!GetHandle()) return false;
     const auto expected = state->identity;
     auto* previous = std::exchange(state->handle, nullptr);
-    std::unique_ptr<std::FILE, decltype(&std::fclose)> replacement(std::freopen(filename, mode, previous), std::fclose);
+#ifdef _WIN32
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> replacement(::_wfreopen(filename.c_str(), wideMode.c_str(), previous), std::fclose);
+#else
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> replacement(std::freopen(filename.c_str(), mode, previous), std::fclose);
+#endif
     const int openError = errno;
     if (!replacement) {
         GuestFiles::GuestFileCloseMatching_nid_no_patch(expected);
