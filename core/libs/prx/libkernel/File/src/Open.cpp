@@ -5,6 +5,7 @@
 #include "prx/libc/include/GuestFileDescriptors.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
+#include "prx/libkernel/File/include/FileLock.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "SceTypes.hpp"
@@ -51,6 +52,7 @@ static int NativeWrite(int fd, const void* buf, std::size_t n) {
 }
 static void NativeCleanup(int fd) noexcept {
     File::ForgetDirectoryDescriptor(fd);
+    File::ForgetFileLock(fd);
 }
 static int NativeUnlink(const std::filesystem::path& p) {
     return ::_wunlink(p.wstring().c_str());

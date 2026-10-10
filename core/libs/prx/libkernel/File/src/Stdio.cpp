@@ -10,6 +10,7 @@
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
+#include "prx/libkernel/File/include/FileLock.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include <cerrno>
@@ -110,25 +111,14 @@ static int NativeFutimes(int descriptor, const KernelTimeval* times) {
     }
     return result;
 }
-static int NativeFlock(int descriptor, int operation) {
-    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
-    if (handle == INVALID_HANDLE_VALUE) {
-        errno = EBADF;
-        return -1;
-    }
-    OVERLAPPED overlapped{};
-    BOOL ok;
-    if (operation & 8) {
-        ok = ::UnlockFileEx(handle, 0, MAXDWORD, MAXDWORD, &overlapped);
-    } else {
-        DWORD flags = 0;
-        if (operation & 2) flags |= LOCKFILE_EXCLUSIVE_LOCK;
-        if (operation & 4) flags |= LOCKFILE_FAIL_IMMEDIATELY;
-        ok = ::LockFileEx(handle, flags, 0, MAXDWORD, MAXDWORD, &overlapped);
-    }
-    if (ok) return 0;
+static int NativeFlock(const GuestFiles::Lease& lease, int operation) {
+    if (File::Flock(lease, operation) == 0) return 0;
     const auto error = ::GetLastError();
-    errno = error == ERROR_LOCK_VIOLATION ? EAGAIN : error == ERROR_ACCESS_DENIED ? EACCES : EIO;
+    errno = error == ERROR_LOCK_VIOLATION ? EAGAIN
+        : error == ERROR_ACCESS_DENIED ? EACCES
+        : error == ERROR_INVALID_HANDLE ? EBADF
+        : error == ERROR_INVALID_PARAMETER ? EINVAL
+        : error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY ? ENOMEM : EIO;
     return -1;
 }
 std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
@@ -218,8 +208,8 @@ static int NativeFutimes(int descriptor, const KernelTimeval* times) {
         {static_cast<time_t>(times[1].tv_sec), static_cast<suseconds_t>(times[1].tv_usec)}};
     return ::futimes(descriptor, values);
 }
-static int NativeFlock(int descriptor, int operation) {
-    return ::flock(descriptor, operation);
+static int NativeFlock(const GuestFiles::Lease& lease, int operation) {
+    return ::flock(GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease), operation);
 }
 static std::int64_t NativePread(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset) {
     return static_cast<std::int64_t>(::pread(descriptor, buf, nbytes, static_cast<off_t>(offset)));
@@ -337,7 +327,9 @@ int APS5_VABI _close_nid_postfix(int descriptor) {
 int APS5_VABI flock_nid_postfix(int d, int operation) {
     const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(d);
     if (!lease) return -1;
-    return NativeFlock(GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease), operation) == 0 ? 0 : PosixFailure(GuestFiles::GuestFileNativeError_nid_no_patch(errno));
+    const int type = operation & 8 ? 8 : operation & 2 ? 2 : operation & 1 ? 1 : 0;
+    if (type == 0) return PosixFailure(GUEST_EBADF);
+    return NativeFlock(lease, type | (operation & 4)) == 0 ? 0 : PosixFailure(GuestFiles::GuestFileNativeError_nid_no_patch(errno));
 }
 
 int64_t APS5_VABI fstat_nid_disambig1_nid_postfix(int d, FileStat* sb) {
