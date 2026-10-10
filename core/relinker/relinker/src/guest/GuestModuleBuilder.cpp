@@ -49,7 +49,7 @@ std::string ModuleStem(std::string name, const bool windows) {
 
 }
 
-std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, const bool windows, const bool macos, const bool toIntel, ISyscallScanner& syscallScanner, const bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& sceModulePath) const {
+std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, const bool windows, const bool macos, const bool toIntel, ISyscallScanner& syscallScanner, const bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& sceModulePath, const bool recursiveModuleSearch) const {
     const auto root = std::filesystem::absolute(sceModulePath).lexically_normal();
     if (!std::filesystem::exists(root)) throw Domain::RelinkerException("Guest module parent directory does not exist: " + root.string());
     if (!std::filesystem::is_directory(root)) throw Domain::RelinkerException("Guest module parent path is not a directory: " + root.string());
@@ -109,6 +109,33 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         });
     };
     for (const auto& path : paths) discovered.emplace(path, GuestImageReader().Read(path, reader.Read(path.string())));
+    if (recursiveModuleSearch && !missingNeeded.empty()) {
+        std::set<std::string> unresolved;
+        for (const auto& name : missingNeeded) {
+            const auto folded = FoldFilename(name);
+            const bool known = std::any_of(discovered.begin(), discovered.end(), [&](const auto& candidate) {
+                const auto& image = candidate.second;
+                return FoldFilename(image.SourcePath.filename().string()) == folded ||
+                    FoldFilename(image.Soname) == folded || matchesIdentity(name, image.ModuleNames);
+            });
+            if (!known) unresolved.insert(name);
+        }
+        std::map<std::string, std::filesystem::path> found;
+        for (auto it = unresolved.empty() ? std::filesystem::recursive_directory_iterator() : std::filesystem::recursive_directory_iterator(root); it != std::filesystem::recursive_directory_iterator(); ++it) {
+            if (it->is_directory() && std::find(directories.begin(), directories.end(), it->path()) != directories.end()) {
+                it.disable_recursion_pending();
+                continue;
+            }
+            const auto name = it->path().filename().string();
+            if (!unresolved.contains(name) || !it->is_regular_file() || !isGuestImage(it->path())) continue;
+            const auto [previous, inserted] = found.emplace(name, it->path());
+            if (!inserted) throw Domain::RelinkerException("Ambiguous needed module: " + previous->second.string() + " and " + it->path().string());
+        }
+        for (const auto& [name, path] : found) {
+            paths.push_back(path);
+            discovered.emplace(path, GuestImageReader().Read(path, reader.Read(path.string())));
+        }
+    }
     if (!unmatchedExclusions.empty()) throw Domain::RelinkerException("Excluded guest module file not found: " + *unmatchedExclusions.begin());
     std::sort(paths.begin(), paths.end());
     paths.erase(std::unique(paths.begin(), paths.end()), paths.end());

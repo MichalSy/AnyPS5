@@ -98,17 +98,37 @@ def main():
         work = Path(directory)
         check_guest_needed(relinker, work)
 
-        def convert(case, windows, needed=NEEDED, repeats=1):
+        def convert(case, windows, needed=NEEDED, repeats=1, options=()):
             if not (case / "sce_modules").exists():
                 (case / "sce_module").mkdir(parents=True, exist_ok=True)
             source = case / "input.elf"
             source.write_bytes(executable_with_needed(needed, repeats))
             output = case / ("output.exe" if windows else "output.elf")
-            result = subprocess.run([str(relinker), *(["--windows"] if windows else []), str(source), str(output)],
+            result = subprocess.run([str(relinker), *(["--windows"] if windows else []), *options, str(source), str(output)],
                                     capture_output=True, text=True, timeout=30)
             return result, output
 
         for windows in (False, True):
+            case = work / f"{windows}-recursive"
+            nested = case / "Media" / "Modules"
+            nested.mkdir(parents=True)
+            module = nested / "needed.prx"
+            original = module_with_symbol(True)
+            module.write_bytes(original)
+            (nested / "unrelated.prx").write_bytes(original)
+            result, output = convert(case, windows)
+            assert result.returncode == 0 and not (case / "app0").exists(), result.stderr
+            if not windows:
+                assert needed_libraries(output.read_bytes()) == ["needed.prx"]
+            result, output = convert(case, windows, options=("--recursive-module-search",))
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            artifact = case / "app0" / "Media" / "Modules" / "needed.prx.guest.prx"
+            assert list((case / "app0").rglob("*.guest.prx")) == [artifact], artifact
+            assert artifact.read_bytes().startswith(b"MZ" if windows else b"\x7fELF"), artifact
+            assert module.read_bytes() == original and (nested / "unrelated.prx").read_bytes() == original
+            if not windows:
+                assert needed_libraries(output.read_bytes()) == ["$ORIGIN/app0/Media/Modules/needed.prx.guest.prx"]
+
             for label, dependency, filename, soname in (
                     ("filename-case", b"Party.prx", "party.prx", None),
                     ("soname-case", b"pArTy.prx", "provider.prx", b"Party.prx")):
@@ -224,6 +244,10 @@ def main():
             assert not list((case / "app0").rglob("*.guest.prx"))
             if not windows:
                 assert needed_libraries(output.read_bytes()) == ["needed.debug_prx" if "debug-name" in case.name else "needed.prx"]
+            output.unlink()
+            result, output = convert(case, windows, options=("--recursive-module-search",))
+            assert result.returncode == 2 and "Ambiguous needed module" in result.stderr, result.stderr
+            assert not output.exists() and not (case / "app0").exists(), output
         case = work / "macos-repeated-system"
         (case / "sce_module").mkdir(parents=True)
         source = case / "input.elf"

@@ -11,6 +11,7 @@ struct Args {
     bool showHelp = false;
     bool skipSyscallCheck = false;
     bool skipSceModule = false;
+    bool recursiveModuleSearch = false;
     bool toIntel = false;
     bool writeRegistry = false;
     bool toWindows = false;

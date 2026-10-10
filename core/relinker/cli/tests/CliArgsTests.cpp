@@ -52,7 +52,7 @@ void defaults() {
     const auto args = parse({"input.elf", "output.elf"});
     require(args.inputPath == "input.elf", "input path was not captured");
     require(args.outputPath == "output.elf", "output path was not captured");
-    require(!args.skipSyscallCheck && !args.skipSceModule && !args.toIntel && !args.writeRegistry &&
+    require(!args.skipSyscallCheck && !args.skipSceModule && !args.recursiveModuleSearch && !args.toIntel && !args.writeRegistry &&
         !args.toWindows && !args.lazyBinding && !args.autorun && !args.windowsDiagnostics && !args.windowsGui,
         "a flag defaulted to true");
     require(args.unusedFilterLevel == 0u, "unused filter level did not default to 0");
@@ -77,7 +77,8 @@ void booleanFlags() {
 }
 
 void positionalsInterleaveWithFlags() {
-    const auto args = parse({"--windows", "input.elf", "--registry", "output.elf", "--autorun"});
+    const auto args = parse({"--windows", "input.elf", "--registry", "output.elf", "--autorun", "--recursive-module-search"});
+    require(args.recursiveModuleSearch, "--recursive-module-search was ignored");
     require(args.toWindows && args.writeRegistry && args.autorun, "a flag after a positional was ignored");
     require(args.inputPath == "input.elf" && args.outputPath == "output.elf", "positionals were misordered around flags");
 }
@@ -124,6 +125,8 @@ void excludeConflictsWithSkip() {
     const std::string message = "--exclude-sce-module conflicts with --skip-sce-module";
     expectThrows({"--skip-sce-module", "--exclude-sce-module", "m", "input.elf", "output.elf"}, message);
     expectThrows({"--exclude-sce-module", "m", "--skip-sce-module", "input.elf", "output.elf"}, message);
+    expectThrows({"--recursive-module-search", "--skip-sce-module", "input.elf", "output.elf"},
+        "--recursive-module-search conflicts with --skip-sce-module");
 }
 
 void unusedFilter() {
