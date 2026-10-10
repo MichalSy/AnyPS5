@@ -118,7 +118,7 @@ public:
         Require(Address() % 65536u == 0 && AgcDriver::GuestMemory::Watched(Address(), StorageBytes), "the color surface must be aligned and genuinely write-watched");
         {
             GuestAllocations::Mutation mutation;
-            mutation.Add(data, allocationBytes, true, true);
+            mutation.Add(data, allocationBytes, true, true, true);
         }
         Require(AgcDriver::GuestMemory::CollectWritesUncached(Address(), StorageBytes) != 0, "the watched color surface must have a nonzero tracker generation");
     }
@@ -638,7 +638,7 @@ void LifetimeTests(AgcDriver::VulkanDevice& device, std::unique_lock<AgcDriver::
         Draw(device, Target(clean, VK_FORMAT_R8G8B8A8_UNORM), Whole, 0);
         Flush(device, clean);
         GuestAllocations::Mutation mutation;
-        mutation.Protect(clean.data + StorageBytes, pieceBytes, true, false, [&] {
+        mutation.Protect(clean.data + StorageBytes, pieceBytes, true, false, true, [&] {
             Check(clean, baseline, "a clean multisample lease releases for a mutation outside its target in the same backing range");
 #ifdef _WIN32
             GuestArena::GuestArenaSetProtection_nid_postfix(clean.Address() + StorageBytes, pieceBytes, PAGE_READONLY);
@@ -652,7 +652,7 @@ void LifetimeTests(AgcDriver::VulkanDevice& device, std::unique_lock<AgcDriver::
     const auto target = Target(block, VK_FORMAT_B8G8R8A8_SRGB);
     const auto protect = [&](std::size_t offset, bool writable) {
         GuestAllocations::Mutation mutation;
-        mutation.Protect(block.data + offset, pieceBytes, true, writable, [&] {
+        mutation.Protect(block.data + offset, pieceBytes, true, writable, true, [&] {
             Check(block, expected, "pending multisample samples are published before backing protection changes");
             Require(!AgcDriver::Graphics::AnyPendingMultisampleColors(block.Address(), StorageBytes), "backing protection must release the pending multisample lease after publication");
 #ifdef _WIN32
@@ -693,7 +693,7 @@ void LifetimeTests(AgcDriver::VulkanDevice& device, std::unique_lock<AgcDriver::
         GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(pointer, bytes);
 #endif
         GuestAllocations::Mutation mutation;
-        mutation.Add(pointer, bytes, true, true);
+        mutation.Add(pointer, bytes, true, true, true);
     };
     Draw(device, target, Partial, VK_COLOR_COMPONENT_G_BIT, 0x55u);
     ExpectWrite(expected, target.format, Partial, VK_COLOR_COMPONENT_G_BIT, 0x55u);

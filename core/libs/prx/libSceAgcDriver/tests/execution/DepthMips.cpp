@@ -180,7 +180,7 @@ public:
         Require(data != nullptr, "cannot allocate the guest surface");
         commit(bytes);
         GuestAllocations::Mutation mutation;
-        mutation.Add(data, bytes, true, true);
+        mutation.Add(data, bytes, true, true, true);
     }
     ~GuestBlock() {
         {
@@ -194,7 +194,7 @@ public:
     std::uint64_t Address() const { return reinterpret_cast<std::uintptr_t>(data); }
     void Protect(bool writable) {
         GuestAllocations::Mutation mutation;
-        mutation.Protect(data, mappedBytes, true, writable, [&] {
+        mutation.Protect(data, mappedBytes, true, writable, true, [&] {
             GuestArena::GuestArenaSetProtection_nid_postfix(Address(), mappedBytes, writable ? 0x04u : 0x02u);
         });
     }
@@ -205,7 +205,7 @@ public:
         }
         commit(mappedBytes);
         GuestAllocations::Mutation mutation;
-        mutation.Add(data, mappedBytes, true, true);
+        mutation.Add(data, mappedBytes, true, true, true);
     }
     std::byte* data = nullptr;
 

@@ -2,6 +2,7 @@
 #include "Triangle_vert_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -208,6 +209,22 @@ public:
                 extensionsEnabled.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
                 minLod.pNext = address.pNext;
                 address.pNext = &minLod;
+            }
+            VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dynamicState{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+            VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT library{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, &dynamicState};
+            if (std::getenv("APS5_NO_GPL") == nullptr && hasExtension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && hasExtension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) && hasExtension(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &library};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT libraryProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+                VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &libraryProperties};
+                function<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(context.physical, &properties);
+                context.graphicsPipelineLibrary = library.graphicsPipelineLibrary == VK_TRUE && dynamicState.extendedDynamicState == VK_TRUE && libraryProperties.graphicsPipelineLibraryFastLinking == VK_TRUE;
+            }
+            library = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, &dynamicState, VK_TRUE};
+            dynamicState = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT, address.pNext, VK_TRUE};
+            if (context.graphicsPipelineLibrary) {
+                extensionsEnabled.insert(extensionsEnabled.end(), {VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME});
+                address.pNext = &library;
             }
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             device.queueCreateInfoCount = 1;
@@ -757,7 +774,7 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr) {
@@ -831,7 +848,7 @@ void remappedImportTests(const Device& device) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     if (HostImportFor(context, address, bytes) == nullptr) {
         std::cout << "host import of the remap test block refused: remapped imports not tested\n";
@@ -842,7 +859,7 @@ void remappedImportTests(const Device& device) {
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(block);
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     Require(HostImportFor(context, address, bytes) != nullptr, "the remapped range was not imported again");
     const auto second = HostImportSerial(context, address, bytes, true);
@@ -876,7 +893,7 @@ void movedMetadataTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -969,7 +986,7 @@ void viewPastLastMipTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -1053,7 +1070,7 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     if (HostImportFor(context, address, bytes) == nullptr) {
         std::cout << "host import of the test block refused: resource read notes not tested\n";
@@ -1161,7 +1178,7 @@ void misalignedRegionTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -1387,7 +1404,7 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -1462,7 +1479,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -1614,7 +1631,7 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     alignas(64) static std::byte other[64];
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(other, sizeof(other), true, true);
+        mutation.Add(other, sizeof(other), true, true, true);
     }
     {
         GuestAllocations::Mutation mutation;
@@ -1659,7 +1676,7 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -1731,7 +1748,7 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -1885,7 +1902,7 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(block);
-        mutation.Add(block, static_cast<std::size_t>(5 * unit), true, true);
+        mutation.Add(block, static_cast<std::size_t>(5 * unit), true, true, true);
     }
     Require(HostImportFor(context, address, bytes) == nullptr, "a shrunk registration still imports the old range");
     Require(!AnyShadowedOverlaps(address, bytes), "the retired import's shadow survived");
@@ -1928,7 +1945,7 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -2115,7 +2132,7 @@ void hostImportUnmapTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     const HostImport* imported = nullptr;
     {
@@ -2189,7 +2206,7 @@ void importWatchTests(const Device& device) {
     };
     const auto registerRange = [](void* block, std::size_t bytes) {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     };
     const auto unregisterRange = [](void* block) {
         GuestAllocations::Mutation mutation;
@@ -2293,7 +2310,7 @@ void staleGenerationTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -2435,7 +2452,7 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
         const auto address = blockAddress + test.offset;
         {
             GuestAllocations::Mutation mutation;
-            mutation.Add(block, bytes, true, true);
+            mutation.Add(block, bytes, true, true, true);
         }
         struct Unregister {
             const Context& context;
@@ -2538,7 +2555,7 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
             const auto address = blockAddress + offset;
             {
                 GuestAllocations::Mutation mutation;
-                mutation.Add(block, bytes, true, true);
+                mutation.Add(block, bytes, true, true, true);
             }
             struct Unregister {
                 const Context& context;
@@ -2662,7 +2679,7 @@ void importWindowTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -3050,7 +3067,7 @@ void pendingKeyStoreTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -3117,7 +3134,7 @@ void sampleDumpTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -3189,7 +3206,7 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -4115,7 +4132,7 @@ void keysFillTests(const Device& device, Recorder& recorder) {
     const auto keysAddress = address + surfaceBytes;
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -4225,7 +4242,7 @@ void denormalClearTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -4301,6 +4318,60 @@ void denormalClearTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+void pipelineLibraryTests(const Device& device) {
+    std::lock_guard gpu(GpuMutex());
+    const auto& context = device.GetContext();
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearCachedPipelines(device); }
+    } cleanup{context.device};
+    ClearCachedPipelines(context.device);
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 11;
+    fragment.variantId = 12;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.hasColorTarget = true;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.colors.push_back(state.color);
+    state.blend.colorWriteMask = 15;
+    state.blends.push_back(state.blend);
+    ShaderResources resources(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), 0, 0);
+    VertexInputLayout input;
+    const auto lookup = [&] { return CachedPipeline(context, state, input, resources, shaders, VK_IMAGE_LAYOUT_GENERAL); };
+    const auto counters = [&] { return PipelineLibraryCountersOf(context.device); };
+    const auto first = lookup();
+    if (!context.graphicsPipelineLibrary) {
+        Require(counters().linked == 0, "a pipeline was linked from libraries without VK_EXT_graphics_pipeline_library");
+        std::cout << "graphics pipeline libraries unavailable or disabled: pipelines are created whole\n";
+        return;
+    }
+    const auto built = counters();
+    Require(built.linked == 1 && built.built == std::array<std::uint64_t, 4>{1, 1, 1, 1}, "the first pipeline was not linked from four new libraries");
+    state.blends.front().blendEnable = VK_TRUE;
+    state.blends.front().srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    state.blends.front().dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    const auto blended = lookup();
+    Require(blended != first && counters().built == std::array<std::uint64_t, 4>{1, 1, 1, 2}, "a blend change rebuilt more than the fragment output library");
+    state.cullMode = VK_CULL_MODE_BACK_BIT;
+    state.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    const auto culled = lookup();
+    Require(culled != blended && counters().built == std::array<std::uint64_t, 4>{1, 1, 1, 2}, "a cull mode change rebuilt a library instead of setting dynamic state");
+    input.bindings.push_back({0, 16, VK_VERTEX_INPUT_RATE_VERTEX});
+    input.attributes.push_back({0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0});
+    static_cast<void>(lookup());
+    Require(counters().built == std::array<std::uint64_t, 4>{2, 1, 1, 2} && counters().linked == 4, "a vertex input change rebuilt more than the vertex input library");
+    fragment.variantId = 13;
+    static_cast<void>(lookup());
+    Require(counters().built == std::array<std::uint64_t, 4>{2, 1, 2, 2}, "a new pixel shader rebuilt more than the fragment shader library");
+    ClearCachedPipelines(context.device);
+    Require(counters().linked == 0, "clearing the pipelines kept the device's libraries");
+    std::cout << "Pipeline library reuse tests passed\n";
+}
+
 int main(int argc, char** argv) {
     try {
         std::unique_ptr<Device> created;
@@ -4312,6 +4383,10 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-only") {
+            pipelineLibraryTests(device);
+            return 0;
+        }
         if (argc == 2 && (std::string_view(argv[1]) == "--benchmark-pipeline-cache" || std::string_view(argv[1]) == "--pipeline-cache-only")) {
             pipelineCacheTests(device, std::string_view(argv[1]) == "--benchmark-pipeline-cache");
             return 0;

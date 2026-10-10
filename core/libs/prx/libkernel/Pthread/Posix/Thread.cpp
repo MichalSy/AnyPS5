@@ -3,6 +3,7 @@
 #include <cstring>
 #include "SceTypes.hpp"
 #include "../include/ThreadLifecycle.hpp"
+#include "../include/Cancel.hpp"
 #include "prx/libc/include/General.hpp"
 #include "../include/Pthread.hpp"
 #include "Common.hpp"
@@ -18,6 +19,7 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval);
 int APS5_VABI scePthreadRename(Pthread thread, const char* name);
 int APS5_VABI scePthreadGetname(Pthread thread, char* name);
 Pthread APS5_VABI scePthreadSelf();
+int APS5_VABI scePthreadCancel(Pthread thread);
 int APS5_VABI scePthreadSetcancelstate(int state, int* old_state);
 int APS5_VABI scePthreadSetcanceltype(int type, int* old_type);
 void APS5_VABI scePthreadTestcancel();
@@ -103,13 +105,15 @@ int APS5_VABI sched_yield_nid_postfix(void) {
     return 0;
 }
 
+int APS5_VABI pthread_cancel_nid_postfix(Pthread thread) {
+    return PosixThread::ToErrno(scePthreadCancel(thread));
+}
+
 int APS5_VABI pthread_setcancelstate_nid_postfix(int state, int* old_state) {
     return PosixThread::ToErrno(scePthreadSetcancelstate(state, old_state));
 }
 
 int APS5_VABI pthread_setcanceltype_nid_postfix(int type, int* old_type) {
-    if (type != 0 && type != 2) return PosixThread::GUEST_EINVAL;
-    if (type == 2) return 45;
     return PosixThread::ToErrno(scePthreadSetcanceltype(type, old_type));
 }
 
@@ -132,7 +136,9 @@ void APS5_VABI pthread_yield_nid_postfix(void) {
 }
 
 unsigned int APS5_VABI sleep_nid_postfix(unsigned int seconds) {
+    ThreadCancel::Check();
     std::this_thread::sleep_for(std::chrono::seconds(seconds));
+    ThreadCancel::Check();
     return 0;
 }
 
