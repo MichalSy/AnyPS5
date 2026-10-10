@@ -5353,7 +5353,7 @@ int main(int argc, char** argv) {
             unchangedCpuStampTests(device, recorder);
             return 0;
         }
-        if (argc == 2 && std::string_view(argv[1]) == "--storage-baseline-settled-only") {
+        if (argc == 2 && (std::string_view(argv[1]) == "--settled-baseline-only" || std::string_view(argv[1]) == "--storage-baseline-settled-only")) {
             return settledBaselineTests(device, recorder, gpu) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--completion-labels-only") {
