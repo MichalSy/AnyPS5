@@ -557,6 +557,11 @@ void StorageArrayRoundTripTest(const Context& context, bool firstLayerResident) 
     last.clearDepth = 1.0f;
     if (firstLayerResident) DepthSurfaceView(context, first);
     DepthSurfaceView(context, last);
+    if (firstLayerResident) {
+        auto padding = View(Extent.width, Extent.height, memory.Address() + sliceBytes / 2);
+        const auto unrelated = CachedStorageSurface(context, padding);
+        Require(unrelated != nullptr && DepthSurfaceAt(first.address), "a storage subrange was mistaken for a native depth array layer");
+    }
     auto resource = View(Extent.width, Extent.height, memory.Address());
     resource.format = 7; // R16_UNORM, sharing the D16 depth plane's native pixel bits.
     resource.dimension = TextureDimension::k2DArray;
@@ -572,6 +577,13 @@ void StorageArrayRoundTripTest(const Context& context, bool firstLayerResident) 
             refused = std::string(error.what()).find("requires a 2D image or array") != std::string::npos;
         }
         Require(refused && DepthSurfaceAt(last.address), "a volume view bypassed its last resident depth slice");
+        refused = false;
+        try {
+            DepthSurfaceAt(volume);
+        } catch (const std::runtime_error& error) {
+            refused = std::string(error.what()).find("requires a 2D image or array") != std::string::npos;
+        }
+        Require(refused && DepthSurfaceAt(last.address), "a volume writer could retire its unsupported depth slice before validation");
     }
     auto writer = CachedStorageSurface(context, resource);
     Buffer readback(context, layers * texels * sizeof(std::uint16_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT);

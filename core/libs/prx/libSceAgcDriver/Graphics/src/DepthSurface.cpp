@@ -588,13 +588,23 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
     Require(geometry.layerBytes != 0 && geometry.guestBytes <= std::numeric_limits<std::uint64_t>::max() - descriptor.baseAddress, "invalid storage image depth range");
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
+    const auto containsPlane = [&](std::uint64_t address) {
+        return address != 0 && (address == descriptor.baseAddress || (descriptor.dimension != TextureDimension::k2D &&
+            address >= descriptor.baseAddress && address - descriptor.baseAddress < geometry.guestBytes));
+    };
     for (const auto& surface : surfaces()) {
-        if (surface->retired || surface->mappingInvalidated || surface->context.device != context.device || !surface->Overlaps(descriptor.baseAddress, geometry.guestBytes)) continue;
+        if (surface->retired || surface->mappingInvalidated || surface->context.device != context.device ||
+            (!containsPlane(surface->target.address) && !containsPlane(surface->target.stencilAddress))) continue;
         Require((descriptor.dimension == TextureDimension::k2D || descriptor.dimension == TextureDimension::k2DArray) && storage->ImageDepth() == 1u,
             "storage access to a depth surface requires a 2D image or array");
         Require(surface->target.address >= descriptor.baseAddress && surface->target.address - descriptor.baseAddress < geometry.guestBytes &&
             (surface->target.address - descriptor.baseAddress) % geometry.layerBytes == 0u,
-            "storage access to a depth surface requires an aligned depth array layer");
+            "storage access to a depth surface requires an aligned depth array layer: depth=" + std::to_string(surface->target.address) +
+            " extent=" + std::to_string(surface->target.extent.width) + "x" + std::to_string(surface->target.extent.height) +
+            " format=" + std::to_string(surface->target.format) + " storage=" + std::to_string(descriptor.baseAddress) +
+            " extent=" + std::to_string(descriptor.width) + "x" + std::to_string(descriptor.height) +
+            " format=" + std::to_string(storage->StorageFormat()) + " bytes=" + std::to_string(geometry.guestBytes) +
+            " layerBytes=" + std::to_string(geometry.layerBytes));
     }
     for (std::uint32_t layer = 0; layer < storage->ImageLayers(); ++layer) {
         const auto address = descriptor.baseAddress + geometry.GuestLayerOffset(layer);
@@ -614,6 +624,26 @@ bool DepthSurfaceAt(std::uint64_t address, std::uint64_t bytes) {
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) {
         return !surface->retired && !surface->mappingInvalidated && (bytes != 0 ? surface->Overlaps(address, bytes) :
             surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address));
+    });
+}
+
+bool DepthSurfaceAt(const GuestTextureResource& resource, bool requireLayerStart) {
+    if (DepthSurfaceAt(resource.baseAddress)) return true;
+    if (resource.dimension == TextureDimension::k2D) return false;
+    if (requireLayerStart && resource.dimension != TextureDimension::k2DArray) {
+        Require(!DepthSurfaceAt(resource, false), "storage access to a depth surface requires a 2D image or array");
+        return false;
+    }
+    const auto geometry = DescribeSurface(resource);
+    Require(geometry.layerBytes != 0, "invalid storage image depth layer size");
+    const auto matches = [&](std::uint64_t address) {
+        if (address == 0 || address < resource.baseAddress || address - resource.baseAddress >= geometry.guestBytes) return false;
+        const auto offset = address - resource.baseAddress;
+        return !requireLayerStart || (offset % geometry.layerBytes == 0u && offset / geometry.layerBytes < geometry.imageLayers);
+    };
+    std::lock_guard lock(surfacesMutex());
+    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) {
+        return !surface->retired && !surface->mappingInvalidated && (matches(surface->target.address) || matches(surface->target.stencilAddress));
     });
 }
 
