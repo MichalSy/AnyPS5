@@ -532,11 +532,10 @@ bool IncompatibleRefused(const Context& context, const DepthTarget& target) {
     auto resource = DecodeTextureResource(words);
     ++resource.width;
     try {
-        static_cast<void>(DepthSurfaceTexture(context, words, resource, Identity));
+        return DepthSurfaceTexture(context, words, resource, Identity) == nullptr && DepthSurfaceAt(target.address);
     } catch (const std::runtime_error& error) {
-        return std::string(error.what()).find("is not implemented") != std::string::npos;
+        return std::string(error.what()).find("is not implemented") != std::string::npos && DepthSurfaceAt(target.address);
     }
-    return false;
 }
 
 void FootprintTests(const Context& context) {
