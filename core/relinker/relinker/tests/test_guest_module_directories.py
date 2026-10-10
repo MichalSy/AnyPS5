@@ -162,7 +162,7 @@ def main():
             assert not output.exists(), output
 
             for magic, message in ((b"\x4f\x15\x3d\x1d", "Unsupported SELF header"),
-                                   (b"\x54\x14\xf5\xee", "Encrypted PS5 SELF containers are unsupported")):
+                                   (b"\x54\x14\xf5\xee", "Unsupported SELF header")):
                 case = work / f"{windows}-self-{magic.hex()}"
                 for name in ("sce_module", "prx"):
                     (case / name).mkdir(parents=True)

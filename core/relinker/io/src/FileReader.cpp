@@ -101,10 +101,8 @@ std::vector<std::uint8_t> FileReader::Read(const std::string& path) {
     std::vector<std::uint8_t> buf(static_cast<std::size_t>(size));
     if (!f.read(reinterpret_cast<char*>(buf.data()), size))
         throw Domain::RelinkerException("Cannot read file: " + path);
-    if (buf.size() >= 4 && ReadU32(buf, 0) == 0x1d3d154f)
+    if (buf.size() >= 4 && (ReadU32(buf, 0) == 0x1d3d154f || ReadU32(buf, 0) == 0xeef51454))
         return DecodeSelf(buf, path);
-    if (buf.size() >= 4 && ReadU32(buf, 0) == 0xeef51454)
-        throw Domain::RelinkerException(path + ": Encrypted PS5 SELF containers are unsupported; provide plaintext input");
     return buf;
 }
 
