@@ -11,6 +11,7 @@
 #include <utility>
 #include <cstdint>
 #include <cstddef>
+#include <mutex>
 #include <type_traits>
 #ifdef _WIN32
 #include <io.h>
@@ -78,6 +79,10 @@ extern "C" {
 extern FileStream _Stdin_nid_postfix;
 extern FileStream _Stdout_nid_postfix;
 extern FileStream _Stderr_nid_postfix;
+std::mutex& GuestFileStreamMutex_nid_no_patch();
+// Caller holds the stream mutex while replacing the matching registry entry.
+int GuestFileStreamCheckRedirect_nid_no_patch(const GuestFiles::Lease& previous);
+void GuestFileStreamRedirect_nid_no_patch(const GuestFiles::Lease& previous, const GuestFiles::Lease& replacement);
 }
 
 #endif

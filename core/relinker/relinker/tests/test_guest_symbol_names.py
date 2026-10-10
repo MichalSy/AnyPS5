@@ -148,6 +148,18 @@ def main():
         check_hash_table((modules / "other.prx.guest.prx").read_bytes())
         imports = imported_symbols(output.read_bytes())
         assert imports == {"AAAAAAAAAAA#guest", "DDDDDDDDDDD"}, imports
+
+        case = work / "duplicate-ü日"
+        (case / "sce_module").mkdir(parents=True)
+        source = case / "input.elf"
+        source.write_bytes(main_fixture())
+        module = case / "sce_module" / "duplicate.prx"
+        module.write_bytes(guest_module([("duplicate#A#A", True), ("duplicate#B#B", True)]))
+        output = case / "output.elf"
+        result = subprocess.run([str(relinker), str(source), str(output)], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 2, (result.returncode, result.stdout, result.stderr)
+        assert "Duplicate or empty export after stripping #: duplicate" in result.stderr and str(module) in result.stderr, result.stderr
+        assert not output.exists() and not (case / "app0").exists(), output
     print("Guest symbol name tests passed")
 
 
