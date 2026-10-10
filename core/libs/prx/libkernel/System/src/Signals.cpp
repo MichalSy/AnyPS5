@@ -339,7 +339,7 @@ int APS5_VABI raise_nid_postfix(int guest) {
     return 0;
 }
 int APS5_VABI kill_nid_postfix(int pid, int guest) {
-    if (guest < 0 || guest > MaxSignal) { *__error_nid_postfix() = 22; return -1; }
+    if (guest != 0 && !ValidSetSignal(guest)) return Fail(guestInvalid);
     const int self = getpid_nid_postfix();
     if (pid != self && pid != 0 && pid != -self) { *__error_nid_postfix() = 3; return -1; }
     return guest == 0 ? 0 : raise_nid_postfix(guest);
