@@ -1647,6 +1647,7 @@ struct MockVulkan {
     std::map<VkBuffer, VkBufferUsageFlags> bufferUsage;
     std::map<VkDeviceMemory, VkMemoryAllocateFlags> allocationFlags;
     std::map<VkBuffer, VkDeviceMemory> bufferMemory;
+    std::map<VkBuffer, VkDeviceSize> bufferOffset;
     std::map<VkDeviceMemory, std::vector<std::byte>> memories;
     std::map<VkDeviceMemory, VkDeviceSize> allocationSizes;
     VkDeviceSize allocatedBytes = 0;
@@ -1711,9 +1712,15 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAlloca
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockBindBufferMemory(VkDevice, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset) {
-    Require(offset == 0, "mock buffer memory must be bound at offset zero");
+    Require(offset + mock.bufferSizes.at(buffer) <= mock.memories.at(memory).size(), "mock buffer memory is bound past its allocation");
     mock.bufferMemory[buffer] = memory;
+    mock.bufferOffset[buffer] = offset;
     return VK_SUCCESS;
+}
+
+std::span<std::byte> mockBufferMemory(VkBuffer buffer) {
+    auto& memory = mock.memories.at(mock.bufferMemory.at(buffer));
+    return std::span<std::byte>(memory).subspan(static_cast<std::size_t>(mock.bufferOffset.at(buffer)), static_cast<std::size_t>(mock.bufferSizes.at(buffer)));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockMapMemory(VkDevice, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize, VkMemoryMapFlags, void** data) {
@@ -1858,7 +1865,7 @@ VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer, std::uint32_t x, std
 }
 
 VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void* data) {
-    auto& memory = mock.memories.at(mock.bufferMemory.at(buffer));
+    auto memory = mockBufferMemory(buffer);
     Require(offset + size <= memory.size(), "a buffer update exceeds its buffer");
     std::memcpy(memory.data() + offset, data, static_cast<std::size_t>(size));
 }
@@ -1985,7 +1992,7 @@ std::vector<std::uint32_t> ShaderDataWords(std::initializer_list<std::uint32_t> 
     return words;
 }
 
-bool sameBytes(const std::vector<std::byte>& memory, const void* expected, std::size_t bytes) {
+bool sameBytes(std::span<const std::byte> memory, const void* expected, std::size_t bytes) {
     return memory.size() >= bytes && std::memcmp(memory.data(), expected, bytes) == 0;
 }
 
@@ -2003,8 +2010,8 @@ const VkDescriptorSetLayoutBinding& findLayoutBinding(std::uint32_t binding) {
     throw std::runtime_error("expected descriptor set layout binding is missing for binding " + std::to_string(binding));
 }
 
-const std::vector<std::byte>& bufferBytes(VkBuffer buffer) {
-    return mock.memories.at(mock.bufferMemory.at(buffer));
+std::span<const std::byte> bufferBytes(VkBuffer buffer) {
+    return mockBufferMemory(buffer);
 }
 
 void expectResourceFailure(const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, std::string_view reason) {
@@ -2148,9 +2155,9 @@ void resourceTests() {
         Require(findWrite(44).buffers.size() == 1 && findWrite(44).buffers[0].range == 8 && sameBytes(bufferBytes(findWrite(44).buffers[0].buffer), guestThird.data(), 8), "fragment guest buffer is incorrect");
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, VK_NULL_HANDLE);
         Require(mock.boundPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && mock.boundFirst == 0 && mock.boundSets == 1, "exactly one descriptor set must be bound at set zero");
-        auto& first = mock.memories.at(mock.bufferMemory.at(array.buffers[0].buffer));
+        auto first = mockBufferMemory(array.buffers[0].buffer);
         std::memset(first.data(), 0xab, 16);
-        auto& shaderData = mock.memories.at(mock.bufferMemory.at(findWrite(5).buffers[0].buffer));
+        auto shaderData = mockBufferMemory(findWrite(5).buffers[0].buffer);
         std::memset(shaderData.data(), 0xcd, 12);
         resources.WriteBack();
         Require(guestFirst[0] == 0xabababab && guestFirst[3] == 0xabababab, "guest buffer was not written back");
@@ -2178,7 +2185,7 @@ void resourceTests() {
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, VK_NULL_HANDLE);
         Require(mock.boundPoint == VK_PIPELINE_BIND_POINT_COMPUTE && mock.boundSets == 1, "compute descriptors were bound to the wrong bind point");
         guestThird = {0xaaaaaaaa, 0xbbbbbbbb};
-        std::memset(mock.memories.at(mock.bufferMemory.at(findWrite(3).buffers[0].buffer)).data(), 0x5a, 8);
+        std::memset(mockBufferMemory(findWrite(3).buffers[0].buffer).data(), 0x5a, 8);
         resources.WriteBack();
         Require(guestThird[0] == 0x5a5a5a5a && guestThird[1] == 0x5a5a5a5a, "compute buffer was not written back");
         guestThird = {0xaaaaaaaa, 0xbbbbbbbb};
@@ -2197,7 +2204,7 @@ void resourceTests() {
         Require(buffer.range == sizeof(guestSecond), "strided buffer range does not cover every record");
         Require(sameBytes(bufferBytes(buffer.buffer), guestSecond.data(), sizeof(guestSecond)), "strided buffer contents were not uploaded");
         const std::uint32_t changed = 0x12345678u;
-        auto& bytes = mock.memories.at(mock.bufferMemory.at(buffer.buffer));
+        auto bytes = mockBufferMemory(buffer.buffer);
         std::memcpy(bytes.data() + 16, &changed, sizeof(changed));
         resources.WriteBack();
         Require(guestSecond[4] == changed && guestSecond[0] == 1 && guestSecond[7] == 8, "strided buffer write back changed the wrong record");
@@ -4199,7 +4206,7 @@ int main() {
         bdaContext.bufferDeviceAddress = true;
         bdaContext.limits.maxStorageBufferRange = 1u << 27;
         RunBdaResourceTests(bdaContext, {
-            [](VkBuffer buffer) -> std::span<std::byte> { return mock.memories.at(mock.bufferMemory.at(buffer)); },
+            [](VkBuffer buffer) -> std::span<std::byte> { return mockBufferMemory(buffer); },
             [](std::uint32_t binding) {
                 for (auto it = mock.writes.rbegin(); it != mock.writes.rend(); ++it) {
                     if (it->binding == binding) return it->buffers.at(0);
@@ -4209,7 +4216,7 @@ int main() {
             [](VkDeviceAddress address) {
                 const auto offset = address - 0x100000000000ULL;
                 const auto buffer = reinterpret_cast<VkBuffer>(offset / 0x10000);
-                return std::span<std::byte>(mock.memories.at(mock.bufferMemory.at(buffer))).subspan(offset % 0x10000);
+                return mockBufferMemory(buffer).subspan(offset % 0x10000);
             },
             [](std::optional<VkDeviceSize> headroom) {
                 mock.memoryLimit = headroom.has_value() ? std::optional<VkDeviceSize>(mock.allocatedBytes + *headroom) : std::nullopt;
