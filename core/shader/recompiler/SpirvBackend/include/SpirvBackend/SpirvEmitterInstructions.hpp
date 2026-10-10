@@ -8,8 +8,8 @@ namespace ShaderRecompiler {
 std::uint32_t EmitConvertU16U32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitConvertU8U32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitConvertF16F32(SpirvEmitterState& state, std::uint32_t arg0);
-std::uint32_t EmitConvertS32F32(SpirvEmitterState& state, std::uint32_t arg0);
-std::uint32_t EmitConvertU32F32(SpirvEmitterState& state, std::uint32_t arg0);
+std::uint32_t EmitConvertS32F32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0);
+std::uint32_t EmitConvertU32F32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0);
 std::uint32_t EmitConvertF32S32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitCompositeExtractU64(SpirvEmitterState& state, std::uint32_t arg0, const IrValue* arg1);
 std::uint32_t EmitPackFloat2x16Rtz(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);

@@ -489,12 +489,15 @@ std::uint32_t EmitConvertF16F32(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitPackHalf2x16(state, pair);
 }
 
-std::uint32_t EmitConvertS32F32(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitF32ToU32(state, arg0, true);
+std::uint32_t EmitConvertS32F32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0) {
+    if (!inst.Flags<F32IntegerConvertFlags>().inputClampedToIntegerRange) return EmitF32ToU32(state, arg0, true);
+    const auto converted = Unary(state, spv::OpConvertFToS, TypeI32(state), arg0);
+    return Unary(state, spv::OpBitcast, TypeU32(state), converted);
 }
 
-std::uint32_t EmitConvertU32F32(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitF32ToU32(state, arg0, false);
+std::uint32_t EmitConvertU32F32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0) {
+    if (!inst.Flags<F32IntegerConvertFlags>().inputClampedToIntegerRange) return EmitF32ToU32(state, arg0, false);
+    return Unary(state, spv::OpConvertFToU, TypeU32(state), arg0);
 }
 
 std::uint32_t EmitConvertF32S32(SpirvEmitterState& state, std::uint32_t arg0) {

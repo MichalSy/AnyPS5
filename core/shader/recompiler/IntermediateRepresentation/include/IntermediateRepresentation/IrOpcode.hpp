@@ -490,6 +490,10 @@ struct ImageOpcodeInfo {
     bool needsSampler = false;
 };
 
+struct F32IntegerConvertFlags {
+    bool inputClampedToIntegerRange = false;
+};
+
 struct DppMoveFlags {
     static constexpr std::uint32_t Lanes8 = 0x1000000u;
     std::uint32_t control = 0;
