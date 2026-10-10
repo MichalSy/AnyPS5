@@ -28,12 +28,6 @@
 #include <string>
 #include <vector>
 
-// The bytes a recorded dispatch or draw holds alive reach the recorder's batch budget
-// (Recorder::KeptBytesBudget): the copies of guest buffers its ShaderResources own (kept by
-// VulkanDevice::recordDispatch and Draw.cpp's keepRecordedDraw) and a draw's snapshots of buffers it
-// reads in place (ShaderResources::PrepareDrawBindings). A snapshot reused by the next draw of the
-// batch is one buffer and counts once.
-
 namespace {
 
 using AgcDriver::Graphics::ColorTargetLayout;
@@ -47,17 +41,14 @@ constexpr std::size_t BufferBytes = 65536;
 constexpr std::uint32_t Width = 256;
 constexpr std::uint32_t Height = 128;
 
-// v1 = v0 << 3; v[2:3] = 0; buffer_store_dwordx2 v[2:3], v1, s[0:3] offen
 alignas(256) constexpr std::array<std::uint32_t, 6> StoreCode{
     0x34020083, 0x7e040280, 0x7e060280, 0xe0741000, 0x80000201, 0xbf810000,
 };
 
-// buffer_load_format_xyzw v[0:3], v5, s[0:3] idxen; exp pos0 v[0:3] done; s_endpgm
 alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{
     0xe0382000, 0x80000005, 0xbf8c3f70, 0xf80008cf, 0x03020100, 0xbf810000,
 };
 
-// v7 = 1.0; exp mrt0 v7 v7 v7 v7 done vm; s_endpgm
 alignas(256) constexpr std::array<std::uint32_t, 4> PixelCode{
     0x7e0e02f2, 0xf800180f, 0x07070707, 0xbf810000,
 };
@@ -76,9 +67,6 @@ std::array<std::uint32_t, 4> VertexBuffer(const void* data, std::uint32_t stride
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
 }
 
-// Guest memory, registered (served in place by a host import where the device has them, and
-// write-watched where the host can watch it, as draw snapshots need to be reused) or plain (every
-// use copies it).
 class GuestBuffer {
 public:
     explicit GuestBuffer(bool registered, std::size_t bytes = BufferBytes) : registered(registered), bytes(bytes), watched(registered && AgcDriver::GuestMemory::WriteWatched()) {
@@ -177,14 +165,10 @@ constexpr std::array<std::array<float, 4>, 3> Triangle{{
     {-1.0f, -1.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}
 }};
 
-// Vertex records for Draw: the triangle, then zeros up to BufferBytes.
 void FillVertices(GuestBuffer& vertices) {
     std::memcpy(vertices.Data(), Triangle.data(), sizeof(Triangle));
 }
 
-// A full-target triangle into a resident (tiled) color target, so the draw is recorded, whose
-// vertex stage reads its positions from `vertices` (BufferBytes of records, so the bound range is
-// the whole buffer).
 void Draw(AgcDriver::VulkanDevice& device, GuestBuffer& pixels, GuestBuffer& vertices) {
     const auto target = device.Target();
     std::vector<std::uint32_t> vertexUserData(4, 0u);
@@ -241,7 +225,6 @@ void Draw(AgcDriver::VulkanDevice& device, GuestBuffer& pixels, GuestBuffer& ver
     device.Draw(state, draw, shaders);
 }
 
-// VulkanDevice::recordDispatch: the dispatch's copy of the buffer it writes.
 void CopiedDispatch(AgcDriver::VulkanDevice& device) {
     GuestBuffer target(false);
     device.WaitIdle();
@@ -253,8 +236,6 @@ void CopiedDispatch(AgcDriver::VulkanDevice& device) {
     device.WaitIdle();
 }
 
-// The target's first draw makes it resident (its upload counts in that batch's kept bytes), so the
-// draws measured after it keep only their own bytes.
 void ResidentTarget(AgcDriver::VulkanDevice& device, GuestBuffer& pixels) {
     GuestBuffer vertices(false);
     FillVertices(vertices);
@@ -262,7 +243,6 @@ void ResidentTarget(AgcDriver::VulkanDevice& device, GuestBuffer& pixels) {
     device.WaitIdle();
 }
 
-// keepRecordedDraw: the draw's copy of the buffer it reads.
 void CopiedDraw(AgcDriver::VulkanDevice& device, GuestBuffer& pixels) {
     GuestBuffer vertices(false);
     FillVertices(vertices);
@@ -275,8 +255,6 @@ void CopiedDraw(AgcDriver::VulkanDevice& device, GuestBuffer& pixels) {
     device.WaitIdle();
 }
 
-// PrepareDrawBindings: the draw's snapshot of the buffer it reads in place, counted once for a
-// second draw of the batch that reuses it.
 bool SnapshotDraws(AgcDriver::VulkanDevice& device, GuestBuffer& pixels) {
     GuestBuffer vertices(true);
     FillVertices(vertices);
