@@ -117,7 +117,51 @@ def stage_libraries(build, staging):
     return prepared
 
 
-def prepare(game, executable, build=None, excluded_modules=()):
+def stage_module_parent(source, staging, module_directories=()):
+    source = Path(source).resolve()
+    if not module_directories:
+        return source
+    directories = []
+    for directory in module_directories:
+        directory = Path(directory)
+        directory = (directory if directory.is_absolute() else source / directory).resolve()
+        if not directory.is_relative_to(source) or not directory.is_dir():
+            raise ValueError("Additional module directory must exist inside the source directory: " + str(directory))
+        if directory in directories or directory in [(source / name).resolve() for name in ("sce_module", "sce_modules", "prx")]:
+            raise ValueError("Repeated module directory: " + str(directory))
+        directories.append(directory)
+    staging = Path(staging)
+    staging.mkdir(parents=True)
+    names = {}
+    for name in ("sce_module", "sce_modules", "prx"):
+        directory = source / name
+        if not directory.exists():
+            continue
+        if not directory.is_dir():
+            raise ValueError("Module path is not a directory: " + str(directory))
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and not path.name.endswith(".guest.prx"):
+                if path.name in names:
+                    raise ValueError("Duplicate module filename: " + str(names[path.name]) + " and " + str(path))
+                names[path.name] = path
+        if name == "prx":
+            directories.insert(0, directory)
+        else:
+            (staging / name).symlink_to(directory, target_is_directory=True)
+    prx = staging / "prx"
+    prx.mkdir()
+    for directory in directories:
+        for path in sorted(directory.iterdir()):
+            if not path.is_file() or path.name.endswith(".guest.prx"):
+                continue
+            if path.name in names and names[path.name] != path:
+                raise ValueError("Duplicate module filename: " + str(names[path.name]) + " and " + str(path))
+            names[path.name] = path
+            (prx / path.name).symlink_to(path)
+    return staging
+
+
+def prepare(game, executable, build=None, excluded_modules=(), module_directories=()):
     project = Path(__file__).resolve().parents[1]
     game = Path(game).resolve()
     if Path(executable).name != executable or not executable.endswith(".elf"):
@@ -133,7 +177,9 @@ def prepare(game, executable, build=None, excluded_modules=()):
             staging = Path(directory)
             output = staging / executable
             libraries = stage_libraries(build, staging)
-            arguments = [str(build / "core/relinker/relinker"), "--registry", "--to-intel"]
+            modules = stage_module_parent(game / "source", staging / "modules", module_directories)
+            arguments = [str(build / "core/relinker/relinker"), "--registry", "--to-intel",
+                         "--sce-module-path", str(modules)]
             for module in excluded_modules:
                 arguments += ["--exclude-sce-module", module]
             subprocess.run(arguments + [str(game / "source/eboot.elf"), str(output)], check=True)
@@ -160,8 +206,10 @@ def main():
     parser.add_argument("executable")
     parser.add_argument("--build", type=Path)
     parser.add_argument("--exclude-sce-module", action="append", default=[])
+    parser.add_argument("--module-dir", action="append", default=[], type=Path,
+                        help="Additional module directory inside source, relative to source or absolute; repeat for multiple directories")
     args = parser.parse_args()
-    prepare(args.game, args.executable, args.build, args.exclude_sce_module)
+    prepare(args.game, args.executable, args.build, args.exclude_sce_module, args.module_dir)
 
 
 if __name__ == "__main__":
