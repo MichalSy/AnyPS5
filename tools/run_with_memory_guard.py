@@ -122,7 +122,7 @@ def main():
             raise RuntimeError("The memory guard requires Linux cgroup v2")
         if not shutil.which("systemd-run") or not shutil.which("systemctl"):
             raise RuntimeError("The memory guard requires a systemd user manager")
-        reserve = setting("ANYPS5_MEMORY_RESERVE_MIB", 6144) * MIB
+        reserve = setting("ANYPS5_MEMORY_RESERVE_MIB", 4096) * MIB
         available = available_memory()
         budget = min(setting("ANYPS5_MEMORY_MAX_MIB", 18432) * MIB, available - reserve)
         budget = (budget // MIB) * MIB

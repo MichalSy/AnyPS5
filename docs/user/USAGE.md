@@ -2,9 +2,9 @@
 
 ## Input and conversion
 
-Use an ELF executable or an unencrypted, uncompressed SELF container with magic `4F 15 3D 1D`. The relinker reconstructs supported SELF program segments in memory. Place bundled ELF or supported SELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable, or under the parent directory selected with `--sce-module-path <path>`. The option accepts absolute paths and paths relative to the current working directory; do not include the `sce_module` directory itself. By default, only files directly inside the module directories are processed. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error.
+Use an ELF executable or an unencrypted, uncompressed SELF container with PS4 magic `4F 15 3D 1D` or PS5 magic `54 14 F5 EE`. The relinker reconstructs supported SELF program segments in memory. Place bundled ELF or supported SELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable, or under the parent directory selected with `--sce-module-path <path>`. The option accepts absolute paths and paths relative to the current working directory; do not include the `sce_module` directory itself. By default, only files directly inside the module directories are processed. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error.
 
-Reconstructed SELF images are limited to 2 GiB. Encrypted or compressed segments and PS5 containers with magic `54 14 F5 EE` are rejected.
+Reconstructed SELF images are limited to 2 GiB. Encrypted or compressed segments are rejected.
 
 ```text
 source/
@@ -123,6 +123,8 @@ python3 tools/run_game.py --runtime /path/to/patched/libs \
 ```
 
 The launcher starts already converted code, replacing its process with the game and preserving its exit status, signals and standard streams. It does not run the relinker or configure save or log directories.
+
+On Linux, wrap the launcher with `python3 tools/run_with_memory_guard.py --` to isolate the game in a systemd user memory cgroup. This requires cgroup v2 and a running systemd user manager. The guard limits the game to 18 GiB or available RAM minus a 4 GiB system reserve, whichever is smaller; swap and core dumps are disabled for the game. It also stops the game if available system RAM falls below 4 GiB. `ANYPS5_MEMORY_MAX_MIB` and `ANYPS5_MEMORY_RESERVE_MIB` override these defaults. Memory measurements are written to `build/profiles/memory-guard/`; `ANYPS5_MEMORY_LOG` selects a new JSONL output file. Standard streams pass through to the caller.
 
 Windows PowerShell:
 
