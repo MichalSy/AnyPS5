@@ -241,6 +241,64 @@ OpFunctionEnd
     }
 }
 
+void testGlobalRedundancyBudget() {
+    for (const unsigned selections : {2u, 512u}) {
+        std::string source = R"(OpCapability Shader
+OpExtension "SPV_KHR_storage_buffer_storage_class"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %block Block
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %buffer DescriptorSet 0
+OpDecorate %buffer Binding 0
+%void = OpTypeVoid
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%function = OpTypeFunction %void
+%block = OpTypeStruct %uint
+%blockPointer = OpTypePointer StorageBuffer %block
+%pointer = OpTypePointer StorageBuffer %uint
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%true = OpConstantTrue %bool
+%buffer = OpVariable %blockPointer StorageBuffer
+%main = OpFunction %void None %function
+%entry = OpLabel
+%address = OpAccessChain %pointer %buffer %zero
+%value = OpLoad %uint %address
+%sum = OpIAdd %uint %value %one
+%deadArithmetic = OpIMul %uint %value %value
+%condition = OpIEqual %bool %value %zero
+OpSelectionMerge %exit None
+OpBranchConditional %true %work %deadArm
+%deadArm = OpLabel
+OpStore %address %zero
+OpBranch %exit
+%work = OpLabel
+OpStore %address %sum
+)";
+        for (unsigned selection = 0; selection < selections; ++selection) {
+            const auto id = std::to_string(selection);
+            source += "OpSelectionMerge %merge" + id + " None\nOpBranchConditional %condition %then" + id + " %merge" + id + "\n";
+            source += "%then" + id + " = OpLabel\n%duplicate" + id + " = OpIAdd %uint %value %one\nOpStore %address %duplicate" + id + "\n";
+            source += "OpBranch %merge" + id + "\n%merge" + id + " = OpLabel\n";
+        }
+        source += "OpBranch %exit\n%exit = OpLabel\nOpReturn\nOpFunctionEnd\n";
+        auto native = assemble(source);
+        native[1] = Spirv11;
+        for (const bool swapped : {false, true}) {
+            const auto input = swapped ? swapByteOrder(native) : native;
+            const auto optimized = ShaderRecompiler::ValidateAndOptimizeSpirv(input, Vulkan11, Spirv13, false, true, true);
+            const auto output = optimized.front() == spv::MagicNumber ? optimized : swapByteOrder(optimized);
+            check(opcodeCount(output, spv::OpStore) == selections + 1u, "redundancy budget changed live buffer stores or retained a dead selection arm");
+            check(opcodeCount(output, spv::OpIMul) == 0u, "redundancy budget disabled dead arithmetic elimination");
+            const auto additions = selections == 2u ? 1u : selections + 1u;
+            check(opcodeCount(output, spv::OpIAdd) == additions, "global redundancy did not follow the input complexity budget");
+        }
+    }
+}
+
 void testInvalidInputIsRejected() {
     const auto valid = assemble(moduleSource(Types.front(), false, ArithmeticSupport::StorageOnly));
     expectRejected(valid, 0x00400000u, Spirv13, "SPIR-V 1.3 with Vulkan 1.0");
@@ -285,6 +343,7 @@ int main() {
     testNarrowConversions(optimizationEnabled);
     testInvalidInputIsRejected();
     testSpecializedSelectionExit();
+    testGlobalRedundancyBudget();
     if (failures != 0) {
         std::fprintf(stderr, "%d optimizer check(s) failed\n", failures);
         return 1;

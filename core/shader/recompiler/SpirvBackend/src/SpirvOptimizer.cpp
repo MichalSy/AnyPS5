@@ -1,7 +1,9 @@
+#define SPV_ENABLE_UTILITY_CODE
+#include <spirv/unified1/spirv.hpp>
+#undef SPV_ENABLE_UTILITY_CODE
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #include <spirv-tools/libspirv.hpp>
 #include <spirv-tools/optimizer.hpp>
-#include <spirv/unified1/spirv.hpp>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -9,6 +11,39 @@
 namespace ShaderRecompiler {
 
 namespace {
+
+bool GlobalRedundancyFitsInput(std::span<const std::uint32_t> spirv) {
+    constexpr std::size_t maxEntries = std::size_t{1} << 20u;
+    const bool swapped = spirv[0] != spv::MagicNumber;
+    const auto wordAt = [spirv, swapped](std::size_t index) {
+        const auto word = spirv[index];
+        return swapped ? (word >> 24u) | ((word >> 8u) & 0x0000ff00u) |
+                             ((word << 8u) & 0x00ff0000u) | (word << 24u)
+                       : word;
+    };
+    bool inFunction = false;
+    std::size_t blocks = 0;
+    std::size_t values = 0;
+    for (std::size_t offset = 5; offset < spirv.size();) {
+        const auto instruction = wordAt(offset);
+        const auto opcode = static_cast<spv::Op>(instruction & spv::OpCodeMask);
+        if (opcode == spv::OpFunction) {
+            inFunction = true;
+            blocks = values = 0;
+        }
+        if (inFunction) {
+            bool hasResult = false;
+            bool hasType = false;
+            spv::HasResultAndType(opcode, &hasResult, &hasType);
+            values += hasResult;
+            blocks += opcode == spv::OpLabel;
+            if (blocks != 0 && values > maxEntries / blocks) return false;
+        }
+        if (opcode == spv::OpFunctionEnd) inFunction = false;
+        offset += instruction >> spv::WordCountShift;
+    }
+    return true;
+}
 
 bool HasLimitedUseTypes(std::span<const std::uint32_t> spirv) {
     if (spirv.size() < 5) throw std::runtime_error("SPIRV-Tools: incomplete module header");
@@ -101,7 +136,8 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     // APS5_SPIRV_OPT=full restores the SPIRV-Tools performance pipeline, =none skips optimization.
     const bool allowFolding = !HasLimitedUseTypes(spirv);
     const bool full = mode != nullptr && std::string(mode) == "full";
-    if (full && allowFolding) {
+    const bool globalRedundancy = GlobalRedundancyFitsInput(spirv);
+    if (full && allowFolding && globalRedundancy) {
         optimizer.RegisterPerformancePasses(true);
     } else {
         optimizer.RegisterPass(spvtools::CreateWrapOpKillPass())
@@ -127,7 +163,7 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
         optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass(true));
         if (full) optimizer.RegisterPass(spvtools::CreateLoopUnrollPass(true));
         optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass())
-            .RegisterPass(spvtools::CreateRedundancyEliminationPass());
+            .RegisterPass(globalRedundancy ? spvtools::CreateRedundancyEliminationPass() : spvtools::CreateLocalRedundancyEliminationPass());
         if (full) optimizer.RegisterPass(spvtools::CreateCombineAccessChainsPass());
         if (allowFolding) optimizer.RegisterPass(spvtools::CreateSimplificationPass());
         if (full) {
@@ -140,15 +176,16 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
                 .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
                 .RegisterPass(spvtools::CreateVectorDCEPass())
                 .RegisterPass(spvtools::CreateDeadInsertElimPass())
-                .RegisterPass(spvtools::CreateDeadBranchElimPass())
-                .RegisterPass(spvtools::CreateIfConversionPass())
+                .RegisterPass(spvtools::CreateDeadBranchElimPass());
+            if (allowFolding) optimizer.RegisterPass(spvtools::CreateSimplificationPass());
+            optimizer.RegisterPass(spvtools::CreateIfConversionPass())
                 .RegisterPass(spvtools::CreateCopyPropagateArraysPass())
                 .RegisterPass(spvtools::CreateReduceLoadSizePass());
         }
         optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass(true))
             .RegisterPass(spvtools::CreateBlockMergePass());
         if (full) {
-            optimizer.RegisterPass(spvtools::CreateRedundancyEliminationPass())
+            optimizer.RegisterPass(globalRedundancy ? spvtools::CreateRedundancyEliminationPass() : spvtools::CreateLocalRedundancyEliminationPass())
                 .RegisterPass(spvtools::CreateDeadBranchElimPass())
                 .RegisterPass(spvtools::CreateBlockMergePass());
         }
