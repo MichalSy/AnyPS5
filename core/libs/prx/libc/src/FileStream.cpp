@@ -5,8 +5,10 @@
 #include <system_error>
 #ifdef _WIN32
 #include <io.h>
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
 #else
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -14,9 +16,16 @@ struct FileStreamState {
     std::FILE* handle;
     GuestFiles::Identity identity;
     int descriptor;
+    FileStreamState* next = nullptr;
 };
 
 namespace {
+std::mutex streamsMutex;
+FileStreamState* streams = nullptr;
+#ifdef _WIN32
+void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
+#endif
+
 int NativeDescriptor(std::FILE* handle) {
 #ifdef _WIN32
     return ::_fileno(handle);
@@ -62,8 +71,13 @@ int ModeAccess(const char* mode) {
     return std::strchr(mode, '+') ? 2 : *mode == 'r' ? 0 : 1;
 }
 
-FileStreamState* CreateState(std::FILE* handle, const GuestFiles::Lease& lease) {
-    return new FileStreamState{handle, lease, GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(lease)};
+FileStreamState* CreateState(std::FILE* handle, const GuestFiles::Lease& lease, int descriptor = -1) {
+    auto* state = new FileStreamState{handle, lease,
+        descriptor < 0 ? GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(lease) : descriptor};
+    std::lock_guard lock(streamsMutex);
+    state->next = streams;
+    streams = state;
+    return state;
 }
 
 GuestFiles::Lease AdoptStream(std::FILE* handle, int accessMode) {
@@ -74,6 +88,49 @@ GuestFiles::Lease AdoptStream(std::FILE* handle, int accessMode) {
 }
 }
 
+extern "C" std::mutex& GuestFileStreamMutex_nid_no_patch() { return streamsMutex; }
+
+extern "C" int GuestFileStreamCheckRedirect_nid_no_patch(const GuestFiles::Lease& previous) {
+    if (!previous) return 0;
+#ifndef _WIN32
+    struct rlimit limit{};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) return GuestFiles::GuestFileNativeError_nid_no_patch(errno);
+#endif
+    for (auto* state = streams; state; state = state->next) {
+        if (!state->handle || state->identity.lock() != previous) continue;
+        const int target = NativeDescriptor(state->handle);
+#ifdef _WIN32
+        const auto handler = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
+        const bool valid = ::_get_osfhandle(target) != -1;
+        _set_thread_local_invalid_parameter_handler(handler);
+        if (!valid) return 9;
+#else
+        if (target < 0 || static_cast<rlim_t>(target) >= limit.rlim_cur || ::fcntl(target, F_GETFD) < 0) return 9;
+#endif
+    }
+    return 0;
+}
+
+extern "C" void GuestFileStreamRedirect_nid_no_patch(const GuestFiles::Lease& previous,
+    const GuestFiles::Lease& replacement) {
+    if (!previous) return;
+    const int saved = errno;
+    const int native = GuestFiles::GuestFileNativeDescriptor_nid_no_patch(replacement);
+    for (auto* state = streams; state; state = state->next) {
+        if (!state->handle || state->identity.lock() != previous) continue;
+        const int target = NativeDescriptor(state->handle);
+#ifdef _WIN32
+        if (::_dup2(native, target) != 0) continue;
+#else
+        int result;
+        do { result = ::dup2(native, target); } while (result < 0 && errno == EINTR);
+        if (result < 0) continue;
+#endif
+        state->identity = replacement;
+    }
+    errno = saved;
+}
+
 FileStream::FileStream(std::FILE* handle, bool dynamic) : dynamic(dynamic) {
     if (!handle) throw std::runtime_error("FileStream: null handle");
     if (handle == stdin || handle == stdout || handle == stderr) {
@@ -81,14 +138,14 @@ FileStream::FileStream(std::FILE* handle, bool dynamic) : dynamic(dynamic) {
         _guest.flags = descriptor == 0 ? 4 : 8;
         _guest.descriptor = static_cast<std::int16_t>(descriptor);
         const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(descriptor);
-        if (!lease) { state = new FileStreamState{nullptr, {}, descriptor}; return; }
+        if (!lease) { state = CreateState(nullptr, {}, descriptor); return; }
         const int duplicate = GuestFiles::GuestFileDuplicateNative_nid_no_patch(lease);
-        if (duplicate < 0) { state = new FileStreamState{nullptr, lease, descriptor}; return; }
+        if (duplicate < 0) { state = CreateState(nullptr, lease, descriptor); return; }
         auto* native = AttachNative(duplicate, descriptor == 0 ? "rb" : "wb");
         if (!native) {
             const int error = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
             NativeClose(duplicate);
-            state = new FileStreamState{nullptr, lease, descriptor};
+            state = CreateState(nullptr, lease, descriptor);
             errno = error;
             return;
         }
@@ -126,11 +183,16 @@ FileStream::FileStream(std::FILE* handle, const GuestFiles::Lease& lease, bool d
 FileStream::~FileStream() {
     const int saved = errno;
     if (state && state->handle) Close();
+    std::lock_guard lock(streamsMutex);
+    for (auto** entry = &streams; *entry; entry = &(*entry)->next) {
+        if (*entry == state) { *entry = state->next; break; }
+    }
     delete state;
     errno = saved;
 }
 
 std::FILE* FileStream::GetHandle() {
+    std::lock_guard lock(streamsMutex);
     if (state && state->handle && GuestFiles::GuestFileMatches_nid_no_patch(state->identity)) return state->handle;
     _guest.flags = static_cast<std::int16_t>(_guest.flags | 0x40);
     _guest.readRemaining = 0;
@@ -151,8 +213,13 @@ bool FileStream::Reopen(const std::filesystem::path& filename, const char* mode)
     for (const char character : std::string_view(mode)) wideMode.push_back(static_cast<unsigned char>(character));
 #endif
     if (!GetHandle()) return false;
-    const auto expected = state->identity;
-    auto* previous = std::exchange(state->handle, nullptr);
+    GuestFiles::Identity expected;
+    std::FILE* previous;
+    {
+        std::lock_guard lock(streamsMutex);
+        expected = state->identity;
+        previous = std::exchange(state->handle, nullptr);
+    }
 #ifdef _WIN32
     std::unique_ptr<std::FILE, decltype(&std::fclose)> replacement(::_wfreopen(filename.c_str(), wideMode.c_str(), previous), std::fclose);
 #else
@@ -183,8 +250,11 @@ bool FileStream::Reopen(const std::filesystem::path& filename, const char* mode)
         errno = error;
         return false;
     }
-    state->handle = replacement.release();
-    state->identity = lease;
+    {
+        std::lock_guard lock(streamsMutex);
+        state->handle = replacement.release();
+        state->identity = lease;
+    }
     state->descriptor = GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(lease);
     _guest = {};
     _guest.flags = 0x10;
@@ -215,13 +285,20 @@ void FileStream::ClearError() {
 }
 
 int FileStream::Close() {
-    if (!state || !state->handle) { errno = 9; return EOF; }
     const int saved = errno;
-    const int logicalResult = GuestFiles::GuestFileCloseMatching_nid_no_patch(state->identity);
+    GuestFiles::Identity expected;
+    std::FILE* handle;
+    {
+        std::lock_guard lock(streamsMutex);
+        if (!state || !state->handle) { errno = 9; return EOF; }
+        expected = state->identity;
+        handle = std::exchange(state->handle, nullptr);
+        state->identity.reset();
+    }
+    const int logicalResult = GuestFiles::GuestFileCloseMatching_nid_no_patch(expected);
     const int logicalError = errno;
-    const int nativeResult = std::fclose(std::exchange(state->handle, nullptr));
+    const int nativeResult = std::fclose(handle);
     const int nativeError = errno;
-    state->identity.reset();
     _guest = {};
     encodingError = false;
     if (logicalResult != 0) { errno = logicalError; return EOF; }

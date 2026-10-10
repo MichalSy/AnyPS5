@@ -15,6 +15,9 @@ extern "C" {
 int GuestFileInitializeStandards_nid_no_patch();
 Lease GuestFileAcquire_nid_no_patch(int descriptor);
 Lease GuestFileAdoptOwned_nid_no_patch(int nativeDescriptor, int accessMode, NativeCleanup cleanup = nullptr);
+// Atomically replace or create a logical slot; leases retain the retired native ownership.
+Lease GuestFileReplaceOwned_nid_no_patch(int descriptor, int nativeDescriptor,
+    int accessMode, NativeCleanup cleanup = nullptr);
 std::array<Lease, 2> GuestFileAdoptPairOwned_nid_no_patch(int first, int second,
     int firstAccessMode, int secondAccessMode, NativeCleanup cleanup = nullptr);
 Lease GuestFileReplaceOwnedMatching_nid_no_patch(const Identity& expected, int nativeDescriptor,

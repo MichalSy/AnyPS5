@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestFileDescriptors.hpp"
+#include "prx/libc/include/FileStream.hpp"
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -201,6 +202,30 @@ std::array<Lease, 2> GuestFileAdoptPairOwned_nid_no_patch(int first, int second,
         table.entries[secondLogical] = result[1];
         return result;
     } catch (const std::bad_alloc&) { lock.unlock(); result = {}; errno = 12; return {}; }
+}
+
+Lease GuestFileReplaceOwned_nid_no_patch(int descriptor, int nativeDescriptor,
+    int accessMode, NativeCleanup cleanup) {
+    OwnedNative owned{nativeDescriptor, cleanup};
+    if (descriptor < 0 || descriptor >= 32768 || nativeDescriptor < 0) { errno = 9; return {}; }
+    if (accessMode < 0 || accessMode > 2) { errno = 22; return {}; }
+    if (GuestFileInitializeStandards_nid_no_patch() != 0) return {};
+    auto& table = GetTable();
+    Lease retired, replacement;
+    std::unique_lock streamLock(GuestFileStreamMutex_nid_no_patch());
+    {
+        std::lock_guard lock(table.mutex);
+        if (const int error = GuestFileStreamCheckRedirect_nid_no_patch(table.entries[descriptor])) {
+            errno = error;
+            return {};
+        }
+        try { replacement = Create(owned, descriptor, accessMode); }
+        catch (const std::bad_alloc&) { errno = 12; return {}; }
+        retired = std::exchange(table.entries[descriptor], replacement);
+    }
+    GuestFileStreamRedirect_nid_no_patch(retired, replacement);
+    streamLock.unlock();
+    return replacement;
 }
 
 Lease GuestFileReplaceOwnedMatching_nid_no_patch(const Identity& expected, int nativeDescriptor,

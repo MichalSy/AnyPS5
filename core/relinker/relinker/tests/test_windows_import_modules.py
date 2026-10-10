@@ -221,6 +221,10 @@ def main():
                 run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
                 assert run.returncode == (11 if owner == 'a.prx' else 22), (run.returncode, run.stdout, run.stderr)
 
+        result, output = convert('unicode-ü日', 'a.prx', guest_owner='b.prx')
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert output.is_file() and (output.parent / 'app0' / 'prx' / 'a.prx.guest.prx').is_file()
+
         check_internal_guest_libc(convert, work, relinker)
 
         for filename, module_name in [('foo.native.prx', 'foo_native'),
@@ -254,11 +258,12 @@ def main():
             run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
             assert run.returncode == 22, (run.returncode, run.stdout, run.stderr)
 
-        result, output = convert('wrong-case-soname', 'ALIAS.prx')
+        result, output = convert('folded-soname-ü日', 'ALIAS.prx', guest_owner='ALIAS.prx')
         assert result.returncode == 0, result.stderr
+        assert output.is_file() and (output.parent / 'app0' / 'prx' / 'b.prx.guest.prx').is_file()
         if os.name == 'nt':
             run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
-            assert run.returncode != 0 and 'Failed to load module:' in run.stderr and 'ALIAS.prx' in run.stderr, (run.returncode, run.stderr)
+            assert run.returncode == 22, (run.returncode, run.stdout, run.stderr)
 
         case = work / 'linux-filename-case'
         modules = case / 'prx'
@@ -269,7 +274,7 @@ def main():
         output = case / 'output.elf'
         result = subprocess.run([str(relinker), str(source), str(output)], capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, (result.stdout, result.stderr)
-        assert 'Party.prx' in needed_libraries(output.read_bytes())
+        assert needed_libraries(output.read_bytes()) == ['$ORIGIN/app0/prx/party.prx.guest.prx']
 
         result, output = convert('ambiguous-alias', 'foo.native.prx', module_name='foo_native',
                                  provider_name='foo.native.prx', extra_dependencies=('foo.native-module.prx',))
