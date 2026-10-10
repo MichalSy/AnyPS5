@@ -81,6 +81,24 @@ chmod +x app.elf
 ./app.elf
 ```
 
+To start a prepared Linux game with a shared runtime:
+
+```sh
+python3 tools/run_game.py --runtime /path/to/patched/libs --game /path/to/prepared/app.elf
+```
+
+`--runtime` selects the directory containing the complete compatible native PRX library set, such as `build/core/libs/libs`. The launcher puts that directory first in `LD_LIBRARY_PATH` and starts the existing executable without conversion or copying files. Remaining library search paths are preserved, so the selected runtime must contain all required system libraries.
+
+The working directory defaults to the executable's directory. Its prepared `app0/` layout and converted title modules must already exist. Use `--workdir /path/to/prepared/data` if the prepared data root is elsewhere; this changes relative resource paths, not the executable-relative paths to converted modules. Original PS5 ELF or SELF files are not launch inputs.
+
+Pass game arguments after `--`:
+
+```sh
+python3 tools/run_game.py --runtime /path/to/patched/libs --game /path/to/prepared/app.elf -- --game-option "value with spaces"
+```
+
+The launcher replaces its process with the game, preserving its exit status, signals and standard streams. It does not configure save or log directories.
+
 Windows PowerShell:
 
 ```powershell

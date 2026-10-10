@@ -41,6 +41,11 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress.py)
         add_test(NAME import_audit COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_import_audit.py)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_test(NAME run_game COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_run_game.py ${CMAKE_CXX_COMPILER})
+            set_tests_properties(run_game PROPERTIES TIMEOUT 30)
+        endif()
     endif()
 endif()
 
