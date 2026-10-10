@@ -46,13 +46,16 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     if (hasPrx) directories.push_back(prx);
     std::vector<std::filesystem::path> paths;
     std::set<std::string> unmatchedExclusions = excludedModules;
-    const auto isElf = [](const std::filesystem::path& path) {
+    const auto isGuestImage = [](const std::filesystem::path& path) {
         std::ifstream stream(path, std::ios::binary);
         if (!stream) throw Domain::RelinkerException("Cannot read guest candidate: " + path.string());
-        char magic[4]{};
-        stream.read(magic, 4);
+        unsigned char magic[4]{};
+        stream.read(reinterpret_cast<char*>(magic), 4);
         if (stream.bad()) throw Domain::RelinkerException("Cannot read guest candidate magic: " + path.string());
-        return stream.gcount() == 4 && static_cast<unsigned char>(magic[0]) == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
+        if (stream.gcount() != 4) return false;
+        return (magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') ||
+               (magic[0] == 0x4f && magic[1] == 0x15 && magic[2] == 0x3d && magic[3] == 0x1d) ||
+               (magic[0] == 0x54 && magic[1] == 0x14 && magic[2] == 0xf5 && magic[3] == 0xee);
     };
     for (const auto& directory : directories) {
         if (!std::filesystem::is_directory(directory)) throw Domain::RelinkerException("Guest module path is not a directory: " + directory.string());
@@ -63,7 +66,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 continue;
             }
             if (!entry.is_regular_file()) continue;
-            if (isElf(entry.path())) paths.push_back(entry.path());
+            if (isGuestImage(entry.path())) paths.push_back(entry.path());
         }
     }
     const auto neededNames = ReadNeededNames(dynamic);
@@ -80,7 +83,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 continue;
             }
             const auto name = it->path().filename().string();
-            if (!it->is_regular_file() || !missingNeeded.contains(name) || !isElf(it->path())) continue;
+            if (!it->is_regular_file() || !missingNeeded.contains(name) || !isGuestImage(it->path())) continue;
             if (!found.emplace(name, it->path()).second) throw Domain::RelinkerException("Ambiguous needed module: " + found.at(name).string() + " and " + it->path().string());
         }
         for (const auto& [name, path] : found) paths.push_back(path);

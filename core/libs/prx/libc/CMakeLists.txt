@@ -156,8 +156,9 @@ if(BUILD_TESTING)
     target_link_libraries(guest_working_directory_tests PRIVATE libc)
     configure_windows_unwind(guest_working_directory_tests)
     add_test(NAME guest_working_directory COMMAND guest_working_directory_tests)
+    add_test(NAME guest_configured_paths COMMAND guest_working_directory_tests --configured)
     if(WIN32)
-        set_tests_properties(guest_working_directory PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(guest_working_directory guest_configured_paths PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_path_case_tests ${LIBS_INCLUDE_DIR}/tests/GuestPathCase.cpp)

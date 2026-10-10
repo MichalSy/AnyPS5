@@ -2,13 +2,15 @@
 
 ## Input and conversion
 
-Use a clean ELF executable. Place its bundled ELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error.
+Use an ELF executable or an unencrypted, uncompressed SELF container with magic `4F 15 3D 1D`. The relinker reconstructs supported SELF program segments in memory. Bundled ELF or supported SELF modules must be in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error.
+
+Reconstructed SELF images are limited to 2 GiB. Encrypted or compressed segments and PS5 containers with magic `54 14 F5 EE` are rejected.
 
 ```text
 source/
     input.elf
     sce_module/
-        <bundled ELF modules>
+        <bundled ELF or supported SELF modules>
 ```
 
 ```text
@@ -81,23 +83,31 @@ chmod +x app.elf
 ./app.elf
 ```
 
-To start a prepared Linux game with a shared runtime:
+To convert directly from the original game directory and start with a shared Linux runtime:
 
 ```sh
-python3 tools/run_game.py --runtime /path/to/patched/libs --game /path/to/prepared/app.elf
+mkdir -p /path/to/cache/PPSA01288
+relinker --to-intel /path/to/game/eboot.bin /path/to/cache/PPSA01288/game.elf
+chmod +x /path/to/cache/PPSA01288/game.elf
+python3 tools/run_game.py --runtime /path/to/patched/libs \
+    --game /path/to/game --executable /path/to/cache/PPSA01288/game.elf
 ```
 
-`--runtime` selects the directory containing the complete compatible native PRX library set, such as `build/core/libs/libs`. The launcher puts that directory first in `LD_LIBRARY_PATH` and starts the existing executable without conversion or copying files. Remaining library search paths are preserved, so the selected runtime must contain all required system libraries.
+Choose the output directory using the game's ID, such as `titleId` from `sce_sys/param.json`. Conversion reads the original executable and bundled modules in place and writes only generated code beside the output executable. Resources stay in the original game directory; no extracted ELF files or resource symlinks are required.
 
-The working directory defaults to the executable's directory. Its prepared `app0/` layout and converted title modules must already exist. Use `--workdir /path/to/prepared/data` if the prepared data root is elsewhere; this changes relative resource paths, not the executable-relative paths to converted modules. Original PS5 ELF or SELF files are not launch inputs.
+`--runtime` selects the directory containing the complete compatible native PRX library set, such as `build/core/libs/libs`. The launcher puts that directory first in `LD_LIBRARY_PATH`; remaining library search paths are preserved. The runtime must be built with support for `ANYPS5_GAME_ROOT` and `ANYPS5_CODE_ROOT`.
+
+`--game` is the original resource directory, mapped to guest `/app0` through `ANYPS5_GAME_ROOT`. `--executable` is the generated native ELF; `ANYPS5_CODE_ROOT` selects its directory for converted modules. The guest working directory starts at `/app0`, while the native working directory defaults to the executable's directory. Use `--workdir /path/to/writable/data` to change the native directory without changing resource or module locations. Without these environment variables, the runtime retains its existing prepared `app0/` layout.
 
 Pass game arguments after `--`:
 
 ```sh
-python3 tools/run_game.py --runtime /path/to/patched/libs --game /path/to/prepared/app.elf -- --game-option "value with spaces"
+python3 tools/run_game.py --runtime /path/to/patched/libs \
+    --game /path/to/game --executable /path/to/cache/PPSA01288/game.elf \
+    -- --game-option "value with spaces"
 ```
 
-The launcher replaces its process with the game, preserving its exit status, signals and standard streams. It does not configure save or log directories.
+The launcher starts already converted code, replacing its process with the game and preserving its exit status, signals and standard streams. It does not run the relinker or configure save or log directories.
 
 Windows PowerShell:
 
