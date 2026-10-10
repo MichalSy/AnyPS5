@@ -24,6 +24,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -94,7 +96,7 @@ public:
 #endif
         Require(block != nullptr, "recorded kept bytes: cannot allocate a guest buffer");
         std::memset(block, 0, bytes);
-        if (registered) GuestAllocations::Mutation().Add(block, bytes, true, true);
+        if (registered) GuestAllocations::Mutation().Add(block, bytes, true, true, true);
     }
 
     ~GuestBuffer() {
@@ -277,6 +279,28 @@ bool SnapshotDraws(AgcDriver::VulkanDevice& device, GuestBuffer& pixels) {
     return true;
 }
 
+void BoundedCommands(AgcDriver::VulkanDevice& device, GuestBuffer& pixels) {
+    GuestBuffer target(false);
+    GuestBuffer vertices(false);
+    FillVertices(vertices);
+    std::memset(target.Data(), 0xa5, BufferBytes);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    device.WaitIdle();
+    auto& recorder = ActiveRecorder();
+    const auto checkBoundary = [&](const char* name, const auto& record) {
+        const auto submissions = recorder.Submissions();
+        recorder.Keep(std::make_shared<int>(0), Recorder::KeptBytesBudget - BufferBytes / 2);
+        record();
+        Require(!recorder.Recording() && recorder.Submissions() == submissions + 1, std::string(name) + " did not submit its batch after crossing the kept byte budget");
+        Require(recorder.InFlightKeptBytes() >= Recorder::KeptBytesBudget, std::string(name) + " did not retain the submitted batch's counted bytes");
+        device.WaitIdle();
+        Require(recorder.InFlightKeptBytes() == 0, std::string(name) + " left counted bytes in flight after completion");
+    };
+    checkBoundary("dispatch", [&] { Dispatch(device, target.Data()); });
+    Require(target.Data()[0] == 0 && target.Data()[BufferBytes - 1] == 0xa5, "a budget-submitted dispatch did not copy back its writes");
+    checkBoundary("draw", [&] { Draw(device, pixels, vertices); });
+}
+
 }
 
 int main() {
@@ -288,6 +312,7 @@ int main() {
         ResidentTarget(*device, pixels);
         CopiedDraw(*device, pixels);
         const bool snapshots = SnapshotDraws(*device, pixels);
+        BoundedCommands(*device, pixels);
         std::printf("recorded kept bytes tests passed%s\n", snapshots ? "" : " (draw snapshots not tested)");
         return 0;
     } catch (const std::exception& error) {

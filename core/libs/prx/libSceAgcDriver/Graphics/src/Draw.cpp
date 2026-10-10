@@ -1711,6 +1711,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (timer.profile) ownWaitedMs += Recorder::ThreadWaitedMs() - ownBefore;
         timer.phase(PhaseSync);
     }
+    recorder->BoundKeptBytes();
 }
 
 // The state with the outputs the pixel shader lacks masked: Vulkan leaves attachments a pixel

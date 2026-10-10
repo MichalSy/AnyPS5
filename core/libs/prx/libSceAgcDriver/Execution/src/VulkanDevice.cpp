@@ -3595,7 +3595,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
         writers->push_back(kept);
     }
+    if (resources.HoldsLease() && !SyncEachDispatch() && !Graphics::SyncLeaseWork()) Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
     recordStep(PhaseRecordCompletion);
+    recorder.BoundKeptBytes();
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut) {
@@ -3860,10 +3862,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                 byProgram.clear();
             }
         }
-    } else if (resources->HoldsLease()) {
-        // The lease is in the open batch (kept above, nothing submitted since): the pin waiter
-        // finishes the recorder up to that batch's serial. Prints the [address-sync] leases line.
-        Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
     }
     if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
     WatchMemory(programAddress);

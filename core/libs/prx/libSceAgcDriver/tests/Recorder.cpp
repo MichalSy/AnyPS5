@@ -1382,7 +1382,9 @@ bool readOnlyStagingTests(const Device& device, Recorder& recorder) {
         GuestBufferMemory memory(context);
         memory.AllowDeviceStaging();
         memory.AddReadable(element, elementBytes, true);
+        const auto keptBefore = recorder.OpenKeptBytes();
         memory.Upload(false);
+        Require(recorder.OpenKeptBytes() == keptBefore + (staged ? elementBytes : 0), "a read-only input snapshot did not count its bytes in the batch");
         std::uint32_t adjustment = 0;
         const auto descriptor = memory.Descriptor(element, elementBytes, adjustment);
         Require(adjustment == 0 && memory.Writes().empty() && !memory.HasCopiedWrites(), "a staged read-only input became a write");

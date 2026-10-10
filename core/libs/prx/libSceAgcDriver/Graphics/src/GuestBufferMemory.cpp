@@ -2798,6 +2798,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             copySource = inputSnapshot->Handle();
             copyOffset = 0;
             recorder->Keep(inputSnapshot);
+            recorder->KeepBytes(inputSnapshot.get(), static_cast<std::size_t>(bytes));
             CaptureTrace::Log("copy-input-snapshot batch=%llu address=%llx bytes=%llu", batch, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
         }
         if (capture && bytes == 32) {
