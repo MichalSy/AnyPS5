@@ -1,6 +1,9 @@
 #include "SpecializedDiskCache.hpp"
 #include "ShaderDiskCache.hpp"
 #include "ShaderCacheDirectory.hpp"
+#include "RuntimeAbi.hpp"
+#include <spirv/unified1/spirv.hpp>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -59,6 +62,32 @@ struct Compute {
         request.useCache = cached;
     }
 };
+
+void SpilledImageInterface() {
+    const std::array<std::uint32_t, 13> code{
+        0x34060082u, 0x7e020280u, 0x7e040281u, 0xd8340000u, 0x00000203u,
+        0xbf8c0000u, 0xbf8a0000u, 0xd8d80000u, 0x02000003u, 0xbf8c0000u,
+        0xf0201108u, 0x00000200u, 0xbf810000u
+    };
+    const std::array<std::uint32_t, 8> image{
+        0x00100000u, (static_cast<std::uint32_t>(IrBufferFormat::Format32UInt) << 20u) | (3u << 30u),
+        7u, 0x90000facu, 0u, 0u, 0u, 0u
+    };
+    Compute fixture(false);
+    fixture.request.shader = {ShaderStage::Compute, 0x24000u, code, 0, {}};
+    fixture.request.context.waveSize = 32u;
+    fixture.request.context.userData = image;
+    fixture.request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 1024u, {false, false, false}, false, 1u};
+    fixture.request.target.maxWorkgroupSharedMemoryBytes = 2048u;
+    const auto compiled = Recompile(fixture.request);
+    Require(compiled.workgroupMemoryDwords == 1025u, "image-only LDS fixture did not spill");
+    Require(compiled.specializationId != 0u, "image-only LDS fixture was not specialized");
+    Require(std::none_of(compiled.bindings.begin(), compiled.bindings.end(), [](const auto& binding) { return binding.role == DescriptorRole::GuestBuffers; }), "image-only LDS fixture acquired guest buffers");
+    Require(std::any_of(compiled.bindings.begin(), compiled.bindings.end(), [](const auto& binding) { return binding.kind == DescriptorKind::StorageImage; }), "image-only LDS fixture lost its image");
+    const auto interface = SpecializedDiskCache::ReadInterface(compiled.spirv.Words());
+    Require(std::find(interface.bindings.begin(), interface.bindings.end(), static_cast<std::uint32_t>(RuntimeAbi::Binding::Buffers)) == interface.bindings.end(), "workgroup memory was mistaken for guest buffers");
+    for (const auto& binding : compiled.bindings) Require(std::find(interface.bindings.begin(), interface.bindings.end(), binding.binding) != interface.bindings.end(), "image-only LDS interface omitted a runtime binding");
+}
 
 void SameInvocation(const RecompileResult& left, const RecompileResult& right) {
     Require(left.spirv.Words() == right.spirv.Words(), "loaded specialized SPIR-V differs from uncached compilation");
@@ -228,6 +257,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 3) return Child(argv[1], argv[2]);
         Require(argc == 1, "invalid specialized cache test arguments");
+        SpilledImageInterface();
         root = std::filesystem::temp_directory_path() / ("anyps5-specialized-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(root);
         Environment("ANYPS5_SHADER_CACHE_DIR", (root / "cache").string());

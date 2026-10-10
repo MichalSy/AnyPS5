@@ -11,6 +11,7 @@
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
+extern "C" int APS5_VABI getpid_nid_postfix(void);
 
 using GuestHandler = void (APS5_VABI *)(int);
 struct GuestSignalSet {
@@ -336,6 +337,12 @@ int APS5_VABI raise_nid_postfix(int guest) {
     const int result = std::raise(native);
     if (result) return Fail(guestInvalid);
     return 0;
+}
+int APS5_VABI kill_nid_postfix(int pid, int guest) {
+    if (guest < 0 || guest > MaxSignal) { *__error_nid_postfix() = 22; return -1; }
+    const int self = getpid_nid_postfix();
+    if (pid != self && pid != 0 && pid != -self) { *__error_nid_postfix() = 3; return -1; }
+    return guest == 0 ? 0 : raise_nid_postfix(guest);
 }
 int APS5_VABI sigaltstack_nid_postfix(const GuestStack* stack, GuestStack* previous) {
     GuestStack replacement = alternateStack;

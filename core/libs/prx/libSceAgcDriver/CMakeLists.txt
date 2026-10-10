@@ -890,6 +890,8 @@ target_sources(agc_driver_depth_mips_tests PRIVATE ${agcSampleLodShaderHeader})
 target_include_directories(agc_driver_depth_mips_tests PRIVATE ${agcTestShaderGeneratedRoot})
 
 target_include_directories(agc_driver_deferred_compute_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+target_include_directories(agc_driver_dual_source_blend_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+
 target_include_directories(agc_driver_packed_unorm_color_target_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
 foreach(stage IN ITEMS vert frag)

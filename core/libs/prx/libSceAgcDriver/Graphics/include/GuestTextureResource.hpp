@@ -104,6 +104,7 @@ inline bool CompatibleTextureDimensions(const GuestTextureResource& first, const
 float EffectiveMinLod(const GuestTextureResource& resource);
 
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words);
+bool DescriptorSingleLevel(std::span<const std::uint32_t> words);
 bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, TextureDimension dimension);
 
 }

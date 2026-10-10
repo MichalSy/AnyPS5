@@ -100,6 +100,12 @@ ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request), mesh, tessellation);
 }
 
+std::uint32_t DeviceMemoryLdsBytes(const RecompileRequest& request) {
+    if (!request.context.compute.has_value()) return 0u;
+    const auto bytes = static_cast<std::uint64_t>(request.context.compute->ldsSizeDwords) * 4u;
+    return bytes + 4u > request.target.maxWorkgroupSharedMemoryBytes ? static_cast<std::uint32_t>(bytes) : 0u;
+}
+
 }
 
 struct PreparedControlFlow {
@@ -158,6 +164,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.userDataBaseRegister = request.context.userDataBaseRegister;
     translateOptions.userDataCount = static_cast<std::uint32_t>(request.context.userData.size());
     translateOptions.scratchDwords = request.context.compute.has_value() ? request.context.compute->scratchDwords : 0u;
+    translateOptions.sharedMemoryBytes = DeviceMemoryLdsBytes(request);
     translateOptions.fragmentShaderBarycentricEnabled = request.target.fragmentShaderBarycentricEnabled;
     translateOptions.floatMode = request.context.floatMode;
     translateOptions.inputInfo = inputInfo;
@@ -559,18 +566,10 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
 #endif
     auto module = std::make_shared<SpecializedModule>();
-    std::map<std::uint32_t, std::uint32_t> bindingNumbers;
-    for (std::size_t cursor = 5; cursor < materialized.size();) {
-        const auto count = materialized[cursor] >> 16u;
-        const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
-        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
-        if (op == spv::OpVariable && count >= 4u) {
-            if (const auto found = bindingNumbers.find(materialized[cursor + 2u]); found != bindingNumbers.end()) module->bindings.push_back(found->second);
-            module->pushData |= materialized[cursor + 3u] == spv::StorageClassPushConstant;
-        }
-        cursor += count;
-    }
-    module->spirv = std::move(materialized);
+    auto interface = SpecializedDiskCache::ReadInterface(std::move(materialized));
+    module->bindings = std::move(interface.bindings);
+    module->pushData = interface.pushData;
+    module->spirv = std::move(interface.spirv);
     module->specializationId = constants.empty() ? 0u : nextVariantId();
     if (disk) SpecializedDiskCache::Store(diskKey, module->spirv.Words());
     return module;
@@ -719,6 +718,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     if (variant.bindings.layout.UsesPushData()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u);
     if (request.context.pixel) {
         for (const auto packing : request.context.pixel->targetExportPacking) moduleKey.push_back(static_cast<std::uint32_t>(packing));
+        moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
     }
     result.vertexAttributes.reserve(result.vertexInputs.size());
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
@@ -761,6 +761,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (variant.bindings.layout.UsesPushData()) constants.push_back({PipelineSpecialization::PushDataOffset, moduleKey[index++]});
             if (request.context.pixel) {
                 for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) constants.push_back({PipelineSpecialization::ExportPackingBase + target, moduleKey[index++]});
+                constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
             }
             if (!artifact.vertexInputPatches.empty()) {
                 for (const auto& input : result.vertexInputs) {
@@ -795,6 +796,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     }
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
+    result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size());
@@ -946,6 +948,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     if (request.context.pixel) {
         for (const auto mapping : request.context.pixel->targetExportMapping) mix(mapping);
         for (const auto packing : request.context.pixel->targetExportPacking) mix(static_cast<std::uint64_t>(packing));
+        mix(request.context.pixel->dualSourceBlend);
     }
     if (request.context.vertex) {
         const auto& vertex = *request.context.vertex;
