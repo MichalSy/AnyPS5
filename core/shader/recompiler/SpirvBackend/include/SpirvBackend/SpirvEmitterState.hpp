@@ -85,6 +85,7 @@ struct SpirvEmitterState {
 
     SpirvRequirements requirements;
     std::uint32_t laneCount = 1;
+    const IrValue* independentReadWriteStore = nullptr;
     std::uint32_t hostSubgroupSize = 0;
     bool splitSubgroup = false;
     bool narrowSubgroupClock = false;

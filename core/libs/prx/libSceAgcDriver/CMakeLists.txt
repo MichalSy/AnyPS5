@@ -896,6 +896,7 @@ target_include_directories(agc_driver_registration_concurrency_tests PRIVATE $<T
 target_include_directories(agc_driver_prepared_graphics_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 target_include_directories(agc_driver_null_pixel_shader_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 target_link_libraries(agc_driver_interpolation_modes_tests PRIVATE shader_recompiler_agc_driver)
+target_link_libraries(agc_driver_independent_compute_halves_tests PRIVATE shader_recompiler_agc_driver)
 
 target_include_directories(agc_driver_prepared_shaders_tests PRIVATE
         $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
@@ -1267,6 +1268,14 @@ if(BUILD_TESTING)
     add_test(NAME mask_roundtrip COMMAND mask_roundtrip_tests)
     if(WIN32)
         set_tests_properties(mask_roundtrip PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(independent_compute_halves_tests ${LIBS_INCLUDE_DIR}/tests/IndependentComputeHalves.cpp)
+    target_link_libraries(independent_compute_halves_tests PRIVATE shader_recompiler_agc_driver libc)
+    configure_windows_unwind(independent_compute_halves_tests)
+    add_test(NAME independent_compute_halves COMMAND independent_compute_halves_tests)
+    if(WIN32)
+        set_tests_properties(independent_compute_halves PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(tiny_product_boundary_tests ${LIBS_INCLUDE_DIR}/tests/TinyProductBoundary.cpp)

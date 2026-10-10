@@ -1,5 +1,6 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitter.hpp"
+#include "SpirvBackend/IndependentComputeHalves.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvEmitterState.hpp"
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
@@ -253,7 +254,12 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.splitSubgroup = program.WaveSize() == 32u && target.subgroupSize > 32u;
     if (state.splitSubgroup && (state.requirements.subgroupBallot || state.requirements.subgroupShuffle)) state.requirements.subgroupLocalInvocationId = true;
     const auto* workgroup = ShaderWorkgroupInputFor(state);
+    if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
     state.laneCount = workgroup != nullptr && program.WaveSize() == 64u && workgroup->hostSubgroupSize == 32u ? 2u : 1u;
+    if (state.laneCount == 2u && state.loopGuardLimit == 0u && program.Resources().stage == IrShaderStage::Compute && inputInfo.compute != nullptr) {
+        state.independentReadWriteStore = IndependentComputeHalfStore(program, *inputInfo.compute);
+        if (state.independentReadWriteStore != nullptr) state.laneCount = 1u;
+    }
     if (state.laneCount == 2u) state.sharedLaneValues = WaveUniformValues(program);
     if (program.Resources().stage == IrShaderStage::Compute && workgroup != nullptr) {
         // The key comes from a subgroup ballot (ReadFirstLane), so the slot is uniform over the
@@ -264,7 +270,6 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         state.tableIndexNonUniform = threads > program.WaveSize() || !oneSubgroup;
     }
     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
-    if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
     // Stopped invocations would leave the wave LDS barriers incomplete.
     state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
     EmitModuleHeader(state, bindings);

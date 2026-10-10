@@ -740,6 +740,10 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
                 ldsRead |= access != SharedAccess::Write;
             }
         }
+        if (inst == state.independentReadWriteStore) {
+            const auto semantics = spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsImageMemoryMask | spv::MemorySemanticsUniformMemoryMask;
+            state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, semantics));
+        }
         const bool shared = state.laneCount == 2u && inst->Type() != IrType::Void && !IrOpcodeHasSideEffects(inst->Opcode()) && state.sharedLaneValues.contains(inst);
         for (std::uint32_t half = 0; half < state.laneCount; half++) {
             if (half != 0 && ctx.otherHalf == nullptr) {

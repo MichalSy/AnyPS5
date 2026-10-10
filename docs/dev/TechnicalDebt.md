@@ -451,3 +451,7 @@ Arbitrary shader writes, packet fills outside VulkanDevice::FillBuffer, partial 
 ### Depth image mapping lifetime
 
 Native depth/stencil cache entries are retired when the guest allocation is unmapped, removed or replaced, including MAP_FIXED replacement. Protection-only changes preserve them. Retired images stay alive for existing sampled handles and in-flight work, and a later depth bind creates a fresh image rather than reviving an unmapped allocation. Mapping invalidation takes the surface registry lock without reading guest memory or submitting Vulkan work. The existing MSAA overlap check only knows each plane's base address; partial unmaps that exclude that base cannot yet invalidate the unknown full MSAA footprint.
+
+### Independent compute halves
+
+[IndependentComputeHalfStore](../../core/shader/recompiler/SpirvBackend/src/IndependentComputeHalves.cpp) admits full 8x8 wave64 compute groups on subgroup32 hosts only when the validated program has no LDS, scratch, cross-lane operations, real physical-address reads or guarded SRT access. A read prefix ends in one injective image store; an unconditional Workgroup barrier preserves reads before writes when sampled and storage descriptors share an image. Ordinary control must be uniform. A pure one-block EXEC skip may vary only when every escaping value is remasked to its exact bypass value. Partial groups, diagnostic loop guards and programs outside this proof retain paired software contexts. Wider eligibility remains unimplemented.
