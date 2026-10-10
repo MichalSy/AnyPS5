@@ -338,6 +338,16 @@ int main() {
     Require(sceKernelRmdir(rootName.c_str()) == static_cast<int>(0x80020042u));
     Require(rmdir_nid_postfix(presentName.c_str()) == -1 && *__error_nid_postfix() == 20);
     Require(rmdir_nid_postfix(missingName.c_str()) == -1 && *__error_nid_postfix() == 2);
+    const auto lockedFile = [&](const char* name) {
+        const auto locked = root / name;
+        { std::ofstream stream(locked); stream << "removable"; }
+        Require(sceKernelChmod_nid_postfix(locked.string().c_str(), 0400) == 0);
+        return locked;
+    };
+    const auto lockedPosix = lockedFile("locked-posix");
+    Require(unlink_nid_postfix(lockedPosix.string().c_str()) == 0 && !std::filesystem::exists(lockedPosix));
+    const auto lockedKernel = lockedFile("locked-kernel");
+    Require(sceKernelUnlink(lockedKernel.string().c_str()) == 0 && !std::filesystem::exists(lockedKernel));
     Require(rmdir_nid_postfix("") == -1 && *__error_nid_postfix() == 2);
     Require(rmdir_nid_postfix(nullptr) == -1 && *__error_nid_postfix() == 14);
     Require(unlink_nid_postfix(missingName.c_str()) == -1 && *__error_nid_postfix() == 2);
