@@ -90,6 +90,29 @@ With `CMAKE_OSX_ARCHITECTURES=x86_64` Apple silicon runs the tests through Roset
 
 Set `APS5_PIPELINE_STATS=1` to capture and print driver statistics for each newly created graphics or compute pipeline. This requires `VK_KHR_pipeline_executable_properties` and `pipelineExecutableInfo`; an unsupported device fails with an error. Statistic names and units are driver-specific. Capturing statistics can increase pipeline compilation cost. The setting is disabled by default.
 
+## Guarded local game launch
+
+The local root `run.sh` uses `tools/run_with_memory_guard.py` to launch Bomberman
+inside a systemd user memory cgroup on Linux. It requires cgroup v2 and an active
+systemd user manager; a failed setup does not fall back to an unguarded launch.
+
+`ANYPS5_MEMORY_MAX_MIB` caps the game group, defaulting to 18432 MiB. The actual
+limit is the smaller of this cap and available RAM minus
+`ANYPS5_MEMORY_RESERVE_MIB`, which defaults to 6144 MiB. Limits apply to resident
+cgroup memory, including charged file and shared memory, rather than the large
+virtual guest address reservation. No CPU or memory-high throttling is applied.
+
+The guard samples memory once per second and stops its game group if available
+system RAM falls below the smaller of the reserve and 4096 MiB. A kernel cgroup
+OOM can also terminate the game at its hard limit. This limits test damage; it
+does not fix an allocation leak or guarantee stability under unrelated system
+memory pressure. Core dumps and swapping for the game group are disabled.
+
+`ANYPS5_MEMORY_LOG` selects a new JSONL output file; otherwise logs are written
+under `build/profiles/memory-guard/`. Logs record the cap, memory usage, cgroup
+memory categories and observed peak. Stop a guarded run with Ctrl+C or close its
+game window. Each launch computes its limit again.
+
 ## Read-only buffer staging
 
 `APS5_READONLY_STAGING=1` enables experimental device-local staging for certified
