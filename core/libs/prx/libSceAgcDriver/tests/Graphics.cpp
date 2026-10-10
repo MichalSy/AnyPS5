@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "SceShaders.hpp"
@@ -34,6 +35,7 @@
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -4058,6 +4060,41 @@ void vertexZeroFillMergeTests() {
     Require(solo.size() == 1 && solo[0] == 1, "a fetch past the records is copied alone");
 }
 
+void parallelCompareTests() {
+    using AgcDriver::Graphics::CompareSpan;
+    using AgcDriver::Graphics::CompareSpansFrom;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t count = 48;
+    std::vector<std::byte> first(block * count + 100, std::byte{7});
+    auto second = first;
+    const std::array<std::size_t, 4> changedAt{3 * block + 17, 20 * block, 33 * block + block - 1, 47 * block + 120};
+    for (const auto at : changedAt) second[at] = std::byte{9};
+    std::vector<CompareSpan> spans;
+    for (std::size_t k = 0; k < count; ++k) {
+        const auto length = k + 1 == count ? block + 100 : block;
+        spans.push_back({first.data() + k * block, second.data() + k * block, length});
+    }
+    const auto expected = [&](std::size_t k) {
+        return std::none_of(changedAt.begin(), changedAt.end(), [&](std::size_t at) { return at >= k * block && at < k * block + spans[k].bytes; });
+    };
+    for (const std::size_t threshold : {std::size_t{0}, std::size_t{1} << 40u}) {
+        for (int round = 0; round < 20; ++round) {
+            std::vector<std::uint8_t> equal(count, 2);
+            CompareSpansFrom(spans, equal, threshold);
+            for (std::size_t k = 0; k < count; ++k) Require((equal[k] == 1) == expected(k) && equal[k] <= 1, "parallel compare misreported a span");
+        }
+    }
+    std::vector<std::uint8_t> left(count, 2), right(count, 2);
+    std::thread other([&] {
+        for (int round = 0; round < 50; ++round) CompareSpansFrom(spans, right, 0);
+    });
+    for (int round = 0; round < 50; ++round) CompareSpansFrom(spans, left, 0);
+    other.join();
+    for (std::size_t k = 0; k < count; ++k) Require((left[k] == 1) == expected(k) && (right[k] == 1) == expected(k), "concurrent parallel compares misreported a span");
+    std::vector<std::uint8_t> none;
+    CompareSpansFrom({}, none, 0);
+}
+
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
@@ -4152,6 +4189,7 @@ int main() {
         nullVertexDescriptorTests();
         vertexZeroFillTests();
         vertexZeroFillMergeTests();
+        parallelCompareTests();
         pixelParameterSlotTests();
         rectListTests();
         floatControlsModeTests();

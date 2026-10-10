@@ -1922,6 +1922,14 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         AgcDriver::GuestMemory::MarkWritten(element, 4);
         const auto afterStore = snapshot(std::byte{0x33});
         Require(afterStore != afterCpu, "a draw snapshot outlived a driver store to its range");
+        std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
+        Require(snapshot(std::byte{0x33}) == afterStore, "a CPU store of the same bytes made the draw input copy again");
+        AgcDriver::GuestMemory::MarkWritten(element, 4);
+        Require(snapshot(std::byte{0x33}) == afterStore, "a driver store of the same bytes made the draw input copy again");
+        reinterpret_cast<std::uint8_t*>(element)[elementBytes - 1] = 0x34;
+        const auto tail = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(tail != nullptr && tail->snapshots.size() == 1 && tail->snapshots[0].buffer != afterStore && tail->snapshots[0].buffer->Bytes()[elementBytes - 1] == std::byte{0x34}, "a draw snapshot outlived a store that changed its last byte");
+        std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
         {
             GuestAllocations::Mutation mutation;
         }
@@ -1930,6 +1938,114 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     }
     recorder.Activate();
 }
+
+void drawSnapshotPatchTests(const Device& device) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 4 * 65536;
+    std::unique_lock gpu(GpuMutex());
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: snapshot patching not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<std::uint8_t*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = static_cast<std::uint8_t>(at * 13u + 5u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the watched block refused: snapshot patching not tested\n";
+        return;
+    }
+    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host imports are compared, not watched: snapshot patching not tested\n";
+        return;
+    }
+    constexpr std::size_t elementOffset = 4096;
+    constexpr std::size_t elementBytes = 3 * 65536;
+    const auto element = address + elementOffset;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    binding.bufferWritten = {false};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto snapshotContext = context;
+    DescriptorCache cache(snapshotContext);
+    snapshotContext.descriptorCache = &cache;
+    Recorder snapshotRecorder(snapshotContext);
+    snapshotRecorder.Activate();
+    {
+        ShaderResources resources(snapshotContext, compute);
+        const auto snapshot = [&] {
+            auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+            Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
+            auto buffer = bindings->snapshots[0].buffer;
+            const auto contents = buffer->Bytes();
+            Require(contents.size() == elementBytes && std::memcmp(contents.data(), reinterpret_cast<const void*>(element), elementBytes) == 0, "a draw snapshot does not hold the guest bytes of its draw");
+            return buffer;
+        };
+        const auto settle = [&](const std::weak_ptr<Buffer>& buffer) {
+            snapshotRecorder.Sync();
+            gpu.unlock();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (buffer.use_count() > 1 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            gpu.lock();
+            Require(buffer.use_count() == 1, "a finished draw still holds its snapshot");
+        };
+        std::weak_ptr<Buffer> first = snapshot();
+        settle(first);
+        guest[elementOffset + 10] ^= 0xffu;
+        guest[elementOffset + 65536 + 300] ^= 0xffu;
+        guest[elementOffset + 2 * 65536 + 7] = guest[elementOffset + 2 * 65536 + 7];
+        guest[elementOffset + elementBytes - 1] ^= 0x5au;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        {
+            const auto patched = snapshot();
+            Require(patched == first.lock(), "a stale snapshot nothing else holds was copied whole instead of patched");
+        }
+        settle(first);
+        std::memset(guest + elementOffset + 65536, 0x77, 65536);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        {
+            const auto patched = snapshot();
+            Require(patched == first.lock(), "a snapshot whose whole middle block changed was not patched");
+        }
+        settle(first);
+        const auto held = snapshot();
+        Require(held == first.lock(), "an unchanged snapshot was not reused");
+        const std::vector<std::byte> before(held->Bytes().begin(), held->Bytes().end());
+        guest[elementOffset + 2 * 65536 + 100] ^= 0xffu;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto fresh = snapshot();
+        Require(fresh != held, "a snapshot a recorded draw still holds was patched");
+        Require(std::memcmp(held->Bytes().data(), before.data(), before.size()) == 0, "a held snapshot's bytes changed");
+        snapshotRecorder.Sync();
+    }
+}
+
 
 void drawSnapshotEvictionTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
@@ -3092,6 +3208,129 @@ void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
     }
     if (!failures.empty()) throw std::runtime_error("single-pass storage moves:\n" + failures);
     std::cout << "single-pass storage moves" << (watched ? " (watched)" : "") << ": ok (" << tested << " surfaces)\n";
+}
+
+void refreshProofTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: refresh proofs not tested\n";
+        return;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t surfaceBytes = side * side * 4;
+    constexpr std::size_t keyCount = surfaceBytes / 256;
+    constexpr std::size_t bytes = surfaceBytes + 65536;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: refresh proofs not tested\n";
+        return;
+    }
+    auto* texels = static_cast<std::uint8_t*>(block);
+    auto* keys = texels + surfaceBytes;
+    std::memset(texels, 0x55, surfaceBytes);
+    std::memset(keys, 0xff, keyCount);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "no watched host import: refresh proofs not tested\n";
+        return;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    resource.dccAddress = address + surfaceBytes;
+    const auto proved = [] { return StorageTexture::RefreshesProved(); };
+    {
+        auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const auto draw = [&](VkClearColorValue value) {
+            const auto commands = recorder.Commands();
+            recorder.Keep(image);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            image->MarkDirty();
+        };
+        const auto settle = [&] {
+            image->Refresh();
+            image->Refresh();
+        };
+        const auto expectProved = [&](const char* what) {
+            const auto before = proved();
+            Require(image->Refresh(), what);
+            Require(proved() == before + 1, what);
+        };
+        const auto expectFull = [&](const char* what) {
+            const auto before = proved();
+            image->Refresh();
+            Require(proved() == before, what);
+        };
+        settle();
+        expectProved("an unchanged surface was not proved current");
+        expectProved("a proved surface was not proved again");
+        draw({{1.0f, 0.0f, 0.0f, 1.0f}});
+        settle();
+        expectProved("a target holding its own pending results was not proved current");
+        draw({{0.0f, 1.0f, 0.0f, 1.0f}});
+        expectProved("a draw into an already pending target broke its proof");
+        texels[0] = 0x11;
+        expectFull("a CPU write of the surface was answered from the proof");
+        settle();
+        expectProved("the proof was not taken again after a CPU write");
+        AgcDriver::GuestMemory::MarkWritten(address + 65536, 4096);
+        expectFull("a driver store into the surface was answered from the proof");
+        settle();
+        AgcDriver::GuestMemory::MarkWritten(resource.dccAddress, keyCount);
+        expectFull("a key store over the surface's keys was answered from the proof");
+        settle();
+        expectProved("the proof was not taken again after a key store");
+        auto other = resource;
+        other.dccAddress = 0;
+        auto pending = std::make_shared<StorageTexture>(context, detiler, other, 0);
+        recorder.Keep(pending);
+        pending->MarkDirty();
+        expectFull("another image's pending results over the surface were answered from the proof");
+        settle();
+        expectProved("the proof was not taken again after another image's results were stored");
+        pending->MarkDirty();
+        expectFull("another image's pending results were answered from the proof");
+        Require(!AgcDriver::Graphics::PendingStorageOverlaps(address, surfaceBytes, image.get()), "the full refresh left another image's results pending");
+        auto fresh = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+        const auto before = proved();
+        fresh->Refresh();
+        Require(proved() == before, "a new image of the surface was answered from another image's proof");
+        std::memset(keys, 0x00, keyCount);
+        expectFull("a fast clear of the keys was answered from the proof");
+        recorder.Sync();
+    }
+    recorder.Sync();
 }
 
 
@@ -5066,6 +5305,7 @@ int main(int argc, char** argv) {
         closeRaceTests(device, recorder);
         keyProofTests(device, recorder);
         targetKeyProofTests(device, recorder);
+        refreshProofTests(device, recorder);
         resourceReadTests(device, recorder);
         depthSurfaceProofTests(device, recorder);
         readWrittenStagingTests(device, recorder);
@@ -5107,7 +5347,9 @@ int main(int argc, char** argv) {
         sampleDumpTests(device, recorder);
         gpu.unlock();
         hostImportUnmapTests(device, recorder);
+        drawSnapshotPatchTests(device);
         gpu.lock();
+        recorder.Activate();
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {
