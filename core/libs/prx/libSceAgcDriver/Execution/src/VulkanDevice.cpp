@@ -3605,7 +3605,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             kept->WriteBackBuffers();
         });
         // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
-        writers->push_back(kept);
+        if (resources.HasCopiedWrites()) writers->push_back(kept);
     }
     if (resources.HoldsLease() && !SyncEachDispatch() && !Graphics::SyncLeaseWork()) Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
     recordStep(PhaseRecordCompletion);

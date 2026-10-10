@@ -2225,7 +2225,17 @@ void resourceTests() {
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestImages; binding.kind = Kind::SampledImage; binding.binding = 1u; }), "guest texture descriptor must contain 8 dwords");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestImages; binding.kind = Kind::StorageImage; binding.binding = 29u; }), "guest storage image descriptors must contain 8 dwords");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestSamplers; binding.kind = Kind::Sampler; binding.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers); }), "shader sampler descriptors exceed per-stage limits");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestImages; binding.kind = Kind::SampledImage; binding.binding = 29u; }), "resource class disagrees");
+    {
+        ShaderRecompiler::RecompileResult vertex;
+        ShaderRecompiler::RecompileResult fragment;
+        vertex.bindings.push_back(changed([](auto& binding) { binding.role = Role::GuestImages; binding.kind = Kind::SampledImage; binding.binding = 29u; binding.guestDescriptor.assign(8, 0); binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D; }));
+        auto sampledContext = mockContext();
+        sampledContext.limits.maxPerStageDescriptorSampledImages = 1;
+        sampledContext.limits.maxDescriptorSetSampledImages = 1;
+        mock = MockVulkan{};
+        expectFailure([&] { AgcDriver::Graphics::ShaderResources resources(sampledContext, vertex, fragment, state.color, 0, 0); }, "resource class disagrees");
+        Require(mock.live == 0, "resource class disagreement leaked Vulkan objects");
+    }
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::Gds; }), "invalid GDS descriptor contract");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::BdaPagetable; binding.guestDescriptor.clear(); }), "BDA table and fault descriptors");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::FaultBuffer; binding.guestDescriptor.clear(); }), "BDA table and fault descriptors");
@@ -2290,6 +2300,8 @@ void resourceTests() {
             mock = MockVulkan{};
             auto limited = mockContext();
             limited.limits.maxPerStageResources = limit;
+            limited.limits.maxPerStageDescriptorStorageImages = 1;
+            limited.limits.maxDescriptorSetStorageImages = 1;
             expectFailure([&] { AgcDriver::Graphics::ShaderResources resources(limited, vertex, fragment, state.color, 0, 0); }, reason);
             Require(mock.live == 0, "failed shader resources leaked Vulkan objects");
         };
@@ -4102,6 +4114,34 @@ void parallelCompareTests() {
     CompareSpansFrom({}, none, 0);
 }
 
+void retainedResourcePlanTests() {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    {
+        DescriptorCache descriptors(context);
+        context.descriptorCache = &descriptors;
+        ShaderRecompiler::RecompileResult program;
+        program.variantId = 0x100000;
+        program.pushConstants.resize(4);
+        program.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 1, vsharp(guestFirst.data(), 16)));
+        program.bindings.front().bufferWritten = {false};
+        program.bindings.front().bufferRead = {true};
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources before(context, shader);
+        const auto beforeWrite = findWrite(0);
+        program.bindings.front().guestDescriptor = vsharp(guestSecond.data(), 32);
+        mock.writes.clear();
+        ShaderResources after(context, shader);
+        const auto afterWrite = findWrite(0);
+        if (std::getenv("APS5_NO_BINDING_PLAN_CACHE") == nullptr) Require(&before.Plan() == &after.Plan(), "resource builds did not retain invariant binding metadata");
+        else Require(&before.Plan() != &after.Plan(), "disabled plan cache retained binding metadata");
+        Require(beforeWrite.buffers.front().range == 16 && afterWrite.buffers.front().range == 32, "cached binding plan froze a runtime buffer range");
+        Require(sameBytes(bufferBytes(beforeWrite.buffers.front().buffer), guestFirst.data(), 16) && sameBytes(bufferBytes(afterWrite.buffers.front().buffer), guestSecond.data(), 32), "later materialization changed an earlier resource build's data");
+    }
+    Require(mock.live == 0, "retained resource binding metadata leaked Vulkan objects");
+}
+
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
@@ -4274,6 +4314,7 @@ int main() {
             [] { return mock.pipelineCreateCount; },
             [] { return mock.pipelineSpecializations.back(); }
         });
+        retainedResourcePlanTests();
         std::cout << "Graphics validation tests passed\n";
         return 0;
     } catch (const std::exception& error) {

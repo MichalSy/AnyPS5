@@ -196,6 +196,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindingPlan.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestBufferMemory.cpp
@@ -572,6 +573,23 @@ target_link_libraries(agc_shader_device_profile_tests PRIVATE shader_recompiler_
 set_target_properties(agc_shader_device_profile_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_device_profile_tests)
 
+add_test_executable(agc_binding_plan_tests EXCLUDE_FROM_ALL tests/BindingPlan.cpp Graphics/src/BindingPlan.cpp)
+target_include_directories(agc_binding_plan_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_binding_plan_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_binding_plan_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_binding_plan_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_binding_plan_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_binding_plan COMMAND agc_binding_plan_tests)
+    add_test(NAME agc_binding_plan_uncached COMMAND agc_binding_plan_tests)
+    set_tests_properties(agc_binding_plan agc_binding_plan_uncached PROPERTIES TIMEOUT 30)
+    set_tests_properties(agc_binding_plan_uncached PROPERTIES ENVIRONMENT "APS5_NO_BINDING_PLAN_CACHE=1")
+    if(WIN32)
+        set_tests_properties(agc_binding_plan agc_binding_plan_uncached PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_shader_control_flow_tests EXCLUDE_FROM_ALL
         tests/ControlFlow.cpp
 )
@@ -736,6 +754,12 @@ if(BUILD_TESTING)
         set_tests_properties(agc_unchanged_cpu_stamps PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_storage_baseline_settled COMMAND agc_driver_recorder_tests --storage-baseline-settled-only)
+    set_tests_properties(agc_storage_baseline_settled PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_storage_baseline_settled PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_host_import_unmap COMMAND agc_driver_recorder_tests --host-import-unmap-only)
     set_tests_properties(agc_host_import_unmap PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
@@ -826,6 +850,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/MultisampleColorLayout.cpp
         Graphics/src/ColorTargetTransfer.cpp
         Graphics/src/Resources.cpp
+        Graphics/src/BindingPlan.cpp
         Graphics/src/ShaderResources.cpp
         Graphics/src/ShaderAddressResources.cpp
         Graphics/src/GuestBufferMemory.cpp

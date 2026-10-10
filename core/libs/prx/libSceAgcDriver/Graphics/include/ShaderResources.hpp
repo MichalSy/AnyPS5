@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindingPlan.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -85,6 +86,7 @@ public:
         std::uint64_t dedicatedPools = 0;
     };
     Stats Counters() const;
+    std::shared_ptr<const BindingPlan> Plan(std::span<const CompiledShader> shaders, std::uint32_t colorAttachments = 0) { return plans.Get(shaders, colorAttachments); }
 
 private:
     Context context;
@@ -97,6 +99,7 @@ private:
     std::vector<VkDescriptorPool> updateAfterBindPools;
     std::vector<VkDescriptorPool> dedicated;
     Stats stats;
+    BindingPlanCache plans;
 };
 
 class ShaderResources {
@@ -160,7 +163,8 @@ public:
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     bool ReadsImage(const StorageTexture* image) const;
-    const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
+    const std::vector<std::uint32_t>& LayoutKey() const { return bindingPlan->layoutKey; }
+    const BindingPlan& Plan() const { return *bindingPlan; }
     // Debug aid: each bound guest resource with the fraction of sampled bytes that are nonzero.
     std::string Describe() const;
 
@@ -278,7 +282,7 @@ private:
 
     struct Binding {
         VkDescriptorSetLayoutBinding layout;
-        std::vector<std::size_t> allocations;
+        std::ranges::iota_view<std::size_t, std::size_t> allocations;
         std::vector<std::size_t> imageAllocations;
     };
 
@@ -307,7 +311,7 @@ private:
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
-    void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags);
+    void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, std::size_t index);
     // Stage A: one record per planned image element (ImageRecord), in plan order: the decoded
     // descriptor and its surface size (computed once for the build), the write watch walked so stage
     // B's collects are memo hits (APS5_NO_PRECOLLECT=1 skips the pass entirely), and for a sampled
@@ -412,7 +416,7 @@ private:
     // Today's per-element walk (APS5_NO_EPOCH_REVALIDATE=1).
     bool fastRevalidateEach();
     Context context;
-    std::vector<std::uint32_t> layoutKey;
+    std::shared_ptr<const BindingPlan> bindingPlan;
     GuestBufferMemory guestMemory;
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
@@ -479,7 +483,6 @@ private:
         std::size_t samplerCount = 0;
     };
     std::vector<DeferredImages> deferredImages;
-    std::uint64_t storageBuffers = 0;
     bool updateAfterBind = false;
     std::uint32_t plannedSampledImages = 0;
     std::uint32_t plannedStorageImages = 0;

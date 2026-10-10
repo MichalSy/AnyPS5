@@ -3301,6 +3301,121 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
     std::cout << "unchanged CPU stamps: ok\n";
 }
 
+bool settledBaselineTests(const Device& device, Recorder& recorder, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu) {
+    const auto& base = device.GetContext();
+#ifdef _WIN32
+    std::cout << "generation baseline over a pending store: Linux write watch only\n";
+    return false;
+#endif
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: generation baseline over a pending store not tested\n";
+        return false;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::uint64_t offset = 0x2000;
+    constexpr std::size_t bytes = 6 * 65536;
+    const auto decided = PrepareImportWatch(base);
+    SetImportWatch(base, ImportWatch::Watch);
+    struct Restore {
+        const Context& context;
+        ImportWatch decided;
+        ~Restore() { SetImportWatch(context, decided); }
+    } restore{base, decided};
+    for (const bool pending : {false, true}) {
+        void* block = AllocateWatched(bytes, 65536);
+        if (block == nullptr) {
+            std::cout << "no write watching: generation baseline over a pending store not tested\n";
+            return false;
+        }
+        std::memset(block, 0x5a, bytes);
+        const auto blockAddress = reinterpret_cast<std::uint64_t>(block);
+        const auto address = blockAddress + offset;
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, bytes, true, true, true);
+        }
+        struct Unregister {
+            const Context& context;
+            Recorder& recorder;
+            std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu;
+            void* block;
+            std::uint64_t address;
+            std::size_t bytes;
+            ~Unregister() {
+                recorder.Sync();
+                gpu.unlock();
+                {
+                    struct Relock {
+                        std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu;
+                        ~Relock() { gpu.lock(); }
+                    } relock{gpu};
+                    GuestAllocations::Mutation mutation;
+                    mutation.Remove(block);
+                }
+                HostImportFor(context, address, bytes);
+                ReleaseWatched(block, bytes);
+            }
+        } unregister{base, recorder, gpu, block, blockAddress, bytes};
+        AgcDriver::GuestMemory::CollectWritesUncached(blockAddress, bytes);
+        TextureDetiler detiler(base);
+        auto context = base;
+        context.detiler = &detiler;
+        GuestTextureResource resource{};
+        resource.baseAddress = address;
+        resource.width = side;
+        resource.height = side;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kLinear;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        const auto surfaceBytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+        Require(surfaceBytes == side * side * 4, "unexpected settled-baseline surface size");
+        if (HostImportFor(context, address, surfaceBytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, surfaceBytes)) {
+            std::cout << "no watched host import: generation baseline over a pending store not tested\n";
+            return false;
+        }
+        static_cast<void>(recorder.Commands());
+        if (pending) {
+            recorder.NotePendingWrite(address + 4096, 4096);
+            Require(recorder.PendingWriteOverlaps(address, surfaceBytes), "the pending baseline fixture has no recorded store over its surface");
+        }
+        const auto before = recorder.Submissions();
+        {
+            auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+            recorder.Keep(image);
+            if (pending) Require(recorder.Submissions() == before, "an upload over a pending recorded store submitted the open batch to read its generation baseline");
+            const auto commands = recorder.Commands();
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            const VkClearColorValue value{{1.0f, 0.0f, 0.0f, 1.0f}};
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            image->MarkDirty();
+            std::memset(reinterpret_cast<void*>(address), 0x5a, 4096);
+            AgcDriver::GuestMemory::CollectWritesUncached(blockAddress, bytes);
+            image->WriteBack();
+        }
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        std::vector<std::byte> read(bytes);
+        AgcDriver::GuestMemory::Read(blockAddress, read);
+        if (pending) Require(std::all_of(read.begin() + offset, read.begin() + 65536, [](std::byte value) { return value == std::byte{0x5a}; }), "a CPU-stamped block was overwritten without a settled generation baseline");
+        constexpr std::array<std::uint8_t, 4> red{255, 0, 0, 255};
+        for (std::size_t at = pending ? 65536 : offset; at < offset + surfaceBytes; at += 4) {
+            for (std::size_t channel = 0; channel < red.size(); ++channel) {
+                Require(std::to_integer<std::uint8_t>(read[at + channel]) == red[channel], pending ? "a write-back dropped GPU results outside the CPU-stamped block" : "a settled generation baseline rejected an unchanged CPU stamp");
+            }
+        }
+    }
+    std::cout << "settled and pending generation baselines: ok\n";
+    return true;
+}
+
 void importWindowTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& base = device.GetContext();
@@ -5238,6 +5353,9 @@ int main(int argc, char** argv) {
             unchangedCpuStampTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--storage-baseline-settled-only") {
+            return settledBaselineTests(device, recorder, gpu) ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--completion-labels-only") {
             completionCountTests(device, recorder);
             afterRecordedWorkTests(device, recorder);
@@ -5298,6 +5416,7 @@ int main(int argc, char** argv) {
         singlePassTests(device, recorder, false);
         singlePassTests(device, recorder, true);
         unchangedCpuStampTests(device, recorder);
+        settledBaselineTests(device, recorder, gpu);
         importWatchTests(device);
         staleGenerationTests(device, recorder);
         importWindowTests(device, recorder);
