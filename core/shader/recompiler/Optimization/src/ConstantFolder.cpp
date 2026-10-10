@@ -472,6 +472,17 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
         case IrOpcode::UMulHi: {
             return foldU32(builder, value, [](std::uint32_t a, std::uint32_t b) { return static_cast<std::uint32_t>((static_cast<std::uint64_t>(a) * b) >> 32u); });
         }
+        case IrOpcode::F32ProductIsTiny: {
+            return foldU32Compare(builder, value, [](std::uint32_t a, std::uint32_t b) {
+                const auto lhsExponent = (a >> 23u) & 0xffu;
+                const auto rhsExponent = (b >> 23u) & 0xffu;
+                if (lhsExponent == 0u || lhsExponent == 0xffu || rhsExponent == 0u || rhsExponent == 0xffu) return false;
+                const auto lhsSignificand = (a & 0x007fffffu) | 0x00800000u;
+                const auto rhsSignificand = (b & 0x007fffffu) | 0x00800000u;
+                const auto carry = (static_cast<std::uint64_t>(lhsSignificand) * rhsSignificand) >= (1ull << 47u) ? 1u : 0u;
+                return lhsExponent + rhsExponent + carry < 128u;
+            });
+        }
         case IrOpcode::IAbs32: {
             auto& operand = resolveArg(value, 0);
             if (!isImmediate(operand, IrType::U32)) {

@@ -284,6 +284,23 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
                 return true;
             }
             return false;
+        case IrOpcode::F32ProductIsTiny:
+            if (binary()) {
+                const auto lhsBits = static_cast<std::uint32_t>(a);
+                const auto rhsBits = static_cast<std::uint32_t>(b);
+                const auto lhsExponent = (lhsBits >> 23u) & 0xffu;
+                const auto rhsExponent = (rhsBits >> 23u) & 0xffu;
+                if (lhsExponent == 0u || lhsExponent == 0xffu || rhsExponent == 0u || rhsExponent == 0xffu) {
+                    result = 0u;
+                    return true;
+                }
+                const auto lhsSignificand = (lhsBits & 0x007fffffu) | 0x00800000u;
+                const auto rhsSignificand = (rhsBits & 0x007fffffu) | 0x00800000u;
+                const auto carry = (static_cast<std::uint64_t>(lhsSignificand) * rhsSignificand) >= (1ull << 47u) ? 1u : 0u;
+                result = lhsExponent + rhsExponent + carry < 128u ? 1u : 0u;
+                return true;
+            }
+            return false;
         case IrOpcode::FPTrunc32:
             if (Arg(inst, 0, a)) {
                 result = Float32Bits(std::trunc(Float32(a)));

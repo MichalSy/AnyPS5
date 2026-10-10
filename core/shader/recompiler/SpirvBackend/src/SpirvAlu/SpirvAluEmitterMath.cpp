@@ -561,6 +561,54 @@ std::uint32_t EmitUMulHi(SpirvEmitterState& state, std::uint32_t arg0, std::uint
     return EmitMulHigh(state, arg0, arg1, false);
 }
 
+std::uint32_t EmitF32ProductIsTiny(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
+    const auto exponent = [&](std::uint32_t bits) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), result, bits, ConstantU32(state, 23u), ConstantU32(state, 8u));
+        return result;
+    };
+    const auto normalExponent = [&](std::uint32_t value) {
+        const auto nonzero = Binary(state, spv::OpINotEqual, TypeBool(state), value, ConstantU32(state, 0u));
+        const auto finite = Binary(state, spv::OpINotEqual, TypeBool(state), value, ConstantU32(state, 0xffu));
+        return Binary(state, spv::OpLogicalAnd, TypeBool(state), nonzero, finite);
+    };
+    const auto lhsExponent = exponent(arg0);
+    const auto rhsExponent = exponent(arg1);
+    const auto normal = Binary(state, spv::OpLogicalAnd, TypeBool(state), normalExponent(lhsExponent), normalExponent(rhsExponent));
+    const auto sum = Binary(state, spv::OpIAdd, TypeU32(state), lhsExponent, rhsExponent);
+    const auto below = Binary(state, spv::OpULessThan, TypeBool(state), sum, ConstantU32(state, 127u));
+    const auto boundary = Binary(state, spv::OpIEqual, TypeBool(state), sum, ConstantU32(state, 127u));
+    const auto withoutCarry = [&] {
+        const auto significand = [&](std::uint32_t bits) {
+            const auto fraction = Binary(state, spv::OpBitwiseAnd, TypeU32(state), bits, ConstantU32(state, 0x007fffffu));
+            return Binary(state, spv::OpBitwiseOr, TypeU32(state), fraction, ConstantU32(state, 0x00800000u));
+        };
+        const auto high = EmitMulHigh(state, significand(arg0), significand(arg1), false);
+        return Binary(state, spv::OpULessThanEqual, TypeBool(state), high, ConstantU32(state, 0x7fffu));
+    };
+    bool mayBranch = state.currentBlock == nullptr;
+    if (state.currentBlock != nullptr) {
+        const auto& blocks = state.program.BlockOrder();
+        const auto& infos = state.program.Metadata().blockInfo;
+        if (blocks.size() == infos.size()) {
+            for (std::size_t index = 0u; index < blocks.size(); ++index) {
+                if (blocks[index] == state.currentBlock) {
+                    mayBranch = !infos[index].terminator.loopHeader;
+                    break;
+                }
+            }
+        }
+    }
+    if (!mayBranch) {
+        const auto atBoundary = Binary(state, spv::OpLogicalAnd, TypeBool(state), boundary, withoutCarry());
+        const auto tiny = Binary(state, spv::OpLogicalOr, TypeBool(state), below, atBoundary);
+        return Binary(state, spv::OpLogicalAnd, TypeBool(state), normal, tiny);
+    }
+    const auto allTiny = Binary(state, spv::OpLogicalAnd, TypeBool(state), normal, below);
+    const auto needsCarry = Binary(state, spv::OpLogicalAnd, TypeBool(state), normal, boundary);
+    return EmitValueOrDefaultIfCondition(state, needsCarry, TypeBool(state), allTiny, withoutCarry);
+}
+
 std::uint32_t EmitIAbs32(SpirvEmitterState& state, std::uint32_t arg0) {
     const auto negated = Unary(state, spv::OpSNegate, TypeU32(state), arg0);
     const auto negative = Binary(state, spv::OpSLessThan, TypeBool(state), arg0, ConstantU32(state, 0u));

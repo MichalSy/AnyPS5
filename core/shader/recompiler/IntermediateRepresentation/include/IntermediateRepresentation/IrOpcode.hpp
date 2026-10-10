@@ -158,6 +158,7 @@ enum class IrOpcode : std::uint16_t {
     UDiv32,
     SMulHi,
     UMulHi,
+    F32ProductIsTiny,
     IAbs32,
     ShiftLeftLogical32,
     ShiftLeftLogical64,

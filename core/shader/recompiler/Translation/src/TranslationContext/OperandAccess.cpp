@@ -135,13 +135,7 @@ IrF32 TranslationContext::flushTinyProduct(IrValue* lhs, IrValue* rhs, IrValue* 
     if ((f32DenormalFlush & 2u) == 0u) return IrF32(*product);
     IrValue& lhsBits = ir.BitCastU32(*lhs);
     IrValue& rhsBits = ir.BitCastU32(*rhs);
-    const auto exponent = [&](IrValue& bits) -> IrValue& { return ir.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&bits, &ir.Constant(23u), &ir.Constant(8u)}); };
-    const auto significand = [&](IrValue& bits) -> IrValue& { return ir.BitwiseOr(ir.BitwiseAnd(bits, ir.Constant(0x007fffffu)), ir.Constant(0x00800000u)); };
-    IrValue& lhsExponent = exponent(lhsBits);
-    IrValue& rhsExponent = exponent(rhsBits);
-    const auto finiteNonZero = [&](IrValue& value) -> IrValue& { return ir.LogicalAnd(ir.INotEqual(value, ir.Constant(0u)), ir.INotEqual(value, ir.Constant(0xffu))); };
-    IrValue& carry = ir.Select(ir.UGreaterThan(ir.Emit(IrOpcode::UMulHi, IrType::U32, {&significand(lhsBits), &significand(rhsBits)}), ir.Constant(0x7fffu)), ir.Constant(1u), ir.Constant(0u));
-    IrValue* tiny = &ir.LogicalAnd(ir.LogicalAnd(finiteNonZero(lhsExponent), finiteNonZero(rhsExponent)), ir.ULessThan(ir.IAdd(ir.IAdd(lhsExponent, rhsExponent), carry), ir.Constant(128u)));
+    IrValue* tiny = &ir.Emit(IrOpcode::F32ProductIsTiny, IrType::U1, {&lhsBits, &rhsBits});
     if (addend != nullptr) tiny = &ir.LogicalAnd(*tiny, ir.IEqual(ir.BitwiseAnd(ir.BitCastU32(*addend), ir.Constant(0x7fffffffu)), ir.Constant(0u)));
     IrValue& sign = ir.BitwiseAnd(ir.BitwiseXor(lhsBits, rhsBits), ir.Constant(0x80000000u));
     return IrF32(ir.Emit(IrOpcode::SelectF32, IrType::F32, {tiny, &ir.BitCastF32(sign), product}));
