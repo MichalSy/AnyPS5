@@ -28,6 +28,7 @@
 #include "Optimization/include/Optimization/DenormalFlushEliminator.hpp"
 #include "Optimization/include/Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
+#include "Optimization/include/Optimization/MaskRoundTripEliminator.hpp"
 #include "Optimization/include/Optimization/ReadLaneEliminator.hpp"
 #include "Optimization/include/Optimization/RequestMemoryView.hpp"
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
@@ -158,6 +159,15 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     deadCodeEliminator.RemoveIdentities(program);
     deadCodeEliminator.Eliminate(program);
     dumpIr("fold");
+
+    constexpr MaskRoundTripEliminator maskRoundTripEliminator;
+    const auto maskRoundTripStats = maskRoundTripEliminator.Eliminate(program);
+    if (maskRoundTripStats.rewrittenBallotBits != 0u || maskRoundTripStats.rewrittenConstantBits != 0u) {
+        constantFolder.Fold(program);
+        ResolveControlFlowIdentities(program);
+        deadCodeEliminator.RemoveIdentities(program);
+        deadCodeEliminator.Eliminate(program);
+    }
 
     constexpr ReadLaneEliminator readLaneEliminator;
     const auto readLaneStats = readLaneEliminator.Eliminate(program, translateOptions.waveSize);
