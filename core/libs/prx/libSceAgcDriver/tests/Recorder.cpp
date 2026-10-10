@@ -3216,7 +3216,7 @@ void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
     std::cout << "single-pass storage moves" << (watched ? " (watched)" : "") << ": ok (" << tested << " surfaces)\n";
 }
 
-bool refreshProofTests(const Device& device, Recorder& recorder, bool requireMultisample = false) {
+bool refreshProofTests(const Device& device, Recorder& recorder, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu, bool requireMultisample = false) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: refresh proofs not tested\n";
@@ -3248,25 +3248,34 @@ bool refreshProofTests(const Device& device, Recorder& recorder, bool requireMul
         GuestAllocations::Mutation mutation;
         mutation.Add(block, bytes, true, true, true);
     }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
     struct Unregister {
         const Context& context;
+        Recorder& recorder;
+        std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu;
         void* block;
         std::uint64_t address;
         ~Unregister() {
+            recorder.Sync();
+            gpu.unlock();
             {
+                struct Relock {
+                    std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu;
+                    ~Relock() { gpu.lock(); }
+                } relock{gpu};
                 GuestAllocations::Mutation mutation;
                 mutation.Remove(block);
             }
             HostImportFor(context, address, bytes);
+            ReleaseWatched(block, bytes);
         }
-    } unregister{base, block, address};
+    } unregister{base, recorder, gpu, block, address};
     if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
         std::cout << "no watched host import: refresh proofs not tested\n";
         return false;
     }
-    TextureDetiler detiler(base);
-    auto context = base;
-    context.detiler = &detiler;
     GuestTextureResource resource{};
     resource.baseAddress = address;
     resource.width = side;
@@ -3411,7 +3420,6 @@ bool refreshProofTests(const Device& device, Recorder& recorder, bool requireMul
         expectFull("a fast clear of the keys was answered from the proof");
         recorder.Sync();
     }
-    recorder.Sync();
     return true;
 }
 
@@ -5325,7 +5333,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--refresh-proof-only") {
-            if (!refreshProofTests(device, recorder, true)) return 77;
+            if (!refreshProofTests(device, recorder, gpu, true)) return 77;
             std::cout << "Storage refresh proof and multisample publication tests passed\n";
             return 0;
         }
@@ -5403,7 +5411,7 @@ int main(int argc, char** argv) {
         closeRaceTests(device, recorder);
         keyProofTests(device, recorder);
         targetKeyProofTests(device, recorder);
-        refreshProofTests(device, recorder);
+        refreshProofTests(device, recorder, gpu);
         resourceReadTests(device, recorder);
         depthSurfaceProofTests(device, recorder);
         readWrittenStagingTests(device, recorder);
