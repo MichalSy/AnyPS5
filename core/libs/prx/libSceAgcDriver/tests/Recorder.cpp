@@ -9,7 +9,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleColorSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
@@ -185,7 +184,8 @@ public:
             if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness};
                 function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
-                context.nullDescriptors = robustness.nullDescriptor;
+                nullDescriptors = robustness.nullDescriptor == VK_TRUE;
+                context.nullDescriptors = nullDescriptors;
                 robustness.robustBufferAccess2 = VK_FALSE;
                 robustness.robustImageAccess2 = VK_FALSE;
                 robustness.pNext = address.pNext;
@@ -236,19 +236,6 @@ public:
             if (context.graphicsPipelineLibrary) {
                 extensionsEnabled.insert(extensionsEnabled.end(), libraryExtensions.begin(), libraryExtensions.end());
                 address.pNext = &library;
-            }
-            VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
-            if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
-                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness};
-                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
-                nullDescriptors = robustness.nullDescriptor == VK_TRUE;
-            }
-            robustness = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
-            robustness.nullDescriptor = VK_TRUE;
-            if (nullDescriptors) {
-                extensionsEnabled.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
-                robustness.pNext = address.pNext;
-                address.pNext = &robustness;
             }
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             device.queueCreateInfoCount = 1;
@@ -1312,250 +1299,6 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         mutation.Remove(block);
     }
     HostImportFor(context, address, bytes);
-    return true;
-}
-
-struct BufferBackingProbe {
-    struct Allocation {
-        VkDeviceMemory memory;
-        std::uint32_t type;
-    };
-    struct Binding {
-        VkBuffer buffer;
-        VkDeviceMemory memory;
-    };
-    static inline BufferBackingProbe* active = nullptr;
-    PFN_vkGetDeviceProcAddr resolver;
-    std::vector<Allocation> allocations;
-    std::vector<Binding> bindings;
-    std::vector<VkDeviceMemory> mappings;
-    std::vector<VkDescriptorBufferInfo> descriptors;
-
-    explicit BufferBackingProbe(PFN_vkGetDeviceProcAddr resolver) : resolver(resolver) {
-        Require(active == nullptr, "a buffer backing probe is already active");
-        active = this;
-    }
-
-    ~BufferBackingProbe() { active = nullptr; }
-
-    static VKAPI_ATTR VkResult VKAPI_CALL AllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
-        const auto result = reinterpret_cast<PFN_vkAllocateMemory>(active->resolver(device, "vkAllocateMemory"))(device, info, callbacks, memory);
-        if (result == VK_SUCCESS) active->allocations.push_back({*memory, info->memoryTypeIndex});
-        return result;
-    }
-
-    static VKAPI_ATTR VkResult VKAPI_CALL BindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset) {
-        const auto result = reinterpret_cast<PFN_vkBindBufferMemory>(active->resolver(device, "vkBindBufferMemory"))(device, buffer, memory, offset);
-        if (result == VK_SUCCESS) active->bindings.push_back({buffer, memory});
-        return result;
-    }
-
-    static VKAPI_ATTR VkResult VKAPI_CALL MapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void** data) {
-        const auto result = reinterpret_cast<PFN_vkMapMemory>(active->resolver(device, "vkMapMemory"))(device, memory, offset, size, flags, data);
-        if (result == VK_SUCCESS) active->mappings.push_back(memory);
-        return result;
-    }
-
-    static VKAPI_ATTR void VKAPI_CALL UpdateDescriptorSets(VkDevice device, std::uint32_t writeCount, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
-        for (std::uint32_t index = 0; index < writeCount; ++index) {
-            if (writes[index].descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) continue;
-            for (std::uint32_t element = 0; element < writes[index].descriptorCount; ++element) active->descriptors.push_back(writes[index].pBufferInfo[element]);
-        }
-        reinterpret_cast<PFN_vkUpdateDescriptorSets>(active->resolver(device, "vkUpdateDescriptorSets"))(device, writeCount, writes, copyCount, copies);
-    }
-
-    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Resolve(VkDevice device, const char* name) {
-        if (std::strcmp(name, "vkAllocateMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&AllocateMemory);
-        if (std::strcmp(name, "vkBindBufferMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&BindBufferMemory);
-        if (std::strcmp(name, "vkMapMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&MapMemory);
-        if (std::strcmp(name, "vkUpdateDescriptorSets") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&UpdateDescriptorSets);
-        return active->resolver(device, name);
-    }
-
-    void RequireDeviceLocal(const Context& context, VkBuffer buffer) const {
-        const auto binding = std::find_if(bindings.rbegin(), bindings.rend(), [&](const Binding& entry) { return entry.buffer == buffer; });
-        Require(binding != bindings.rend(), "a staged descriptor has no observed memory binding");
-        const auto allocation = std::find_if(allocations.rbegin(), allocations.rend(), [&](const Allocation& entry) { return entry.memory == binding->memory; });
-        Require(allocation != allocations.rend(), "a staged buffer has no observed memory allocation");
-        Require((context.memory.memoryTypes[allocation->type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0, "a read-only staging buffer is not device-local");
-        Require(std::find(mappings.begin(), mappings.end(), binding->memory) == mappings.end(), "a read-only staging buffer was mapped on the host");
-    }
-};
-
-bool readOnlyStagingTests(const Device& device, Recorder& recorder) {
-    const auto& base = device.GetContext();
-    GuestBufferMemory validation(base);
-    if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: read-only staging not tested\n";
-        return false;
-    }
-    const auto alignment = static_cast<std::size_t>(std::max<VkDeviceSize>(65536, base.hostImportAlignment));
-    const auto bytes = alignment * 2;
-#ifdef _WIN32
-    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-#else
-    void* block = std::aligned_alloc(alignment, bytes);
-#endif
-    Require(block != nullptr, "cannot allocate the read-only staging test block");
-    const auto address = reinterpret_cast<std::uint64_t>(block);
-    {
-        GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true, true);
-    }
-    struct Release {
-        const Context& context;
-        Recorder& recorder;
-        void* block;
-        std::uint64_t address;
-        std::size_t bytes;
-        ~Release() {
-            recorder.Sync();
-            {
-                GuestAllocations::Mutation mutation;
-                mutation.Remove(block);
-            }
-            HostImportFor(context, address, bytes);
-#ifdef _WIN32
-            VirtualFree(block, 0, MEM_RELEASE);
-#else
-            std::free(block);
-#endif
-        }
-    } release{base, recorder, block, address, bytes};
-    const auto* imported = HostImportFor(base, address, bytes);
-    if (imported == nullptr) {
-        std::cout << "host import of the read-only staging test block refused\n";
-        return false;
-    }
-    const auto importBuffer = imported->buffer;
-    const auto importBase = imported->base;
-    const auto element = address + std::max<VkDeviceSize>(4096, base.limits.minStorageBufferOffsetAlignment);
-    constexpr std::size_t elementBytes = 2048;
-    auto* input = reinterpret_cast<std::byte*>(element);
-    std::memset(input, 0x11, elementBytes);
-    const auto setting = [](const char* name, std::uint64_t fallback) {
-        const char* value = std::getenv(name);
-        return value != nullptr ? std::strtoull(value, nullptr, 10) : fallback;
-    };
-    const char* enabled = std::getenv("APS5_READONLY_STAGING");
-    const bool staged = enabled != nullptr && std::string_view(enabled) == "1" && std::getenv("APS5_CPU_COPIES") == nullptr && elementBytes >= setting("APS5_READONLY_STAGE_MIN_KIB", 0) * 1024u && elementBytes <= setting("APS5_READONLY_STAGE_MAX_KIB", 4096) * 1024u;
-    BufferBackingProbe probe(base.deviceProc);
-    auto context = base;
-    context.deviceProc = &BufferBackingProbe::Resolve;
-    context.functions = nullptr;
-    context.bufferPool = std::make_shared<BufferPool>(context);
-    const auto checkBacking = [&](const VkDescriptorBufferInfo& descriptor, bool expectedStaged) {
-        if (expectedStaged) {
-            Require(descriptor.buffer != importBuffer && descriptor.offset == 0, "a certified read-only element still binds its host import");
-            probe.RequireDeviceLocal(context, descriptor.buffer);
-        } else {
-            Require(descriptor.buffer == importBuffer && descriptor.offset == element - importBase, "an excluded read-only element stopped binding its host import");
-        }
-        Require(descriptor.range == elementBytes, "read-only staging changed the descriptor range");
-    };
-    const auto checkInput = [&](const VkDescriptorBufferInfo& descriptor, std::byte expected) {
-        Buffer readback(context, elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        const auto commands = recorder.Commands();
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        CopyBuffer(context, commands, descriptor.buffer, descriptor.offset, readback.Handle(), 0, elementBytes);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-        recorder.Sync();
-        Require(std::all_of(readback.Bytes().begin(), readback.Bytes().end(), [&](std::byte value) { return value == expected; }), "read-only staging consumed stale or changed input bytes");
-    };
-    {
-        GuestBufferMemory memory(context);
-        memory.AllowDeviceStaging();
-        memory.AddReadable(element, elementBytes, true);
-        const auto keptBefore = recorder.OpenKeptBytes();
-        memory.Upload(false);
-        Require(recorder.OpenKeptBytes() == keptBefore + (staged ? elementBytes : 0), "a read-only input snapshot did not count its bytes in the batch");
-        std::uint32_t adjustment = 0;
-        const auto descriptor = memory.Descriptor(element, elementBytes, adjustment);
-        Require(adjustment == 0 && memory.Writes().empty() && !memory.HasCopiedWrites(), "a staged read-only input became a write");
-        checkBacking(descriptor, staged);
-        memory.RecordCopyBacks(recorder);
-        Require(!recorder.PendingWriteOverlaps(element, elementBytes), "read-only copy-back noted an input write");
-        checkInput(descriptor, std::byte{0x11});
-        std::memset(input, 0x22, elementBytes);
-        memory.RecordStagingCopies(recorder);
-        memory.RecordCopyBacks(recorder);
-        checkInput(descriptor, std::byte{0x22});
-        Require(std::all_of(input, input + elementBytes, [](std::byte value) { return value == std::byte{0x22}; }), "read-only copy-back rolled back CPU input changes");
-        if (staged) {
-            memory.RecordStagingCopies(recorder);
-            std::memset(input, 0x33, elementBytes);
-            memory.RecordCopyBacks(recorder);
-            checkInput(descriptor, std::byte{0x22});
-            Require(std::all_of(input, input + elementBytes, [](std::byte value) { return value == std::byte{0x33}; }), "read-only staging overwrote a CPU change after its copy-in");
-        }
-    }
-    for (const auto exclusion : {0, 1, 2, 3, 4}) {
-        GuestBufferMemory memory(context);
-        memory.AllowDeviceStaging();
-        memory.AddReadable(element, elementBytes, exclusion != 0);
-        if (exclusion == 1) memory.AddReadable(element + 1024, 512);
-        if (exclusion == 2) memory.AddWritable(element + 1024, 16);
-        if (exclusion == 4) memory.ExcludeReadOnlyStaging(element + 1024, 16);
-        memory.Upload(exclusion == 3);
-        std::uint32_t adjustment = 0;
-        checkBacking(memory.Descriptor(element, elementBytes, adjustment), false);
-        memory.RecordCopyBacks(recorder);
-        recorder.Sync();
-    }
-    {
-        const auto commands = recorder.Commands();
-        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, importBuffer, element - importBase, elementBytes, 0x44444444u);
-        recorder.NotePendingWrite(element, elementBytes);
-        GuestBufferMemory memory(context);
-        memory.AllowDeviceStaging();
-        memory.AddReadable(element, elementBytes, true);
-        memory.Upload(false);
-        std::uint32_t adjustment = 0;
-        const auto descriptor = memory.Descriptor(element, elementBytes, adjustment);
-        checkBacking(descriptor, staged);
-        memory.RecordCopyBacks(recorder);
-        checkInput(descriptor, std::byte{0x44});
-    }
-    ShaderRecompiler::RecompileResult program;
-    ShaderRecompiler::DescriptorBinding binding;
-    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
-    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
-    binding.descriptorSet = 0;
-    binding.binding = 0;
-    binding.count = 1;
-    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u};
-    binding.bufferRead = {true};
-    binding.bufferWritten = {false};
-    binding.bufferAtomic = {false};
-    program.bindings.push_back(binding);
-    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
-    {
-        probe.descriptors.clear();
-        ShaderResources resources(context, compute);
-        Require(probe.descriptors.size() == 1, "the read-only resource did not write one buffer descriptor");
-        const auto descriptor = probe.descriptors.front();
-        checkBacking(descriptor, staged);
-        resources.MarkGpuWrites(recorder);
-        Require(!recorder.PendingWriteOverlaps(element, elementBytes), "a certified read-only shader input was noted as written");
-        checkInput(descriptor, std::byte{0x44});
-        std::memset(input, 0x55, elementBytes);
-        Require(resources.Revalidate(std::span<const CompiledShader>(&compute, 1)), "a read-only staging resource could not be revalidated");
-        resources.MarkGpuWrites(recorder);
-        Require(!recorder.PendingWriteOverlaps(element, elementBytes), "a reused read-only shader input was noted as written");
-        checkInput(descriptor, std::byte{0x55});
-        Require(std::all_of(input, input + elementBytes, [](std::byte value) { return value == std::byte{0x55}; }), "a reused read-only input was copied back into guest memory");
-    }
-    for (const auto metadata : {0, 1, 2, 3}) {
-        program.bindings[0].bufferRead = metadata == 0 ? std::vector<bool>{} : std::vector<bool>{metadata >= 2};
-        program.bindings[0].bufferAtomic = metadata == 3 ? std::vector<bool>{} : std::vector<bool>{metadata == 2};
-        probe.descriptors.clear();
-        ShaderResources resources(context, compute);
-        Require(probe.descriptors.size() == 1, "an uncertified resource did not write one buffer descriptor");
-        checkBacking(probe.descriptors.front(), false);
-        resources.MarkGpuWrites(recorder);
-        recorder.Sync();
-    }
-    std::cout << "Read-only staging tests passed (device-local " << (staged ? "on" : "off") << ")\n";
     return true;
 }
 
@@ -5452,12 +5195,15 @@ int main(int argc, char** argv) {
             std::cout << "Storage refresh proof and multisample publication tests passed\n";
             return 0;
         }
-        if (argc == 2 && std::string_view(argv[1]) == "--read-only-staging-only") {
-            return readOnlyStagingTests(device, recorder) ? 0 : 77;
-        }
         if (argc == 2 && std::string_view(argv[1]) == "--read-written-staging-only") {
             if (!readWrittenStagingTests(device, recorder)) return 77;
             std::cout << "Read and written staging tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--image-memo-only") {
+            if (!device.NullDescriptors()) return 77;
+            imageMemoTests(device, recorder);
+            std::cout << "Sampled image memo reuse and deduplication tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--storage-owner-only") {

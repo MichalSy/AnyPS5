@@ -113,31 +113,6 @@ under `build/profiles/memory-guard/`. Logs record the cap, memory usage, cgroup
 memory categories and observed peak. Stop a guarded run with Ctrl+C or close its
 game window. Each launch computes its limit again.
 
-## Read-only buffer staging
-
-`APS5_READONLY_STAGING=1` enables experimental device-local staging for certified
-read-only compute buffers. The setting is disabled when unset or `0`; other values
-are rejected. Restart the title when changing it. Shader arithmetic is unchanged.
-
-`APS5_READONLY_STAGE_MIN_KIB` and `APS5_READONLY_STAGE_MAX_KIB` set the admitted
-buffer-size window, defaulting to 0 and 4096 KiB. Both accept unsigned decimal
-integers; the minimum must not exceed the maximum. Address-based, sparse, mirrored
-and image-aliased ranges keep their existing backing.
-
-Staged inputs are copied before every use, including cached-resource reuse, and
-are not copied back. This mode uses the existing upload and synchronization paths;
-it does not retain a persistent copy of unchanged contents. Compare warm frame
-times with staging disabled and enabled, including CPU snapshots, uploads and
-barriers. A shorter shader interval alone does not establish a faster frame.
-
-From the repository root with a prepared title launcher:
-
-```sh
-APS5_READONLY_STAGING=0 ./run.sh
-APS5_READONLY_STAGING=1 ./run.sh
-APS5_READONLY_STAGING=1 APS5_READONLY_STAGE_MAX_KIB=256 ./run.sh
-```
-
 ## Shader recompiler
 
 The shader recompilation logic in [core/shader/recompiler](../../core/shader/recompiler) is isolated from the rest of the project and is a pure function of its input data, designed for integration into any other project. The current CMake target also includes cache support and links a supplied runtime target, glslang, and optionally SPIRV-Tools.
