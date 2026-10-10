@@ -26,7 +26,6 @@ constexpr std::uint32_t Side = 2;
 constexpr std::uint32_t Format8888UNorm = 56;
 constexpr std::uint32_t Format8888Srgb = 130;
 constexpr std::uint32_t Format8888UInt = 60;
-constexpr std::uint32_t Format8888Srgb = 130;
 constexpr std::uint32_t Format32Float = 22;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Equal = 2;
