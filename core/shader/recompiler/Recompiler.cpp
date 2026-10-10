@@ -29,6 +29,7 @@
 #include "Optimization/include/Optimization/DenormalFlushEliminator.hpp"
 #include "Optimization/include/Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/include/Optimization/HostInterpolationChecker.hpp"
+#include "Optimization/include/Optimization/LoopInvariantCache.hpp"
 #include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/include/Optimization/MaskRoundTripEliminator.hpp"
 #include "Optimization/include/Optimization/ReadLaneEliminator.hpp"
@@ -49,9 +50,18 @@
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <ControlFlow/RequestSerializer.hpp>
 
 namespace ShaderRecompiler {
+
+bool LoopInvariantCacheEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_LOOP_INVARIANT_CACHE");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
 
 namespace {
 
@@ -247,6 +257,16 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     constexpr ResourceTracker resourceTracker;
     resourceTracker.Track(program);
     deadCodeEliminator.Eliminate(program);
+    if (stageKind == ShaderStageKind::Compute && LoopInvariantCacheEnabled()) {
+        const auto stats = LoopInvariantCache{}.Cache(program);
+        if (stats.cachedSlices != 0u) {
+            deadCodeEliminator.Eliminate(program);
+            if (std::getenv("APS5_DUMP_IR") != nullptr) {
+                std::fprintf(stderr, "[loop-invariant-cache] slices=%u values=%u loads=%u instructions=%u\n",
+                             stats.cachedSlices, stats.cachedValues, stats.cachedLoads, stats.cachedInstructions);
+            }
+        }
+    }
     dumpIr("resources");
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
 
