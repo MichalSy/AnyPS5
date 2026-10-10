@@ -156,16 +156,18 @@ public:
             target.mipCount == 1u && target.mip == 0u && htileRegistry == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     }
 
-    void NoteHtileFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
+    std::shared_ptr<StorageTexture> NoteHtileFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
         const auto footprint = HtileSliceBytes(surfaceExtent(target));
         if (htileAddress == 0 || footprint == 0 || bytes == 0 ||
-            (address >= htileAddress ? address - htileAddress >= footprint : htileAddress - address >= bytes)) return;
+            (address >= htileAddress ? address - htileAddress >= footprint : htileAddress - address >= bytes)) return nullptr;
         pendingClear = false;
-        if (!AcceptsHtileFill() || !HtileFillCovers(htileAddress, surfaceExtent(target), address, bytes) || (pattern & 0xfu) != 0) return;
+        if (!AcceptsHtileFill() || !HtileFillCovers(htileAddress, surfaceExtent(target), address, bytes) || (pattern & 0xfu) != 0) return nullptr;
         const auto generation = GuestMemory::CollectWritesUncached(htileAddress, static_cast<std::size_t>(footprint));
-        if (generation == 0 || !GuestMemory::Watched(htileAddress, static_cast<std::size_t>(footprint))) return;
+        if (generation == 0 || !GuestMemory::Watched(htileAddress, static_cast<std::size_t>(footprint))) return nullptr;
+        auto consumed = TakeWrites();
         pendingGeneration = generation;
         pendingClear = true;
+        return consumed;
     }
 
     void ApplyFastClear() {
@@ -174,7 +176,6 @@ public:
         const auto footprint = static_cast<std::size_t>(HtileSliceBytes(surfaceExtent(target)));
         if (!AcceptsHtileFill() || GuestMemory::CollectWritesUncached(htileAddress, footprint) == 0 ||
             GuestMemory::StoredOver(htileAddress, footprint, pendingGeneration)) return;
-        writer.reset();
         auto* recorder = recorderFor(context);
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
@@ -202,7 +203,7 @@ public:
             BlockHeight(descriptor.format) == 1u && BytesPerElement(descriptor.format) == (d16 ? 2u : 4u) &&
             storage.StorageFormat() == ResolveTextureFormat(descriptor.format);
         return !(target.samples != VK_SAMPLE_COUNT_1_BIT || target.mipCount != 1u || target.mip != 0u || target.address == 0 ||
-            (!d16 && !d32) || !sized || offset > std::numeric_limits<std::uint64_t>::max() - descriptor.baseAddress ||
+            (!d16 && !d32) || !sized || !storage.CanWriteBackLayer(layer) || offset > std::numeric_limits<std::uint64_t>::max() - descriptor.baseAddress ||
             descriptor.baseAddress + offset != target.address || (storage.ImageLayers() > 1u && geometry.layerBytes != stride) || descriptor.width != extent.width ||
             descriptor.height != extent.height || descriptor.mipCount != 1u || descriptor.baseLevel != 0u ||
             descriptor.lastLevel != 0u || descriptor.baseArray >= storage.ImageLayers() || layer >= storage.ImageLayers() ||
@@ -246,6 +247,9 @@ public:
         return std::exchange(writer, nullptr);
     }
 
+    std::uint32_t WriterLayer() const { return writerLayer; }
+    bool HasWriter(const std::shared_ptr<StorageTexture>& storage) const { return writer == storage; }
+
     bool StorageOwnsSample(const GuestTextureResource& resource) const {
         if (writer == nullptr || !Texture::CanCopyFrom(*writer, resource)) return false;
         const auto format = ResolveTextureFormat(resource.format);
@@ -259,9 +263,9 @@ public:
             Retire();
             return nullptr;
         }
-        ApplyFastClear();
-        if (writer == storage && writerLayer == layer) return nullptr;
+        if (writer == storage && writerLayer == layer && !pendingClear) return nullptr;
         auto consumed = TakeWrites();
+        ApplyFastClear();
         Transfer(*storage, true, layer);
         writer = storage;
         writerLayer = layer;
@@ -433,11 +437,15 @@ std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
     return *list;
 }
 
-void finishStorageWrites(std::unique_lock<std::mutex>& lock, DepthSurface* surface, const std::shared_ptr<StorageTexture>& consumed) {
-    if (consumed == nullptr || consumed->Cached()) return;
+void finishStorageWrites(std::unique_lock<std::mutex>& lock, DepthSurface* surface, const std::shared_ptr<StorageTexture>& consumed, std::uint32_t consumedLayer) {
+    if (consumed == nullptr) return;
+    const bool publishAll = !consumed->Cached() && std::none_of(surfaces().begin(), surfaces().end(), [&](const auto& current) {
+        return current.get() != surface && !current->retired && !current->mappingInvalidated && current->HasWriter(consumed);
+    });
     // Write-back acquires the allocation registry, whose mapping callback acquires this mutex.
     lock.unlock();
-    consumed->WriteBack();
+    if (publishAll) consumed->WriteBack();
+    else consumed->WriteBackLayer(consumedLayer);
     lock.lock();
     const auto found = std::find_if(surfaces().begin(), surfaces().end(), [&](const auto& current) { return current.get() == surface; });
     if (found != surfaces().end() && !(*found)->retired && !(*found)->mappingInvalidated) (*found)->NoteWritten();
@@ -495,11 +503,12 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     for (const auto& surface : surfaces()) {
         if (surface.get() != bound && surface->context.device == context.device && surface->Overlaps(*bound)) surface->Retire();
     }
-    bound->ApplyFastClear();
+    const auto consumedLayer = bound->WriterLayer();
     auto consumed = bound->TakeWrites();
+    bound->ApplyFastClear();
     bound->NoteWritten();
     const auto view = bound->View(target.mip);
-    finishStorageWrites(lock, bound, consumed);
+    finishStorageWrites(lock, bound, consumed, consumedLayer);
     return view;
 }
 
@@ -518,15 +527,23 @@ bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t addre
 
 void NoteDepthMetadataFill(VkDevice device, std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    std::lock_guard lock(surfacesMutex());
+    std::unique_lock lock(surfacesMutex());
     std::size_t candidates = 0;
     for (const auto& surface : surfaces()) {
         if (surface->context.device == device && surface->AcceptsHtileFill() && HtileFillCovers(surface->htileAddress, surfaceExtent(surface->target), address, bytes)) ++candidates;
     }
+    DepthSurface* owner = nullptr;
+    std::shared_ptr<StorageTexture> consumed;
+    std::uint32_t consumedLayer = 0;
     for (const auto& surface : surfaces()) {
         if (surface->context.device != device) continue;
-        surface->NoteHtileFill(address, bytes, candidates == 1u ? pattern : 0xffffffffu);
+        if (auto writer = surface->NoteHtileFill(address, bytes, candidates == 1u ? pattern : 0xffffffffu)) {
+            owner = surface.get();
+            consumed = std::move(writer);
+            consumedLayer = surface->WriterLayer();
+        }
     }
+    finishStorageWrites(lock, owner, consumed, consumedLayer);
 }
 
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads) {
@@ -575,9 +592,10 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         return nullptr;
     }
     auto texture = (*found)->Sampled(words, resource, components);
-    (*found)->ApplyFastClear();
+    const auto consumedLayer = (*found)->WriterLayer();
     auto consumed = (*found)->TakeWrites();
-    finishStorageWrites(lock, found->get(), consumed);
+    (*found)->ApplyFastClear();
+    finishStorageWrites(lock, found->get(), consumed, consumedLayer);
     return texture;
 }
 
@@ -592,9 +610,10 @@ bool DepthSurfaceHolds(const Context& context, std::span<const std::uint32_t> wo
             (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
     });
     if (found == list.rend() || !(*found)->Holds(words, resource, components, texture)) return false;
-    (*found)->ApplyFastClear();
+    const auto consumedLayer = (*found)->WriterLayer();
     auto consumed = (*found)->TakeWrites();
-    finishStorageWrites(lock, found->get(), consumed);
+    (*found)->ApplyFastClear();
+    finishStorageWrites(lock, found->get(), consumed, consumedLayer);
     return true;
 }
 
@@ -631,8 +650,9 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
         });
         if (found == list.rend()) continue;
         auto* surface = found->get();
+        const auto consumedLayer = surface->WriterLayer();
         auto consumed = surface->SeedStorage(storage, layer);
-        finishStorageWrites(lock, surface, consumed);
+        finishStorageWrites(lock, surface, consumed, consumedLayer);
     }
 }
 

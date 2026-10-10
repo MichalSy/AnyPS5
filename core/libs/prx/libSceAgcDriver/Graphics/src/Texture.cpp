@@ -985,6 +985,15 @@ bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const
 // so the comparison with guest memory must not flush them.
 thread_local const StorageTexture* refreshing = nullptr;
 
+class StorageFlushExemption {
+public:
+    explicit StorageFlushExemption(const StorageTexture* texture) : previous(std::exchange(refreshing, texture)) {}
+    ~StorageFlushExemption() { refreshing = previous; }
+
+private:
+    const StorageTexture* previous;
+};
+
 void FlushHook(std::uint64_t address, std::size_t bytes) {
     StorageTexture::FlushPending(address, bytes);
 }
@@ -1387,13 +1396,9 @@ bool StorageTexture::Refresh() {
         return true;
     }
     refreshProof = {};
-    struct Exempt {
-        const StorageTexture* previous;
-        ~Exempt() { refreshing = previous; }
-    } exempt{refreshing};
+    const StorageFlushExemption exempt(this);
     // This image's own pending results stay on the GPU, where the next dispatch wants them (the
     // flush below and the compare through the hook skip it).
-    refreshing = this;
     NoteProved();
     const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
     if (descriptor.dccAddress != 0 && keyCount != 0 && otherPendingOverlaps(descriptor.dccAddress, keyCount)) {
@@ -1782,11 +1787,7 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
 
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
     if (!originalValid) return false;
-    struct Exempt {
-        const StorageTexture* previous;
-        ~Exempt() { refreshing = previous; }
-    } exempt{refreshing};
-    refreshing = this;
+    const StorageFlushExemption exempt(this);
     Require(address >= descriptor.baseAddress && bytes <= guestBytes && address - descriptor.baseAddress <= guestBytes - bytes, "texture comparison exceeds its snapshot");
     Require(original.size() == guestBytes, "texture comparison has no complete snapshot");
     GuestMemory::FlushGpuWrites(address, bytes);
@@ -3515,6 +3516,36 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
 void StorageTexture::WriteBack() {
     const auto previous = std::exchange(flushReason, "explicit");
     writeBack(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    flushReason = previous;
+}
+
+bool StorageTexture::CanWriteBackLayer(std::uint32_t layer) const {
+    if (layer >= geometry.imageLayers || geometry.imageDepth != 1u || geometry.thick || descriptor.mipCount != 1u ||
+        (descriptor.dimension != TextureDimension::k2D && descriptor.dimension != TextureDimension::k2DArray)) return false;
+    if (geometry.imageLayers == 1u) return true;
+    const auto offset = geometry.GuestLayerOffset(layer);
+    if (descriptor.dccAddress != 0 || descriptor.baseAddress % 65536u != 0u || geometry.layerBytes % 65536u != 0u ||
+        trackedLayerBytes == 0u || offset % trackedLayerBytes != 0u || geometry.layerBytes % trackedLayerBytes != 0u) return false;
+    const auto first = offset / trackedLayerBytes;
+    const auto count = geometry.layerBytes / trackedLayerBytes;
+    return first < trackedLayers && count <= trackedLayers - first;
+}
+
+void StorageTexture::WriteBackLayer(std::uint32_t layer) {
+    Require(CanWriteBackLayer(layer), "storage layer write-back requires a single-mip 2D image or independently tracked aligned array without DCC");
+    const StorageFlushExemption exempt(this);
+    if (geometry.imageLayers == 1u) {
+        WriteBack();
+        return;
+    }
+    const auto offset = geometry.GuestLayerOffset(layer);
+    const auto first = offset / trackedLayerBytes;
+    const auto count = geometry.layerBytes / trackedLayerBytes;
+    std::vector<bool> layers(trackedLayers, false);
+    for (auto unit = first; unit < first + count; ++unit) layers[unit] = layerPending[unit];
+    if (std::none_of(layers.begin(), layers.end(), [](bool pending) { return pending; })) return;
+    const auto previous = std::exchange(flushReason, "depth layer");
+    writeBackLayers(layers);
     flushReason = previous;
 }
 

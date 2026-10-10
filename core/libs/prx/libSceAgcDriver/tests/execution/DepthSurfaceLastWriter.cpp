@@ -499,17 +499,19 @@ void ReadStorageImage(const Context& context, const StorageTexture& storage, Buf
     batch.SubmitAndWait();
 }
 
-void StorageRoundTripTest(const Context& context) {
-    GuestBlock memory(DepthSliceBytes(Extent, 4));
+void StorageRoundTripTest(const Context& context, bool keepCached, bool clearPendingWriter = false, bool skipClearBind = false) {
+    GuestBlock memory(2 * Block);
     struct Cleanup {
         VkDevice device;
         ~Cleanup() { ClearCachedTextures(device); ClearDepthSurfaces(device); }
     } cleanup{context.device};
-    std::memset(memory.data, 0xcd, DepthSliceBytes(Extent, 4));
-    AgcDriver::GuestMemory::MarkWritten(memory.Address(), DepthSliceBytes(Extent, 4));
+    std::memset(memory.data, 0xcd, 2 * Block);
+    AgcDriver::GuestMemory::MarkWritten(memory.Address(), 2 * Block);
     AgcDriver::GuestMemory::BumpCollectEpoch();
     auto target = Depth(memory.Address());
-    target.clearDepth = 0.25f;
+    target.clearDepth = clearPendingWriter && !skipClearBind ? 0.5f : 0.25f;
+    const auto initialDepth = target.clearDepth;
+    if (keepCached) target.htileAddress = memory.Address() + Block;
     DepthSurfaceView(context, target);
     auto resource = View(Extent.width, Extent.height, memory.Address());
     resource.tileMode = TextureTileMode::kZ64KBX;
@@ -517,11 +519,15 @@ void StorageRoundTripTest(const Context& context) {
     const auto initial = Sample(context, resource);
     Require(initial != nullptr && sampler.RedBits(*initial) == std::bit_cast<std::uint32_t>(target.clearDepth),
         "the depth round trip did not start with the GPU clear value");
+    if (skipClearBind) {
+        target.clearDepth = 0.5f;
+        DepthSurfaceView(context, target);
+    }
 
     auto writer = CachedStorageSurface(context, resource);
     {
         Texture sampledStorage(context, writer, resource, Identity);
-        Require(sampler.RedBits(sampledStorage) == std::bit_cast<std::uint32_t>(target.clearDepth),
+        Require(sampler.RedBits(sampledStorage) == std::bit_cast<std::uint32_t>(initialDepth),
             "the storage image did not receive the depth clear's pixel bits");
     }
     constexpr float writtenDepth = 0.75f;
@@ -540,15 +546,38 @@ void StorageRoundTripTest(const Context& context) {
     }
     writer->MarkDirty();
     const std::weak_ptr<StorageTexture> retained = writer;
-    ClearCachedTextures(context.device);
-    Check(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device), "vkDeviceWaitIdle");
-    writer.reset();
-    Require(!retained.expired(), "cache eviction and the last external reference destroyed the depth surface's storage writer");
-    DepthSurfaceView(context, target);
-    const auto rebound = Sample(context, resource);
-    Require(rebound != nullptr && sampler.RedBits(*rebound) == std::bit_cast<std::uint32_t>(writtenDepth),
-        "rebinding depth did not import the retained storage writer's GPU pixel bits");
-    Require(retained.expired(), "a completed depth rebind retained the consumed storage writer");
+    if (!keepCached) {
+        ClearCachedTextures(context.device);
+        Check(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device), "vkDeviceWaitIdle");
+        writer.reset();
+        Require(!retained.expired(), "cache eviction and the last external reference destroyed the depth surface's storage writer");
+    }
+    auto rebound = initial;
+    if (!clearPendingWriter) {
+        DepthSurfaceView(context, target);
+        rebound = Sample(context, resource);
+        Require(rebound != nullptr && sampler.RedBits(*rebound) == std::bit_cast<std::uint32_t>(writtenDepth),
+            "rebinding depth did not import the retained storage writer's GPU pixel bits");
+    }
+    if (!keepCached) Require(retained.expired(), "a completed depth rebind retained the consumed storage writer");
+    if (keepCached) {
+        Require(writer->Cached(), "the depth writer left the storage cache before the coherence check");
+        target.clearDepth = 0.5f;
+        if (!clearPendingWriter) DepthSurfaceView(context, target);
+        const auto beforeClear = AgcDriver::GuestMemory::CollectWrites(memory.Address(), DepthSliceBytes(Extent, 4));
+        const auto metadataBytes = static_cast<std::size_t>(HtileSliceBytes(Extent));
+        constexpr std::uint32_t pattern = 0x0003fff0u;
+        std::fill_n(reinterpret_cast<std::uint32_t*>(memory.data + Block), metadataBytes / sizeof(pattern), pattern);
+        AgcDriver::GuestMemory::MarkWritten(target.htileAddress, metadataBytes);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        NoteDepthMetadataFill(context.device, target.htileAddress, metadataBytes, pattern);
+        if (!skipClearBind) {
+            DepthSurfaceView(context, target);
+            Require(sampler.RedBits(*rebound) == std::bit_cast<std::uint32_t>(target.clearDepth), "the HTILE-only clear did not update native depth pixels");
+        }
+        if (!clearPendingWriter) Require(!AgcDriver::GuestMemory::WrittenSince(memory.Address(), DepthSliceBytes(Extent, 4), beforeClear),
+            "an HTILE-only clear changed the depth plane's guest write generation");
+    }
 
     auto replacement = View(Extent.width / 4, Extent.height / 4, memory.Address());
     replacement.format = 29; // R16G16_SFLOAT in a smaller linear buffer at the reused address.
@@ -559,6 +588,9 @@ void StorageRoundTripTest(const Context& context) {
         refused = std::string(error.what()).find("is not implemented") != std::string::npos;
     }
     Require(refused && DepthSurfaceAt(target.address), "an incompatible storage view discarded current GPU depth pixels without newer guest writes");
+    if (skipClearBind) rebound = Sample(context, resource);
+    if (keepCached) Require(sampler.RedBits(*rebound) == std::bit_cast<std::uint32_t>(target.clearDepth),
+        "an older cached storage writer replaced the newer native depth clear");
     constexpr std::uint32_t replacementPixel = 0x40003c00u;
     std::fill_n(reinterpret_cast<std::uint32_t*>(memory.data), DepthSliceBytes(Extent, 4) / sizeof(replacementPixel), replacementPixel);
     AgcDriver::GuestMemory::MarkWritten(memory.Address(), DepthSliceBytes(Extent, 4));
@@ -574,7 +606,7 @@ void StorageRoundTripTest(const Context& context) {
     }
 }
 
-void StorageArrayRoundTripTest(const Context& context, bool firstLayerResident) {
+void StorageArrayRoundTripTest(const Context& context, bool firstLayerResident, bool keepCached = false) {
     constexpr std::uint32_t layers = 3;
     constexpr std::uint32_t texels = Extent.width * Extent.height;
     const auto sliceBytes = DepthSliceBytes(Extent, 2);
@@ -642,17 +674,31 @@ void StorageArrayRoundTripTest(const Context& context, bool firstLayerResident) 
         clear.float32[0] = 0.5f;
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layers - 1, 1};
         context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, writer->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        if (!firstLayerResident && !keepCached) {
+            clear.float32[0] = 0.0f;
+            const VkImageSubresourceRange firstRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, writer->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &firstRange);
+        }
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
         batch.SubmitAndWait();
     }
     writer->MarkDirty();
     const std::weak_ptr<StorageTexture> retained = writer;
-    ClearCachedTextures(context.device);
-    Check(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device), "vkDeviceWaitIdle");
-    writer.reset();
-    Require(!retained.expired(), "cache eviction lost the depth array's storage writer");
+    if (!keepCached) {
+        ClearCachedTextures(context.device);
+        Check(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device), "vkDeviceWaitIdle");
+        writer.reset();
+        Require(!retained.expired(), "cache eviction lost the depth array's storage writer");
+    }
+    const auto firstGeneration = AgcDriver::GuestMemory::CollectWritesUncached(first.address, sliceBytes);
     DepthSurfaceView(context, last);
+    if (keepCached) {
+        Require(!AgcDriver::GuestMemory::WrittenSince(first.address, sliceBytes, firstGeneration),
+            "publishing the last depth array slice stamped an unconsumed first slice");
+        Require(StorageTexture::FindPending(memory.Address(), layers * sliceBytes) == writer,
+            "publishing one depth array slice discarded the other pending slices");
+    }
     auto lastView = resource;
     lastView.baseAddress = last.address;
     lastView.dimension = TextureDimension::k2D;
@@ -668,7 +714,16 @@ void StorageArrayRoundTripTest(const Context& context, bool firstLayerResident) 
         Require(preserved != nullptr && sampler.RedBits(*preserved) == std::bit_cast<std::uint32_t>(0.0f),
             "writing the last depth array layer changed the first layer");
     }
-    Require(retained.expired(), "consuming all depth array slices retained the storage writer");
+    if (!keepCached) Require(retained.expired(), "consuming all depth array slices retained the storage writer");
+    if (!firstLayerResident && !keepCached) {
+        const auto restored = CachedStorageSurface(context, resource);
+        ReadStorageImage(context, *restored, readback);
+        for (std::uint32_t pixel = 0; pixel < texels; ++pixel) {
+            std::uint16_t value;
+            std::memcpy(&value, readback.Bytes().data() + pixel * sizeof(value), sizeof(value));
+            Require(value == 0, "releasing the last depth owner discarded another storage array layer's GPU writes");
+        }
+    }
 }
 
 void MultisampleRefusalTest(const Context& context) {
@@ -786,9 +841,13 @@ int main() {
         std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
         Run(device->GetContext());
         RemappedColorTest(*device);
-        StorageRoundTripTest(device->GetContext());
+        StorageRoundTripTest(device->GetContext(), false);
+        StorageRoundTripTest(device->GetContext(), true);
+        StorageRoundTripTest(device->GetContext(), true, true);
+        StorageRoundTripTest(device->GetContext(), true, true, true);
         StorageArrayRoundTripTest(device->GetContext(), true);
         StorageArrayRoundTripTest(device->GetContext(), false);
+        StorageArrayRoundTripTest(device->GetContext(), true, true);
         MultisampleRefusalTest(device->GetContext());
         std::puts("depth surface last writer tests passed");
         return 0;

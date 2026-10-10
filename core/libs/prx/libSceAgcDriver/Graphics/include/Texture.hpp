@@ -144,6 +144,8 @@ public:
     void RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
     void RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
     void WriteBack();
+    bool CanWriteBackLayer(std::uint32_t layer) const;
+    void WriteBackLayer(std::uint32_t layer);
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
     void Flush();
