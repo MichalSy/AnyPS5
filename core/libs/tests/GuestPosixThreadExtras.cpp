@@ -89,9 +89,9 @@ int main() {
     Require(scePthreadGetname(self, name) == 0);
     Require(std::strcmp(name, "quake-main") == 0);
     int oldType = -1;
-    Require(pthread_setcanceltype_nid_postfix(2, &oldType) == 45 && oldType == -1);
-    Require(pthread_setcanceltype_nid_postfix(1, &oldType) == 22 && oldType == -1);
-    Require(pthread_setcanceltype_nid_postfix(0, &oldType) == 0 && oldType == 0);
+    Require(pthread_setcanceltype_nid_postfix(2, &oldType) == 0 && oldType == 0);
+    Require(pthread_setcanceltype_nid_postfix(1, &oldType) == 22 && oldType == 0);
+    Require(pthread_setcanceltype_nid_postfix(0, &oldType) == 0 && oldType == 2);
 
     KernelClockid clock = -1;
     Require(pthread_getcpuclockid_nid_postfix(nullptr, &clock) == 22);

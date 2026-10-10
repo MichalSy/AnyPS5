@@ -79,8 +79,8 @@ void RunGuestLeaseWaitTests() {
     const auto address = reinterpret_cast<std::uintptr_t>(memory.data());
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(memory.data(), 64, true, true, true, true);
-        mutation.Add(memory.data() + 64, 64, true, true, true, true);
+        mutation.Add(memory.data(), 64, true, true, true);
+        mutation.Add(memory.data() + 64, 64, true, true, true);
     }
     auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     std::erase_if(lease, [&](const auto& range) { return range->address != address; });
@@ -147,7 +147,7 @@ void RunGuestAllocationTests() {
     std::array<std::byte, 128> mapping{};
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(mapping.data(), mapping.size(), true, true, true, true);
+        mutation.Add(mapping.data(), mapping.size(), true, true, true);
         reject([&] { mutation.RequireAvailable(mapping.data() + 32, 16); });
         mutation.Protect(mapping.data() + 32, 32, true, false, true, [] {});
     }
