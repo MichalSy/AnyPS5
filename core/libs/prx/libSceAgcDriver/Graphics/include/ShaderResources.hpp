@@ -186,6 +186,7 @@ public:
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
+    const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
@@ -335,6 +336,12 @@ private:
         std::uint64_t entryGeneration = 0;
     };
     std::vector<ImageRecord> imageRecords;
+    struct PreviousSampled {
+        std::array<std::uint32_t, 8> words{};
+        bool depthCompare = false;
+        std::shared_ptr<Texture> texture;
+    };
+    PreviousSampled previousSampled;
     // The next record resolveImageBinding consumes (records follow the deferredImages order).
     std::size_t nextImageRecord = 0;
     // Stage B: the record's texture when the fastRevalidate predicate proves it current under the

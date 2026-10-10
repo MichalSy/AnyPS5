@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -236,6 +237,19 @@ public:
                 extensionsEnabled.insert(extensionsEnabled.end(), libraryExtensions.begin(), libraryExtensions.end());
                 address.pNext = &library;
             }
+            VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+            if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                nullDescriptors = robustness.nullDescriptor == VK_TRUE;
+            }
+            robustness = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+            robustness.nullDescriptor = VK_TRUE;
+            if (nullDescriptors) {
+                extensionsEnabled.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+                robustness.pNext = address.pNext;
+                address.pNext = &robustness;
+            }
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             device.queueCreateInfoCount = 1;
             device.pQueueCreateInfos = &queue;
@@ -263,6 +277,7 @@ public:
     }
 
     ~Device() { release(); }
+    bool NullDescriptors() const { return nullDescriptors; }
     const Context& GetContext() const { return context; }
     bool Graphics() const { return graphics; }
     void WaitQueue() const { Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle"); }
@@ -291,6 +306,7 @@ private:
     VkInstance instance = VK_NULL_HANDLE;
     Context context{};
     bool graphics = false;
+    bool nullDescriptors = false;
 };
 
 using Kind = Recorder::ReadKind;
@@ -4241,6 +4257,105 @@ void dataWordPositionsTests() {
     }
 }
 
+std::array<std::uint32_t, 8> linearTextureWords(std::uint64_t address, std::uint32_t width, std::uint32_t height, std::uint32_t format) {
+    const auto base40 = address >> 8u;
+    std::array<std::uint32_t, 8> words{};
+    words[0] = static_cast<std::uint32_t>(base40);
+    words[1] = static_cast<std::uint32_t>((base40 >> 32u) & 0xffu) | (format << 20u) | (((width - 1u) & 3u) << 30u);
+    words[2] = (((width - 1u) >> 2u) & 0xfffu) | ((height - 1u) << 14u);
+    words[3] = 4u | (5u << 3u) | (6u << 6u) | (7u << 9u) | (9u << 28u);
+    return words;
+}
+
+void imageMemoTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    TextureCache textureCache(context);
+    context.textureCache = &textureCache;
+    if (!device.NullDescriptors()) {
+        std::cout << "nullDescriptor unavailable: image memo not tested\n";
+        return;
+    }
+    context.nullDescriptors = true;
+    constexpr std::uint32_t width = 64;
+    constexpr std::uint32_t height = 4;
+    constexpr std::size_t surfaceBytes = width * height * 4;
+    constexpr std::size_t bytes = 2 * 65536;
+    void* block = AllocateWatched(bytes, 65536);
+    const bool watched = block != nullptr;
+#ifdef _WIN32
+    if (!watched) block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    if (!watched) block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the image memo block");
+    auto* first = static_cast<std::uint8_t*>(block);
+    auto* second = first + 65536;
+    std::memset(first, 0x11, surfaceBytes);
+    std::memset(second, 0x22, surfaceBytes);
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = 1;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageSamplers = {0u};
+    program.bindings.push_back(binding);
+    const CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    std::vector<std::shared_ptr<Texture>> kept;
+    const auto sample = [&](const std::uint8_t* surface) {
+        const auto words = linearTextureWords(reinterpret_cast<std::uint64_t>(surface), width, height, 56);
+        program.bindings[0].guestDescriptor.assign(words.begin(), words.end());
+        ShaderResources resources(context, compiled);
+        Require(resources.SampledTextures().size() == 1, "the build has no sampled texture");
+        kept.push_back(resources.SampledTextures().front());
+        return kept.back();
+    };
+    const auto made = sample(first);
+    Require(sample(first) == made, "an unchanged sampled texture was made again");
+    const auto other = sample(second);
+    Require(other != made && sample(first) == made, "a texture of another descriptor answered for the first");
+    ClearCachedTextures(context.device);
+    const auto remade = sample(first);
+    Require(remade != made && remade != other, "a texture the cache dropped was bound again");
+    Require(sample(first) == remade, "the remade texture is not the cache's");
+    const auto replaced = sample(second);
+    Require(replaced != other && sample(second) == replaced && sample(first) == remade, "the cache does not answer with the replacements");
+    const auto firstWords = linearTextureWords(reinterpret_cast<std::uint64_t>(first), width, height, 56);
+    const auto secondWords = linearTextureWords(reinterpret_cast<std::uint64_t>(second), width, height, 56);
+    const auto bindElements = [&](std::initializer_list<std::array<std::uint32_t, 8>> elements, std::vector<bool> depthCompare) {
+        program.bindings[0].count = static_cast<std::uint32_t>(elements.size());
+        program.bindings[0].guestDescriptor.clear();
+        for (const auto& words : elements) program.bindings[0].guestDescriptor.insert(program.bindings[0].guestDescriptor.end(), words.begin(), words.end());
+        program.bindings[0].imageDepthCompare = std::move(depthCompare);
+        program.bindings[0].imageSamplers.assign(elements.size(), 0u);
+        ShaderResources resources(context, compiled);
+        Require(resources.SampledTextures().size() == elements.size(), "the build has the wrong number of sampled textures");
+        kept.insert(kept.end(), resources.SampledTextures().begin(), resources.SampledTextures().end());
+        return resources.SampledTextures();
+    };
+    const auto repeated = bindElements({firstWords, firstWords, secondWords, firstWords}, {});
+    Require(repeated[0] == remade && repeated[1] == remade && repeated[2] == replaced && repeated[3] == remade, "repeated elements of one build do not bind the cache's textures");
+    program.bindings[0].count = 1;
+    program.bindings[0].imageDepthCompare.clear();
+    program.bindings[0].imageSamplers.assign(1, 0u);
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    kept.clear();
+    ClearCachedTextures(context.device);
+    if (watched) ReleaseWatched(block, bytes);
+#ifdef _WIN32
+    else VirtualFree(block, 0, MEM_RELEASE);
+#else
+    else std::free(block);
+#endif
+}
+
 // A template's data buffers refreshed by words from a patched compiled result (a data-only hit)
 // and back: DataWordsHash() follows the buffers exactly, so a later recipe hit's hash compare
 // (RecordedDispatch::DataRefresh::Hash) decides correctly in both directions.
@@ -5444,6 +5559,7 @@ int main(int argc, char** argv) {
         dataRefreshTests(device, recorder);
         pendingAliasTests(device, recorder);
         storageOwnerTests(device, recorder);
+        imageMemoTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
         singleCubeTests(device, recorder);
