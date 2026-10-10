@@ -27,6 +27,8 @@ static_assert(sizeof(GuestSignalAction) == 32);
 static_assert(offsetof(GuestSignalAction, flags) == 8);
 static_assert(offsetof(GuestSignalAction, mask) == 12);
 
+extern "C" int APS5_VABI _sigprocmask_nid_postfix(int how, const GuestSignalSet* set, GuestSignalSet* previousSet);
+
 namespace {
 constexpr int guestInvalid = 22;
 constexpr int guestFault = 14;
@@ -297,10 +299,7 @@ int APS5_VABI sigaction_nid_postfix(int guest, const GuestSignalAction* action, 
 int APS5_VABI pthread_sigmask_nid_postfix(int how, const GuestSignalSet* set, GuestSignalSet* previous) {
     const int savedError = *__error_nid_postfix();
 #ifdef _WIN32
-    (void)how;
-    (void)set;
-    (void)previous;
-    const int error = guestNotSupported;
+    const int error = set && (how < 1 || how > 3) ? guestInvalid : _sigprocmask_nid_postfix(how, set, previous);
 #else
     const int error = ChangeMask(how, set, previous);
 #endif

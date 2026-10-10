@@ -256,13 +256,20 @@ int main() {
     Require(sigprocmask_nid_postfix(2, &blocked, nullptr) == 0);
     Require(sigprocmask_nid_postfix(1, nullptr, &previous) == 0);
     Require(previous.bits[0] == 0);
+    *__error_nid_postfix() = 0;
+    Require(pthread_sigmask_nid_postfix(1, &blocked, nullptr) == 0);
+    Require(pthread_sigmask_nid_postfix(0, &blocked, &previous) == 22);
+    Require(pthread_sigmask_nid_postfix(4, &blocked, &previous) == 22);
+    Require(*__error_nid_postfix() == 0);
+    Require(pthread_sigmask_nid_postfix(0, nullptr, &previous) == 0);
+    Require(previous.bits[0] == 0x20);
+    Require(sigprocmask_nid_postfix(1, nullptr, &previous) == 0 && previous.bits[0] == 0x20);
+    Require(pthread_sigmask_nid_postfix(2, &blocked, &previous) == 0 && previous.bits[0] == 0x20);
+    Require(pthread_sigmask_nid_postfix(1, nullptr, &previous) == 0 && previous.bits[0] == 0);
 #ifndef _WIN32
     TestPosixSignals();
     Require(pthread_sigmask_nid_postfix(3, &initialMask, nullptr) == 0);
 #else
-    *__error_nid_postfix() = 13;
-    Require(pthread_sigmask_nid_postfix(1, &blocked, nullptr) == 45);
-    Require(*__error_nid_postfix() == 13);
     TestWindowsSigaction();
 #endif
 }
