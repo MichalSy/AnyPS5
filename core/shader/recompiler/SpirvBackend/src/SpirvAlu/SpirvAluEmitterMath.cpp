@@ -609,6 +609,37 @@ std::uint32_t EmitF32ProductIsTiny(SpirvEmitterState& state, std::uint32_t arg0,
     return EmitValueOrDefaultIfCondition(state, needsCarry, TypeBool(state), allTiny, withoutCarry);
 }
 
+std::uint32_t EmitF32ProductIsTinyContext(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    auto& state = ctx.state;
+    const auto constantBits = [&](std::size_t index) -> std::optional<std::uint32_t> {
+        const auto* value = inst.Argument(index)->Resolve();
+        return value->HasImmediate() && value->Type() == IrType::U32 ? std::optional{value->ImmediateU32()} : std::nullopt;
+    };
+    const auto lhs = constantBits(0u);
+    const auto rhs = constantBits(1u);
+    const auto excludesTiny = [](const std::optional<std::uint32_t>& bits) {
+        if (!bits) return false;
+        const auto exponent = (*bits >> 23u) & 0xffu;
+        return exponent == 0u || exponent >= 127u;
+    };
+    if (excludesTiny(lhs) || excludesTiny(rhs)) return ConstantBool(state, false);
+    const auto unitSignificand = [](const std::optional<std::uint32_t>& bits) {
+        return bits && (*bits & 0x007fffffu) == 0u;
+    };
+    if (unitSignificand(lhs) || unitSignificand(rhs)) {
+        const bool leftIsUnit = unitSignificand(lhs);
+        const auto knownExponent = (*(leftIsUnit ? lhs : rhs) >> 23u) & 0xffu;
+        const auto otherExponent = EmitBitFieldUExtract(state, ctx.Arg(inst, leftIsUnit ? 1u : 0u), ConstantU32(state, 23u), ConstantU32(state, 8u));
+        const auto nonzero = Binary(state, spv::OpINotEqual, TypeBool(state), otherExponent, ConstantU32(state, 0u));
+        const auto finite = Binary(state, spv::OpINotEqual, TypeBool(state), otherExponent, ConstantU32(state, 0xffu));
+        const auto normal = Binary(state, spv::OpLogicalAnd, TypeBool(state), nonzero, finite);
+        const auto sum = Binary(state, spv::OpIAdd, TypeU32(state), ConstantU32(state, knownExponent), otherExponent);
+        const auto tiny = Binary(state, spv::OpULessThan, TypeBool(state), sum, ConstantU32(state, 128u));
+        return Binary(state, spv::OpLogicalAnd, TypeBool(state), normal, tiny);
+    }
+    return EmitF32ProductIsTiny(state, ctx.Arg(inst, 0u), ctx.Arg(inst, 1u));
+}
+
 std::uint32_t EmitIAbs32(SpirvEmitterState& state, std::uint32_t arg0) {
     const auto negated = Unary(state, spv::OpSNegate, TypeU32(state), arg0);
     const auto negative = Binary(state, spv::OpSLessThan, TypeBool(state), arg0, ConstantU32(state, 0u));

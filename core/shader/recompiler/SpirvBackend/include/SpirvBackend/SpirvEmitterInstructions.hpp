@@ -20,6 +20,7 @@ std::uint32_t EmitIMul64(SpirvEmitterState& state, std::uint32_t arg0, std::uint
 std::uint32_t EmitSMulHi(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitUMulHi(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitF32ProductIsTiny(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
+std::uint32_t EmitF32ProductIsTinyContext(SpirvValueEmitContext& ctx, const IrValue& inst);
 std::uint32_t EmitIAbs32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitShiftLeftLogical64(SpirvValueEmitContext& ctx, std::uint32_t arg0, const IrValue* arg1);
 std::uint32_t EmitShiftRightLogical64(SpirvValueEmitContext& ctx, std::uint32_t arg0, const IrValue* arg1);

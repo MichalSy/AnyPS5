@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 using namespace ShaderRecompiler;
 
@@ -170,6 +171,150 @@ void CheckSpirv(bool loopHeader) {
     Require(selections == (loopHeader ? 0u : 1u), "loop-header fallback or ordinary guard structure changed");
 }
 
+struct ContextPredicateModule {
+    std::vector<std::uint32_t> words;
+    std::uint32_t result;
+};
+
+ContextPredicateModule EmitContextPredicate(std::uint32_t a, std::uint32_t b, std::uint32_t constantMask, bool loopHeader = false) {
+    IrProgram program;
+    program.Resources().stage = IrShaderStage::Compute;
+    program.SetWaveSize(32u);
+    auto& block = program.CreateBlock();
+    program.SetEntryBlock(block);
+    program.BlockOrder().push_back(&block);
+    program.Metadata().blockInfo.push_back(BlockInfo{});
+    program.Metadata().blockInfo.back().terminator.loopHeader = loopHeader;
+    IrBuilder ir(program);
+    ir.SetInsertionPoint(block);
+    SpirvEmitterState state(program, ShaderStageInputInfo{});
+    SpirvValueEmitContext ctx(state);
+    auto& module = state.module;
+    module.EmitCapability(spv::CapabilityShader);
+    module.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+    const auto function = module.AllocateId();
+    module.EmitEntryPoint(spv::ExecutionModelGLCompute, function, "main", {});
+    module.AddExecutionMode(function, spv::ExecutionModeLocalSize, 32u, 1u, 1u);
+    const auto typeVoid = module.Type(spv::OpTypeVoid);
+    const auto typeFunction = module.Type(spv::OpTypeFunction, typeVoid);
+    module.AddFunction(spv::OpFunction, typeVoid, function, spv::FunctionControlMaskNone, typeFunction);
+    EmitLabel(state, module.AllocateId());
+    const auto header = module.AllocateId();
+    const auto continuing = module.AllocateId();
+    const auto merge = module.AllocateId();
+    if (loopHeader) {
+        module.AddFunction(spv::OpBranch, header);
+        EmitLabel(state, header);
+    }
+    state.currentBlock = &block;
+    const auto argument = [&](std::uint32_t bits, std::uint32_t index) -> IrValue& {
+        if ((constantMask & (1u << index)) != 0u) {
+            auto& value = program.CreateValue(IrOpcode::Identity, IrType::U32);
+            value.AddArgument(&ir.Constant(bits));
+            block.AppendInstruction(&value);
+            return value;
+        }
+        auto& value = ir.Emit(IrOpcode::UndefU32, IrType::U32, {});
+        const auto copied = module.AllocateId();
+        module.AddFunction(spv::OpCopyObject, TypeU32(state), copied, ConstantU32(state, bits));
+        ctx.Define(value, copied);
+        return value;
+    };
+    auto& lhs = argument(a, 0u);
+    auto& rhs = argument(b, 1u);
+    auto& inst = ir.Emit(IrOpcode::F32ProductIsTiny, IrType::U1, {&lhs, &rhs});
+    const auto predicate = EmitF32ProductIsTinyContext(ctx, inst);
+    if (loopHeader) {
+        module.AddFunction(spv::OpLoopMerge, merge, continuing, spv::LoopControlMaskNone);
+        module.AddFunction(spv::OpBranchConditional, predicate, continuing, merge);
+        EmitLabel(state, continuing);
+        module.AddFunction(spv::OpBranch, header);
+        EmitLabel(state, merge);
+    }
+    module.AddFunction(spv::OpReturn);
+    module.AddFunction(spv::OpFunctionEnd);
+    const auto words = module.Finalize();
+    Require(ValidateAndOptimizeSpirv(words, 0x00401000u, 0x00010300u, false, false) == words, "context predicate validation changed its module");
+    return {words, predicate};
+}
+
+bool EvaluateContextShortcut(const ContextPredicateModule& emitted) {
+    std::unordered_map<std::uint32_t, std::uint32_t> values;
+    for (std::size_t offset = 5u; offset < emitted.words.size();) {
+        const auto count = emitted.words[offset] >> 16u;
+        const auto opcode = emitted.words[offset] & 0xffffu;
+        Require(count > 0u && offset + count <= emitted.words.size(), "invalid context SPIR-V word count");
+        const auto operand = [&](std::size_t index) { return values.at(emitted.words[offset + index]); };
+        switch (opcode) {
+        case spv::OpConstant: values[emitted.words[offset + 2u]] = emitted.words[offset + 3u]; break;
+        case spv::OpConstantTrue: values[emitted.words[offset + 2u]] = 1u; break;
+        case spv::OpConstantFalse: values[emitted.words[offset + 2u]] = 0u; break;
+        case spv::OpCopyObject: values[emitted.words[offset + 2u]] = operand(3u); break;
+        case spv::OpBitFieldUExtract: values[emitted.words[offset + 2u]] = (operand(3u) >> operand(4u)) & ((1u << operand(5u)) - 1u); break;
+        case spv::OpINotEqual: values[emitted.words[offset + 2u]] = operand(3u) != operand(4u); break;
+        case spv::OpLogicalAnd: values[emitted.words[offset + 2u]] = operand(3u) != 0u && operand(4u) != 0u; break;
+        case spv::OpIAdd: values[emitted.words[offset + 2u]] = operand(3u) + operand(4u); break;
+        case spv::OpULessThan: values[emitted.words[offset + 2u]] = operand(3u) < operand(4u); break;
+        default: break;
+        }
+        offset += count;
+    }
+    return values.at(emitted.result) != 0u;
+}
+
+void CheckContextStructure(const ContextPredicateModule& emitted, std::uint32_t expectedSelections, std::uint32_t expectedMultiplies) {
+    std::uint32_t selections = 0u;
+    std::uint32_t multiplies = 0u;
+    for (std::size_t offset = 5u; offset < emitted.words.size();) {
+        const auto count = emitted.words[offset] >> 16u;
+        const auto opcode = emitted.words[offset] & 0xffffu;
+        Require(count > 0u && offset + count <= emitted.words.size(), "invalid context SPIR-V word count");
+        if (opcode == spv::OpSelectionMerge) ++selections;
+        if (opcode == spv::OpUMulExtended || opcode == spv::OpIMul) ++multiplies;
+        offset += count;
+    }
+    Require(selections == expectedSelections, "constant context has the wrong selection count");
+    Require(multiplies == expectedMultiplies, "constant context has the wrong carry multiply count");
+}
+
+void CheckConstantContext() {
+    const std::array<std::uint32_t, 12> otherValues{
+        0u, 0x80000000u, 1u, Bits(1u, 0u), Bits(1u, 0x7fffffu), Bits(2u, 0u),
+        Bits(64u, 0x7fffffu), Bits(126u, 1u), Bits(127u, 0u), 0x7f800000u, 0xff800000u, Bits(255u, 0x412345u)};
+    for (const auto exponent : {0u, 1u, 63u, 126u, 127u, 255u}) {
+        for (const auto negative : {false, true}) {
+            for (const auto fraction : {0u, 1u}) {
+                const auto factor = Bits(exponent, fraction, negative);
+                const bool alwaysFalse = exponent == 0u || exponent >= 127u;
+                const bool shortcut = alwaysFalse || fraction == 0u;
+                for (const auto other : otherValues) {
+                    for (const auto position : {0u, 1u}) {
+                        const auto a = position == 0u ? factor : other;
+                        const auto b = position == 0u ? other : factor;
+                        const auto emitted = EmitContextPredicate(a, b, 1u << position);
+                        CheckContextStructure(emitted, shortcut ? 0u : 1u, shortcut ? 0u : 1u);
+                        if (shortcut) {
+                            const auto result = EvaluateContextShortcut(emitted);
+                            CheckFold(a, b, result ? 1 : 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (const bool loopHeader : {false, true}) {
+        const auto dynamic = EmitContextPredicate(Bits(63u, 0x7fffffu), Bits(64u, 1u), 0u, loopHeader);
+        CheckContextStructure(dynamic, loopHeader ? 0u : 1u, 1u);
+        for (const auto position : {0u, 1u}) {
+            const auto known = Bits(126u, 0u, true);
+            const auto other = Bits(1u, 0x7fffffu);
+            const auto unit = EmitContextPredicate(position == 0u ? known : other, position == 0u ? other : known, 1u << position, loopHeader);
+            CheckContextStructure(unit, 0u, 0u);
+            CheckFold(known, other, EvaluateContextShortcut(unit) ? 1 : 0);
+        }
+    }
+}
+
 }
 
 int main() {
@@ -180,6 +325,7 @@ int main() {
         CheckTranslation({0xd54b0017u, 0x04164104u}, RdnaOpcode::VFmaF32, 0xc0u, true);
         CheckSpirv(false);
         CheckSpirv(true);
+        CheckConstantContext();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
