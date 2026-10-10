@@ -29,9 +29,9 @@ class RegisteredMemory {
 public:
     RegisteredMemory() {
         GuestAllocations::Mutation mutation;
-        mutation.Add(colorMemory.data(), colorMemory.size(), true, true);
-        mutation.Add(depthMemory.data(), depthMemory.size(), true, true);
-        mutation.Add(stencilMemory.data(), stencilMemory.size(), true, true);
+        mutation.Add(colorMemory.data(), colorMemory.size(), true, true, true);
+        mutation.Add(depthMemory.data(), depthMemory.size(), true, true, true);
+        mutation.Add(stencilMemory.data(), stencilMemory.size(), true, true, true);
         mutation.Add(pixelProgram.data(), sizeof(pixelProgram), true, false);
     }
     ~RegisteredMemory() {
