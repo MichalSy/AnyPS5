@@ -190,7 +190,7 @@ public:
         else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
     }
 
-    void Transfer(StorageTexture& storage, bool intoStorage, std::uint32_t layer) {
+    bool StorageAccepts(const StorageTexture& storage, std::uint32_t layer) const {
         const auto& descriptor = storage.Descriptor();
         const auto geometry = DescribeSurface(descriptor);
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
@@ -201,20 +201,19 @@ public:
         const bool sized = !IsConvertedTextureFormat(descriptor.format) && BlockWidth(descriptor.format) == 1u &&
             BlockHeight(descriptor.format) == 1u && BytesPerElement(descriptor.format) == (d16 ? 2u : 4u) &&
             storage.StorageFormat() == ResolveTextureFormat(descriptor.format);
-        if (target.samples != VK_SAMPLE_COUNT_1_BIT || target.mipCount != 1u || target.mip != 0u || target.address == 0 ||
+        return !(target.samples != VK_SAMPLE_COUNT_1_BIT || target.mipCount != 1u || target.mip != 0u || target.address == 0 ||
             (!d16 && !d32) || !sized || offset > std::numeric_limits<std::uint64_t>::max() - descriptor.baseAddress ||
             descriptor.baseAddress + offset != target.address || (storage.ImageLayers() > 1u && geometry.layerBytes != stride) || descriptor.width != extent.width ||
             descriptor.height != extent.height || descriptor.mipCount != 1u || descriptor.baseLevel != 0u ||
             descriptor.lastLevel != 0u || descriptor.baseArray >= storage.ImageLayers() || layer >= storage.ImageLayers() ||
             (descriptor.dimension != TextureDimension::k2D && descriptor.dimension != TextureDimension::k2DArray) ||
-            (descriptor.dimension == TextureDimension::k2D && descriptor.depthOrLastArray != 0u) || storage.ImageDepth() != 1u) {
-            char text[320];
-            std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d, %u samples, %u mips) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented",
-                static_cast<unsigned long long>(target.address), extent.width, extent.height, static_cast<int>(target.format),
-                static_cast<unsigned>(target.samples), target.mipCount, descriptor.width, descriptor.height,
-                static_cast<int>(storage.StorageFormat()), static_cast<int>(descriptor.dimension), descriptor.mipCount);
-            throw std::runtime_error(text);
-        }
+            (descriptor.dimension == TextureDimension::k2D && descriptor.depthOrLastArray != 0u) || storage.ImageDepth() != 1u);
+    }
+
+    void Transfer(StorageTexture& storage, bool intoStorage, std::uint32_t layer) {
+        if (!StorageAccepts(storage, layer)) refuseStorage(storage, OverwrittenInMemory());
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto extent = surfaceExtent(target);
         if (transferBuffer == nullptr) transferBuffer = std::make_unique<DeviceBuffer>(context, static_cast<std::size_t>(extent.width) * extent.height * (d16 ? 2u : 4u), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         auto* recorder = recorderFor(context);
         std::unique_ptr<CommandBatch> batch;
@@ -254,6 +253,12 @@ public:
     }
 
     std::shared_ptr<StorageTexture> SeedStorage(const std::shared_ptr<StorageTexture>& storage, std::uint32_t layer) {
+        if (!StorageAccepts(*storage, layer)) {
+            const bool newerGuestWrites = OverwrittenInMemory();
+            if (!newerGuestWrites) refuseStorage(*storage, newerGuestWrites);
+            Retire();
+            return nullptr;
+        }
         ApplyFastClear();
         if (writer == storage && writerLayer == layer) return nullptr;
         auto consumed = TakeWrites();
@@ -377,6 +382,18 @@ private:
     std::uint32_t writerLayer = 0;
     std::uint64_t depthWritten = 0;
     std::uint64_t stencilWritten = 0;
+
+    [[noreturn]] void refuseStorage(const StorageTexture& storage, bool newerGuestWrites) const {
+        const auto& descriptor = storage.Descriptor();
+        const auto extent = surfaceExtent(target);
+        char text[384];
+        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d, %u samples, %u mips) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented; newer guest writes=%u",
+            static_cast<unsigned long long>(target.address), extent.width, extent.height, static_cast<int>(target.format),
+            static_cast<unsigned>(target.samples), target.mipCount, descriptor.width, descriptor.height,
+            static_cast<int>(storage.StorageFormat()), static_cast<int>(descriptor.dimension), descriptor.mipCount,
+            static_cast<unsigned>(newerGuestWrites));
+        throw std::runtime_error(text);
+    }
 
     std::uint64_t depthBytes() const {
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;

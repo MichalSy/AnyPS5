@@ -485,6 +485,20 @@ void RemappedColorTest(const Device& device) {
     ClearCachedTextures(device.GetContext().device);
 }
 
+void ReadStorageImage(const Context& context, const StorageTexture& storage, Buffer& readback) {
+    CommandBatch batch(context);
+    const auto commands = batch.Handle();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, storage.ImageLayers()};
+    copy.imageExtent = {storage.Descriptor().width, storage.Descriptor().height, 1};
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, storage.Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    batch.SubmitAndWait();
+}
+
 void StorageRoundTripTest(const Context& context) {
     GuestBlock memory(DepthSliceBytes(Extent, 4));
     struct Cleanup {
@@ -535,6 +549,29 @@ void StorageRoundTripTest(const Context& context) {
     Require(rebound != nullptr && sampler.RedBits(*rebound) == std::bit_cast<std::uint32_t>(writtenDepth),
         "rebinding depth did not import the retained storage writer's GPU pixel bits");
     Require(retained.expired(), "a completed depth rebind retained the consumed storage writer");
+
+    auto replacement = View(Extent.width / 4, Extent.height / 4, memory.Address());
+    replacement.format = 29; // R16G16_SFLOAT in a smaller linear buffer at the reused address.
+    bool refused = false;
+    try {
+        CachedStorageSurface(context, replacement);
+    } catch (const std::runtime_error& error) {
+        refused = std::string(error.what()).find("is not implemented") != std::string::npos;
+    }
+    Require(refused && DepthSurfaceAt(target.address), "an incompatible storage view discarded current GPU depth pixels without newer guest writes");
+    constexpr std::uint32_t replacementPixel = 0x40003c00u;
+    std::fill_n(reinterpret_cast<std::uint32_t*>(memory.data), DepthSliceBytes(Extent, 4) / sizeof(replacementPixel), replacementPixel);
+    AgcDriver::GuestMemory::MarkWritten(memory.Address(), DepthSliceBytes(Extent, 4));
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto reused = CachedStorageSurface(context, replacement);
+    Require(reused != nullptr && !DepthSurfaceAt(target.address), "newer guest writes did not retire an incompatible depth image at a reused address");
+    Buffer replacementReadback(context, replacement.width * replacement.height * sizeof(replacementPixel), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    ReadStorageImage(context, *reused, replacementReadback);
+    for (std::size_t offset = 0; offset < replacementReadback.Bytes().size(); offset += sizeof(replacementPixel)) {
+        std::uint32_t value;
+        std::memcpy(&value, replacementReadback.Bytes().data() + offset, sizeof(value));
+        Require(value == replacementPixel, "retiring a reused depth address replaced newer guest pixels with stale depth bits");
+    }
 }
 
 void StorageArrayRoundTripTest(const Context& context, bool firstLayerResident) {
@@ -587,19 +624,7 @@ void StorageArrayRoundTripTest(const Context& context, bool firstLayerResident) 
     }
     auto writer = CachedStorageSurface(context, resource);
     Buffer readback(context, layers * texels * sizeof(std::uint16_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    {
-        CommandBatch batch(context);
-        const auto commands = batch.Handle();
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        VkBufferImageCopy copy{};
-        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
-        copy.imageExtent = {Extent.width, Extent.height, 1};
-        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, writer->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-        batch.SubmitAndWait();
-    }
+    ReadStorageImage(context, *writer, readback);
     const std::array<std::uint16_t, layers> expected{firstLayerResident ? std::uint16_t{0} : std::uint16_t{0x3333}, 0x3333, 65535};
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         for (std::uint32_t pixel = 0; pixel < texels; ++pixel) {
