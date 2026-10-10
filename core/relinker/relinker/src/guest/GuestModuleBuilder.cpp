@@ -124,7 +124,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         }
         std::map<std::string, std::filesystem::path> found;
         for (auto it = std::filesystem::recursive_directory_iterator(root); it != std::filesystem::recursive_directory_iterator(); ++it) {
-            if (it->is_directory() && (it->path() == root / "sce_sys" || std::find(directories.begin(), directories.end(), it->path()) != directories.end())) {
+            if (it->is_directory() && (it->path() == root / "sce_sys" || it->path() == root / "fakelib" || std::find(directories.begin(), directories.end(), it->path()) != directories.end())) {
                 it.disable_recursion_pending();
                 continue;
             }
