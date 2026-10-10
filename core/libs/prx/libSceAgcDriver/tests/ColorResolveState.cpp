@@ -27,8 +27,8 @@ public:
         sourceMemory.fill(std::byte{0x39});
         destinationMemory.fill(std::byte{0xa7});
         GuestAllocations::Mutation mutation;
-        mutation.Add(sourceMemory.data(), sourceMemory.size(), true, true);
-        mutation.Add(destinationMemory.data(), destinationMemory.size(), true, true);
+        mutation.Add(sourceMemory.data(), sourceMemory.size(), true, true, true);
+        mutation.Add(destinationMemory.data(), destinationMemory.size(), true, true, true);
     }
     ~Memory() {
         GuestAllocations::Mutation mutation;

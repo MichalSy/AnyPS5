@@ -211,9 +211,9 @@ void Submit(const AgcDriver::QueueState& queue) {
 void CheckRegisteredDraw(bool rectangleOnly = false, bool pairAbi = false) {
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(Pixels.data(), Pixels.size(), true, true);
-        mutation.Add(Depth.data(), Depth.size(), true, true);
-        mutation.Add(Stencil.data(), Stencil.size(), true, true);
+        mutation.Add(Pixels.data(), Pixels.size(), true, true, true);
+        mutation.Add(Depth.data(), Depth.size(), true, true, true);
+        mutation.Add(Stencil.data(), Stencil.size(), true, true, true);
     }
     auto queue = Queue();
     Header<3, 1> vertex;
@@ -275,9 +275,9 @@ void CheckRegisteredDraw(bool rectangleOnly = false, bool pairAbi = false) {
 void CheckDepthOnly(std::uint32_t primitiveType, bool explicitNull) {
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(Pixels.data(), Pixels.size(), true, true);
-        mutation.Add(Depth.data(), Depth.size(), true, true);
-        mutation.Add(Stencil.data(), Stencil.size(), true, true);
+        mutation.Add(Pixels.data(), Pixels.size(), true, true, true);
+        mutation.Add(Depth.data(), Depth.size(), true, true, true);
+        mutation.Add(Stencil.data(), Stencil.size(), true, true, true);
     }
     auto queue = Queue();
     Header<3, 1> vertex;
@@ -443,9 +443,9 @@ void CheckDepthExportAbi(AgcDriver::VulkanDevice& device) {
 void CheckRegisteredDepthExport(std::uint32_t zOrder, bool registeredDepth = true) {
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(Pixels.data(), Pixels.size(), true, true);
-        mutation.Add(Depth.data(), Depth.size(), true, true);
-        mutation.Add(Stencil.data(), Stencil.size(), true, true);
+        mutation.Add(Pixels.data(), Pixels.size(), true, true, true);
+        mutation.Add(Depth.data(), Depth.size(), true, true, true);
+        mutation.Add(Stencil.data(), Stencil.size(), true, true, true);
     }
     auto queue = Queue();
     queue.context[0x200] = 0x76;

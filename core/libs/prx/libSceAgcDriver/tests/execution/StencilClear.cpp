@@ -48,9 +48,9 @@ class GuestBackings {
 public:
     GuestBackings() {
         GuestAllocations::Mutation mutation;
-        mutation.Add(Pixels.data(), Pixels.size(), true, true);
-        mutation.Add(Depth.data(), Depth.size(), true, true);
-        mutation.Add(Stencil.data(), Stencil.size(), true, true);
+        mutation.Add(Pixels.data(), Pixels.size(), true, true, true);
+        mutation.Add(Depth.data(), Depth.size(), true, true, true);
+        mutation.Add(Stencil.data(), Stencil.size(), true, true, true);
     }
 
     ~GuestBackings() {

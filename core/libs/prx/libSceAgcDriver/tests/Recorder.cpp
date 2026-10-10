@@ -1258,7 +1258,7 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;
@@ -3587,7 +3587,7 @@ void storageOwnerTests(const Device& device, Recorder& recorder) {
         const auto address = reinterpret_cast<std::uint64_t>(block);
         {
             GuestAllocations::Mutation mutation;
-            mutation.Add(block, bytes, true, true);
+            mutation.Add(block, bytes, true, true, true);
         }
         struct Unregister {
             const Context& context;
@@ -3801,7 +3801,7 @@ void pendingAliasTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     struct Unregister {
         const Context& context;

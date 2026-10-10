@@ -92,7 +92,7 @@ public:
 #endif
         Require(data != nullptr && Address() % 65536u == 0, "cannot allocate an aligned multisample guest surface");
         GuestAllocations::Mutation mutation;
-        mutation.Add(data, StorageBytes, true, true);
+        mutation.Add(data, StorageBytes, true, true, true);
     }
     ~Block() {
         {

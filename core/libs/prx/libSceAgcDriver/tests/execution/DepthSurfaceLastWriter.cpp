@@ -179,7 +179,7 @@ public:
         Require(data != nullptr, "cannot allocate the guest surface");
         commit(bytes);
         GuestAllocations::Mutation mutation;
-        mutation.Add(data, bytes, true, true);
+        mutation.Add(data, bytes, true, true, true);
     }
     ~GuestBlock() {
         {
@@ -202,7 +202,7 @@ public:
         mappedBytes = bytes;
         {
             GuestAllocations::Mutation mutation;
-            mutation.Add(data, bytes, true, true);
+            mutation.Add(data, bytes, true, true, true);
         }
         Require(!AgcDriver::GuestMemory::Accessible(data + bytes, 1), "the old allocation tail survived the smaller remap");
     }

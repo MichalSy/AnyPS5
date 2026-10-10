@@ -32,7 +32,7 @@ public:
         mutation.Add(colorMemory.data(), colorMemory.size(), true, true, true);
         mutation.Add(depthMemory.data(), depthMemory.size(), true, true, true);
         mutation.Add(stencilMemory.data(), stencilMemory.size(), true, true, true);
-        mutation.Add(pixelProgram.data(), sizeof(pixelProgram), true, false);
+        mutation.Add(pixelProgram.data(), sizeof(pixelProgram), true, false, true);
     }
     ~RegisteredMemory() {
         GuestAllocations::Mutation mutation;
