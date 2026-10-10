@@ -35,6 +35,8 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <initializer_list>
 #include <atomic>
 #include <cmath>
 #include <chrono>
@@ -2894,6 +2896,291 @@ void expectRed(float got, float want, const char* what) {
     if (std::abs(got - want) > 1.5f / 255.0f) throw std::runtime_error(std::string(what) + ": read " + std::to_string(got) + ", expected " + std::to_string(want));
 }
 
+std::vector<std::uint32_t> storageOwnerShader(bool array, float red) {
+    const std::uint32_t color = std::bit_cast<std::uint32_t>(red);
+    std::vector<std::uint32_t> code{0x07230203u, 0x00010000u, 0u, 20u, 0u};
+    const auto emit = [&](std::uint32_t opcode, std::initializer_list<std::uint32_t> operands) {
+        code.push_back((static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | opcode);
+        code.insert(code.end(), operands.begin(), operands.end());
+    };
+    emit(17, {1});
+    emit(14, {0, 1});
+    emit(15, {5, 17, 0x6e69616du, 0u});
+    emit(16, {17, 17, 1, 1, 1});
+    emit(71, {9, 34, 0});
+    emit(71, {9, 33, array ? 32u : 31u});
+    emit(19, {1});
+    emit(33, {2, 1});
+    emit(22, {3, 32});
+    emit(23, {4, 3, 4});
+    emit(21, {5, 32, 1});
+    emit(23, {6, 5, array ? 3u : 2u});
+    emit(25, {7, 3, 1, 0, array ? 1u : 0u, 0, 2, 4});
+    emit(32, {8, 0, 7});
+    emit(59, {8, 9, 0});
+    emit(43, {5, 10, 128});
+    emit(43, {5, 11, 0});
+    emit(43, {3, 12, color});
+    emit(43, {3, 13, 0});
+    emit(43, {3, 14, 0x3f800000u});
+    if (array) emit(44, {6, 15, 10, 10, 11});
+    else emit(44, {6, 15, 10, 10});
+    emit(44, {4, 16, 12, 13, 13, 14});
+    emit(54, {1, 17, 0, 2});
+    emit(248, {18});
+    emit(61, {7, 19, 9});
+    emit(99, {19, 15, 16});
+    emit(253, {});
+    emit(56, {});
+    return code;
+}
+
+void storageOwnerWrite(const Context& context, Recorder& recorder, std::span<const std::uint32_t> words, bool array, float red) {
+    ShaderRecompiler::RecompileResult program;
+    program.spirv = storageOwnerShader(array, red);
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = array ? 32u : 31u;
+    binding.count = 1;
+    binding.guestDescriptor.assign(words.begin(), words.end());
+    binding.imageShape = array ? ShaderRecompiler::DescriptorImageShape::Image2DArray : ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageWritten = {true};
+    program.bindings.push_back(std::move(binding));
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(context, shader);
+    struct PipelineObjects {
+        const Context& context;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkShaderModule module = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        ~PipelineObjects() {
+            if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+            if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+        }
+    } objects{context};
+    const auto setLayout = resources.Layout();
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &setLayout;
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &objects.layout), "vkCreatePipelineLayout storage owner");
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = program.spirv.size() * sizeof(std::uint32_t);
+    moduleInfo.pCode = program.spirv.data();
+    Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &objects.module), "vkCreateShaderModule storage owner");
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, objects.module, "main", nullptr};
+    pipelineInfo.layout = objects.layout;
+    Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &objects.pipeline), "vkCreateComputePipelines storage owner");
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+    context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, objects.pipeline);
+    resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, objects.layout);
+    context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+    resources.MarkGpuWrites(recorder);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    recorder.Submit();
+    recorder.Sync();
+}
+
+void storageOwnerTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    constexpr std::size_t bytes = 4u << 20u;
+    for (const bool arrayFirst : {false, true}) {
+        ClearCachedTextures(context.device);
+        recorder.Sync();
+#ifdef _WIN32
+        void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+        void* block = std::aligned_alloc(65536, bytes);
+#endif
+        Require(block != nullptr, "cannot allocate the storage owner block");
+        std::memset(block, 0, bytes);
+        const auto address = reinterpret_cast<std::uint64_t>(block);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, bytes, true, true);
+        }
+        struct Unregister {
+            const Context& context;
+            Recorder& recorder;
+            void* block;
+            std::uint64_t address;
+            ~Unregister() {
+                ClearCachedTextures(context.device);
+                recorder.Sync();
+                {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Remove(block);
+                }
+                HostImportFor(context, address, bytes);
+#ifdef _WIN32
+                VirtualFree(block, 0, MEM_RELEASE);
+#else
+                std::free(block);
+#endif
+            }
+        } unregister{context, recorder, block, address};
+        HostImportFor(context, address, bytes);
+        const auto descriptor = [&](bool array) {
+            const auto shifted = address >> 8u;
+            return std::array<std::uint32_t, 8>{static_cast<std::uint32_t>(shifted), static_cast<std::uint32_t>(shifted >> 32u) | (56u << 20u) | (3u << 30u), 63u | (255u << 14u), 0xfacu | (1u << 16u) | (0x1bu << 20u) | ((array ? 13u : 9u) << 28u), 0, 1u << 4u, 0, 0};
+        };
+        const auto flatWords = descriptor(false);
+        const auto arrayWords = descriptor(true);
+        const auto flat = DecodeTextureResource(flatWords);
+        const auto array = DecodeTextureResource(arrayWords);
+        const auto flatGeometry = DescribeSurface(flat);
+        const auto arrayGeometry = DescribeSurface(array);
+        Require(flatGeometry.guestBytes == arrayGeometry.guestBytes && flatGeometry.layerBytes == arrayGeometry.layerBytes && flatGeometry.sliceLinearBytes == arrayGeometry.sliceLinearBytes && arrayGeometry.imageLayers == 1 && arrayGeometry.imageDepth == 1 && !arrayGeometry.thick, "one-slice descriptors have different physical geometry");
+        auto owner = CachedStorageSurface(context, arrayFirst ? array : flat);
+        const auto accounted = TextureCacheUsage().storageBytes;
+        auto alternate = CachedStorageSurface(context, arrayFirst ? flat : array);
+        Require(owner == alternate && owner->Image() == alternate->Image() && owner->Descriptor().dimension == TextureDimension::k2D, "one-slice descriptors did not resolve to one physical owner");
+        Require(TextureCacheUsage().storageBytes == accounted && owner->Cached(), "one physical owner was accounted twice or left the cache");
+        for (const auto mip : {0u, 1u}) {
+            const auto flatView = owner->StorageView(mip, false, flat.dimension);
+            const auto arrayView = owner->StorageView(mip, false, array.dimension);
+            const auto firstLayer = owner->StorageView(mip, true, array.dimension);
+            Require(flatView != VK_NULL_HANDLE && arrayView != VK_NULL_HANDLE && flatView != arrayView, "storage binding shapes share the wrong view handle");
+            Require(flatView == owner->StorageView(mip, false, flat.dimension) && arrayView == owner->StorageView(mip, false, array.dimension) && firstLayer == owner->StorageView(mip, true, array.dimension), "requested storage views were not cached");
+        }
+        VkFormatProperties properties{};
+        context.formatProperties(context.physical, VK_FORMAT_R8G8B8A8_UNORM, &properties);
+        const bool attachable = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+        Require(owner->Attachable() == attachable, "array-first owner changed color attachment capability");
+        if (attachable) Require(owner->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM) != VK_NULL_HANDLE, "array-first owner cannot create its attachment view");
+        SampleProgram sample2D(context, recorder);
+        SampleProgram sampleArray(context, recorder, SAMPLE_ARRAY_SPV);
+        const VkComponentMapping identity{};
+        const auto sample = [&](const GuestTextureResource& request, bool arrayShape) {
+            Texture texture(context, owner, request, identity);
+            return arrayShape ? sampleArray.Red(texture.View(), texture.Layout(), 0, 0) : sample2D.Red(texture.View(), texture.Layout(), 0);
+        };
+        const auto verifyWrite = [&](const std::array<std::uint32_t, 8>& words, bool arrayShape, float red) {
+            storageOwnerWrite(context, recorder, words, arrayShape, red);
+            const auto version = owner->Version();
+            Require(CachedStorageSurface(context, flat) == owner && CachedStorageSurface(context, array) == owner && owner->Version() == version, "a dimension handover refreshed or replaced the physical owner");
+            Require(StorageTexture::FindPending(address, owner->GuestBytes()) == owner && !PendingStorageOverlaps(address, owner->GuestBytes(), owner.get()), "dimension handover created another pending writeback owner");
+            expectRed(sample(flat, false), red, "2D view did not read the shared compute write");
+            expectRed(sample(array, true), red, "array view did not read the shared compute write");
+        };
+        verifyWrite(arrayFirst ? arrayWords : flatWords, arrayFirst, 0.25f);
+        verifyWrite(arrayFirst ? flatWords : arrayWords, !arrayFirst, 0.5f);
+        verifyWrite(arrayWords, false, 0.75f);
+        const auto beforeCpuWrite = owner->Version();
+        std::memset(block, 0x10, static_cast<std::size_t>(owner->GuestBytes()));
+        AgcDriver::GuestMemory::MarkWritten(address, static_cast<std::size_t>(owner->GuestBytes()));
+        Require(CachedStorageSurface(context, array) == owner && owner->Version() > beforeCpuWrite, "CPU writes did not refresh the shared owner through its array descriptor");
+        expectRed(sample(flat, false), 0x10 / 255.0f, "2D view lost the CPU write over pending compute results");
+        expectRed(sample(array, true), 0x10 / 255.0f, "array view lost the CPU write over pending compute results");
+        owner->Flush();
+        recorder.Sync();
+        Require(StorageTexture::FindPending(address, owner->GuestBytes()) == nullptr, "the shared owner stayed pending after its flush");
+        const auto distinct = [&](GuestTextureResource request, const char* reason) {
+            Require(CachedStorageSurface(context, request) != owner, reason);
+        };
+        auto different = array;
+        different.depthOrLastArray = 1;
+        distinct(different, "multi-layer array shared the single-layer owner");
+        different.baseArray = 1;
+        distinct(different, "nonzero array origin shared the flat owner");
+        Require(!Texture::CanCopyFrom(*owner, different), "sampled subset bypassed the one-slice dimension gate");
+        different = flat;
+        different.dimension = TextureDimension::k3D;
+        distinct(different, "3D depth one shared the 2D owner");
+        Require(!Texture::CanCopyFrom(*owner, different), "3D depth one bypassed the sampled dimension gate");
+        different = flat;
+        different.format = 20;
+        distinct(different, "equal element sizes shared different storage formats");
+        different = flat;
+        different.width = 128;
+        distinct(different, "different width shared the owner");
+        different = flat;
+        different.mipCount = 1;
+        different.allocatedMipCount = 1;
+        distinct(different, "different mip chains shared the owner");
+        different = flat;
+        different.tileMode = TextureTileMode::kLinear;
+        distinct(different, "different tiling shared the owner");
+        different = array;
+        different.dccAlphaOnMsb = true;
+        distinct(different, "different DCC alpha interpretation shared the owner");
+        Require(!Texture::CanCopyFrom(*owner, different), "sampled array bypassed the DCC alpha compatibility gate");
+        different.dimension = TextureDimension::k2D;
+        Require(!Texture::CanCopyFrom(*owner, different), "sampled flat view bypassed the DCC alpha compatibility gate");
+        different = array;
+        different.dccPipeAligned = true;
+        distinct(different, "different DCC key geometry shared the owner");
+        Require(!Texture::CanCopyFrom(*owner, different), "sampled array bypassed the DCC key geometry gate");
+        different.dimension = TextureDimension::k2D;
+        Require(!Texture::CanCopyFrom(*owner, different), "sampled flat view bypassed the DCC key geometry gate");
+        different = flat;
+        different.baseAddress += 2u << 20u;
+        distinct(different, "different address shared the owner");
+        for (const auto dimension : {TextureDimension::kCube, TextureDimension::k1DArray, TextureDimension::k3D}) {
+            different = flat;
+            different.dimension = dimension;
+            Require(!IsSingleSlice2DSurface(different) && !CompatibleTextureDimensions(flat, different), "an unsupported dimension passed the owner-sharing gate");
+        }
+        auto atomicResource = flat;
+        atomicResource.baseAddress += 1u << 20u;
+        atomicResource.format = 21;
+        auto atomicArray = atomicResource;
+        atomicArray.dimension = TextureDimension::k2DArray;
+        const auto atomicOwner = CachedStorageSurface(context, arrayFirst ? atomicArray : atomicResource);
+        Require(CachedStorageSurface(context, arrayFirst ? atomicResource : atomicArray) == atomicOwner, "atomic bindings did not share the physical owner");
+        for (const auto dimension : {TextureDimension::k2D, TextureDimension::k2DArray}) {
+            const auto storage = atomicOwner->StorageView(0, false, dimension);
+            const auto atomic = atomicOwner->AtomicView(0, false, dimension);
+            Require(storage != VK_NULL_HANDLE && atomic != VK_NULL_HANDLE, "requested signed storage or atomic view is missing");
+            Require(storage == atomicOwner->StorageView(0, false, dimension) && atomic == atomicOwner->AtomicView(0, false, dimension), "requested signed storage and atomic views were not cached");
+        }
+        if (context.imageInt64Atomics) {
+            atomicResource.format = 62;
+            const auto atomic64Owner = CachedStorageSurface(context, atomicResource);
+            const auto atomic64 = atomic64Owner->Atomic64View(0, false, TextureDimension::k2DArray);
+            Require(atomic64 != VK_NULL_HANDLE && atomic64 == atomic64Owner->Atomic64View(0, false, TextureDimension::k2DArray), "requested 64-bit atomic array views were not cached");
+        }
+        Texture retainedFlat(context, owner, flat, identity);
+        Texture retainedArray(context, owner, array, identity);
+        const auto weakOwner = owner->weak_from_this();
+        ClearCachedTextures(context.device);
+        recorder.Sync();
+        Require(!owner->Cached(), "eviction retained the shared cache owner");
+        owner.reset();
+        alternate.reset();
+        Require(!weakOwner.expired() && retainedFlat.StorageSource() == retainedArray.StorageSource(), "surviving requested views did not retain one owner");
+        expectRed(sample2D.Red(retainedFlat.View(), retainedFlat.Layout(), 0), 0x10 / 255.0f, "evicted 2D view lost its owner content");
+        expectRed(sampleArray.Red(retainedArray.View(), retainedArray.Layout(), 0, 0), 0x10 / 255.0f, "evicted array view lost its owner content");
+        auto keyed = flat;
+        keyed.baseAddress += 2u << 20u;
+        keyed.mipCount = keyed.allocatedMipCount = 1;
+        keyed.lastLevel = 0;
+        keyed.dccPipeAligned = true;
+        keyed.dccAddress = address + (3u << 20u);
+        const auto keyBytes = DccKeyCount(keyed, DescribeSurface(keyed).guestBytes);
+        std::memset(reinterpret_cast<void*>(keyed.dccAddress), 0, keyBytes);
+        std::memset(reinterpret_cast<void*>(keyed.dccAddress + 4096), 0xc0, keyBytes);
+        AgcDriver::GuestMemory::MarkWritten(keyed.dccAddress, keyBytes + 4096);
+        const auto keyedOwner = CachedStorageSurface(context, keyed);
+        auto keyedArray = keyed;
+        keyedArray.dimension = TextureDimension::k2DArray;
+        Require(CachedStorageSurface(context, keyedArray) == keyedOwner, "matching DCC descriptors did not share the owner");
+        Texture cleared(context, keyedOwner, keyedArray, identity);
+        expectRed(sampleArray.Red(cleared.View(), cleared.Layout(), 0, 0), 0, "shared DCC array view did not preserve its clear code");
+        keyedArray.dccAddress += 4096;
+        const auto moved = CachedStorageSurface(context, keyedArray);
+        Require(moved != keyedOwner && !keyedOwner->Cached(), "DCC clear metadata movement did not replace the shared owner");
+        Texture movedClear(context, moved, keyedArray, identity);
+        expectRed(sampleArray.Red(movedClear.View(), movedClear.Layout(), 0, 0), 1, "moved DCC array view did not read its new clear code");
+    }
+}
+
 void pendingAliasTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
     TextureDetiler detiler(context);
@@ -3373,6 +3660,14 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--storage-owner-only") {
+            storageOwnerTests(device, recorder);
+            firstLayerViewTests(device, recorder);
+            atomicViewTests(device, recorder);
+            movedMetadataTests(device, recorder);
+            std::cout << "Shared storage owner and requested view tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
@@ -3439,6 +3734,7 @@ int main(int argc, char** argv) {
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
         pendingAliasTests(device, recorder);
+        storageOwnerTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
         singleCubeTests(device, recorder);

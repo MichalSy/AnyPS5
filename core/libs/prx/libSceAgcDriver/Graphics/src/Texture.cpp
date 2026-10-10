@@ -461,7 +461,7 @@ bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResour
     if (IsBlockCompressed(descriptor.format) || IsBlockCompressed(from.format)) return false;
     // Same memory, same layout, same texel size: the GPU copy reinterprets the texels exactly as a
     // guest read through the sampled descriptor would.
-    return descriptor.baseAddress == from.baseAddress && descriptor.width == from.width && descriptor.height == from.height && descriptor.dimension == from.dimension && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && descriptor.depthOrLastArray == from.depthOrLastArray && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
+    return descriptor.baseAddress == from.baseAddress && descriptor.width == from.width && descriptor.height == from.height && CompatibleTextureDimensions(descriptor, from) && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && descriptor.depthOrLastArray == from.depthOrLastArray && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
 }
 
 Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components) : context(context), storageSource(source) {
@@ -1002,8 +1002,15 @@ bool AdjacentGenerationEnabled() {
 }
 
 VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFormat format) const {
+    return createView(mip, firstLayer, format, descriptor.dimension);
+}
+
+VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFormat format, TextureDimension requestedDimension) const {
     Require(mip < descriptor.mipCount, "storage texture mip level is outside the texture");
-    Require(!firstLayer || descriptor.dimension == TextureDimension::k2DArray, "a first-layer storage view needs a 2D array surface");
+    auto requested = descriptor;
+    requested.dimension = requestedDimension;
+    Require(CompatibleTextureDimensions(descriptor, requested), "storage view dimension does not match its physical image");
+    Require(!firstLayer || requestedDimension == TextureDimension::k2DArray, "a first-layer storage view needs a 2D array surface");
     const auto viewLayerCount = firstLayer ? 1u : geometry.imageLayers - descriptor.baseArray;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
@@ -1011,7 +1018,7 @@ VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFor
     viewInfo.pNext = format == storageFormat ? nullptr : &usage;
     viewInfo.image = image;
     // Storage views address one mip; cube faces are written as array layers.
-    viewInfo.viewType = firstLayer ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k1D ? VK_IMAGE_VIEW_TYPE_1D : descriptor.dimension == TextureDimension::k2D ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_VIEW_TYPE_3D : descriptor.dimension == TextureDimension::k1DArray ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    viewInfo.viewType = firstLayer ? VK_IMAGE_VIEW_TYPE_2D : ViewTypeFor(requestedDimension, viewLayerCount);
     viewInfo.format = format;
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, descriptor.baseArray, viewLayerCount};
@@ -1158,6 +1165,40 @@ VkImageView StorageTexture::StorageView(std::uint32_t mip, bool firstLayer) {
     const auto created = createView(mip, firstLayer, format);
     uintViews.emplace(std::pair{mip, firstLayer}, created);
     return created;
+}
+
+VkImageView StorageTexture::requestedView(std::uint32_t mip, bool firstLayer, VkFormat format, TextureDimension requestedDimension) {
+    auto requested = descriptor;
+    requested.dimension = requestedDimension;
+    Require(CompatibleTextureDimensions(descriptor, requested), "storage view dimension does not match its physical image");
+    Require(!firstLayer || requestedDimension == TextureDimension::k2DArray, "a first-layer storage view needs a 2D array surface");
+    const auto layers = firstLayer ? 1u : geometry.imageLayers - descriptor.baseArray;
+    const auto type = firstLayer ? VK_IMAGE_VIEW_TYPE_2D : ViewTypeFor(requestedDimension, layers);
+    const auto key = std::tuple{format, mip, type, descriptor.baseArray, layers};
+    if (const auto found = requestedViews.find(key); found != requestedViews.end()) return found->second;
+    const auto created = createView(mip, firstLayer, format, requestedDimension);
+    requestedViews.emplace(key, created);
+    return created;
+}
+
+VkImageView StorageTexture::StorageView(std::uint32_t mip, bool firstLayer, TextureDimension requestedDimension) {
+    if (requestedDimension == descriptor.dimension) return StorageView(mip, firstLayer);
+    const auto uintFormat = UintFormatOfSint(storageFormat);
+    const auto format = uintFormat == VK_FORMAT_UNDEFINED ? storageFormat : uintFormat;
+    Require(StorageFormatOrUndefined(context, format) == format, "storage image has no requested storage format");
+    return requestedView(mip, firstLayer, format, requestedDimension);
+}
+
+VkImageView StorageTexture::AtomicView(std::uint32_t mip, bool firstLayer, TextureDimension requestedDimension) {
+    if (requestedDimension == descriptor.dimension) return AtomicView(mip, firstLayer);
+    Require(storageFormat == VK_FORMAT_R32_UINT || storageFormat == VK_FORMAT_R32_SINT || storageFormat == VK_FORMAT_R32_SFLOAT, "storage image atomics need a surface of one 32-bit component");
+    return requestedView(mip, firstLayer, VK_FORMAT_R32_UINT, requestedDimension);
+}
+
+VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer, TextureDimension requestedDimension) {
+    if (requestedDimension == descriptor.dimension) return Atomic64View(mip, firstLayer);
+    Require(storageFormat == VK_FORMAT_R64_UINT || storageFormat == VK_FORMAT_R32G32_UINT || storageFormat == VK_FORMAT_R32G32_SINT || storageFormat == VK_FORMAT_R32G32_SFLOAT, "64-bit storage image atomics need a surface of two 32-bit components");
+    return requestedView(mip, firstLayer, VK_FORMAT_R64_UINT, requestedDimension);
 }
 
 VkImageView StorageTexture::AtomicView(std::uint32_t mip, bool firstLayer) {
@@ -3869,6 +3910,8 @@ void StorageTexture::release() noexcept {
     atomicViews.clear();
     for (const auto& [key, uint] : uintViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, uint, nullptr);
     uintViews.clear();
+    for (const auto& [key, requested] : requestedViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, requested, nullptr);
+    requestedViews.clear();
     for (const auto& [format, attachment] : attachmentViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, attachment, nullptr);
     attachmentViews.clear();
     if (proxyView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, proxyView, nullptr);

@@ -86,6 +86,19 @@ struct GuestTextureResource {
     std::uint32_t allocatedMipCount = 0;
 };
 
+inline bool IsSingleSlice2DSurface(const GuestTextureResource& resource) {
+    return (resource.dimension == TextureDimension::k2D || resource.dimension == TextureDimension::k2DArray) && resource.depthOrLastArray == 0 && resource.baseArray == 0;
+}
+
+inline TextureDimension StorageSurfaceDimension(const GuestTextureResource& resource) {
+    return IsSingleSlice2DSurface(resource) ? TextureDimension::k2D : resource.dimension;
+}
+
+inline bool CompatibleTextureDimensions(const GuestTextureResource& first, const GuestTextureResource& second) {
+    if (IsSingleSlice2DSurface(first) && IsSingleSlice2DSurface(second)) return first.dccAlphaOnMsb == second.dccAlphaOnMsb && first.dccPipeAligned == second.dccPipeAligned;
+    return first.dimension == second.dimension;
+}
+
 float EffectiveMinLod(const GuestTextureResource& resource);
 
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words);

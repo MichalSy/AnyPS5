@@ -648,7 +648,7 @@ void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::i
 // mode): the image holds the whole mip chain, and render targets in the same memory attach to it.
 std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextureResource& resource) {
     // Guest formats that store in the same Vulkan format share the image (views carry the difference).
-    return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
+    return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(StorageSurfaceDimension(resource)) << 20u) | static_cast<std::uint32_t>(resource.dccAlphaOnMsb) | (static_cast<std::uint32_t>(resource.dccPipeAligned) << 1u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
 }
 
 struct ExtendedSurfaces {
@@ -669,8 +669,9 @@ std::uint32_t AllocatedLevels(const GuestTextureResource& resource) {
 GuestTextureResource StorageSurface(const Context& context, const GuestTextureResource& viewed) {
     auto& surfaces = ExtendedChains();
     const bool extended = viewed.mipCount > AllocatedLevels(viewed);
-    if (!extended && !surfaces.any.load(std::memory_order_acquire)) return viewed;
     auto surface = viewed;
+    surface.dimension = StorageSurfaceDimension(viewed);
+    if (!extended && !surfaces.any.load(std::memory_order_acquire)) return surface;
     surface.mipCount = AllocatedLevels(viewed);
     const auto identity = SurfaceKey(context, surface);
     std::lock_guard lock(surfaces.mutex);
@@ -1363,7 +1364,7 @@ void ShaderResources::buildComplete() {
                         write.pImageInfo = images.data() + images.size();
                         for (const auto index : binding.imageAllocations) {
                             if (index == std::numeric_limits<std::size_t>::max()) images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL});
-                            else images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index]), VK_IMAGE_LAYOUT_GENERAL});
+                            else images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index], storageDimensions[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index], storageDimensions[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index], storageDimensions[index]), VK_IMAGE_LAYOUT_GENERAL});
                         }
                         Require(binding.imageAllocations.size() == binding.layout.descriptorCount, "descriptor allocations disagree with compact binding");
                         break;
@@ -2978,6 +2979,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes));
         storageMips.push_back(mip);
+        storageDimensions.push_back(resource.dimension);
         storageKeys.push_back(resource.dccAddress);
         storageFirstLayer.push_back(firstLayer);
         // Images the shader only reads have nothing to store back.

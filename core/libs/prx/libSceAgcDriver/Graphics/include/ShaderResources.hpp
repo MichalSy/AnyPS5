@@ -427,6 +427,7 @@ private:
     std::vector<bool> textureFirstLayer;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
     std::vector<std::uint32_t> storageMips;
+    std::vector<TextureDimension> storageDimensions;
     std::vector<std::uint64_t> storageKeys;
     std::vector<bool> storageFirstLayer;
     std::vector<bool> storageWritten;
