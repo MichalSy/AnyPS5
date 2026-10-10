@@ -52,7 +52,6 @@ public:
         append(key, request.context.pixel);
         append(key, request.context.vertex);
         append(key, request.context.floatMode);
-        append(key, LoopInvariantCacheEnabled());
         appendMesh(key, request);
         appendTessellation(key, request);
         std::uint64_t hash = 0xcbf29ce484222325ull;
@@ -91,7 +90,6 @@ private:
         append(key, DebugProbeActive());
         append(key, RayTracingStrict());
         append(key, RayTracingMiss());
-        append(key, LoopInvariantCacheEnabled());
     }
 
     static void appendMesh(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
