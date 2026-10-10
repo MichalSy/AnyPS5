@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleColorSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -172,6 +173,8 @@ public:
             function<PFN_vkGetPhysicalDeviceFeatures>("vkGetPhysicalDeviceFeatures")(context.physical, &supported);
             enabled.occlusionQueryPrecise = supported.occlusionQueryPrecise;
             context.occlusionQueryPrecise = supported.occlusionQueryPrecise == VK_TRUE;
+            enabled.shaderStorageImageMultisample = supported.shaderStorageImageMultisample;
+            context.shaderStorageImageMultisample = supported.shaderStorageImageMultisample == VK_TRUE;
             enabled.shaderStorageImageReadWithoutFormat = supported.shaderStorageImageReadWithoutFormat;
             enabled.shaderStorageImageWriteWithoutFormat = supported.shaderStorageImageWriteWithoutFormat;
             context.singlePassStorage = supported.shaderStorageImageReadWithoutFormat == VK_TRUE && supported.shaderStorageImageWriteWithoutFormat == VK_TRUE;
@@ -1847,13 +1850,13 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
-void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
+bool drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
         std::cout << "host imports or write watching unavailable: draw snapshot reuse not tested\n";
-        return;
+        return false;
     }
     struct Release {
         void* block;
@@ -1878,11 +1881,11 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     } unregister{context, block};
     if (HostImportFor(context, address, bytes) == nullptr) {
         std::cout << "host import of the watched block refused: draw snapshot reuse not tested\n";
-        return;
+        return false;
     }
     if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
         std::cout << "host imports are compared, not watched: draw snapshot reuse not tested\n";
-        return;
+        return false;
     }
     const auto element = address + 4096;
     constexpr std::size_t elementBytes = 1024;
@@ -1937,16 +1940,17 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         snapshotRecorder.Sync();
     }
     recorder.Activate();
+    return true;
 }
 
-void drawSnapshotPatchTests(const Device& device) {
+bool drawSnapshotPatchTests(const Device& device) {
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 4 * 65536;
     std::unique_lock gpu(GpuMutex());
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
         std::cout << "host imports or write watching unavailable: snapshot patching not tested\n";
-        return;
+        return false;
     }
     struct Release {
         void* block;
@@ -1972,11 +1976,11 @@ void drawSnapshotPatchTests(const Device& device) {
     } unregister{context, block};
     if (HostImportFor(context, address, bytes) == nullptr) {
         std::cout << "host import of the watched block refused: snapshot patching not tested\n";
-        return;
+        return false;
     }
     if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
         std::cout << "host imports are compared, not watched: snapshot patching not tested\n";
-        return;
+        return false;
     }
     constexpr std::size_t elementOffset = 4096;
     constexpr std::size_t elementBytes = 3 * 65536;
@@ -2044,16 +2048,17 @@ void drawSnapshotPatchTests(const Device& device) {
         Require(std::memcmp(held->Bytes().data(), before.data(), before.size()) == 0, "a held snapshot's bytes changed");
         snapshotRecorder.Sync();
     }
+    return true;
 }
 
 
-void drawSnapshotEvictionTests(const Device& device) {
+bool drawSnapshotEvictionTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
     constexpr std::size_t bytes = 65536;
     void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
         std::cout << "write watching unavailable: draw snapshot eviction not tested\n";
-        return;
+        return false;
     }
     struct Release {
         void* block;
@@ -2083,6 +2088,7 @@ void drawSnapshotEvictionTests(const Device& device) {
     std::memset(block, 0x5a, 16);
     CollectWrites(address, 16);
     Require(cache.ReusableDrawSnapshot(address, 16) == nullptr && cache.ReusableDrawSnapshot(address, 16) == nullptr, "a snapshot outlived a CPU store");
+    return true;
 }
 
 void drawInputReuseTests(const Device& device, Recorder& recorder) {
@@ -3210,11 +3216,19 @@ void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
     std::cout << "single-pass storage moves" << (watched ? " (watched)" : "") << ": ok (" << tested << " surfaces)\n";
 }
 
-void refreshProofTests(const Device& device, Recorder& recorder) {
+bool refreshProofTests(const Device& device, Recorder& recorder, bool requireMultisample = false) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: refresh proofs not tested\n";
-        return;
+        return false;
+    }
+    constexpr VkImageUsageFlags multisampleUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    constexpr VkImageCreateFlags multisampleFlags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    VkImageFormatProperties multisampleProperties{};
+    const bool multisampleSupported = base.shaderStorageImageMultisample && base.imageFormatProperties(base.physical, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, multisampleUsage, multisampleFlags, &multisampleProperties) == VK_SUCCESS && (multisampleProperties.sampleCounts & VK_SAMPLE_COUNT_8_BIT) != 0;
+    if (requireMultisample && !multisampleSupported) {
+        std::cout << "eight-sample storage images unavailable: multisample refresh proof not tested\n";
+        return false;
     }
     constexpr std::uint32_t side = 256;
     constexpr std::size_t surfaceBytes = side * side * 4;
@@ -3223,7 +3237,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
         std::cout << "no write watching: refresh proofs not tested\n";
-        return;
+        return false;
     }
     auto* texels = static_cast<std::uint8_t*>(block);
     auto* keys = texels + surfaceBytes;
@@ -3248,7 +3262,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
         std::cout << "no watched host import: refresh proofs not tested\n";
-        return;
+        return false;
     }
     TextureDetiler detiler(base);
     auto context = base;
@@ -3270,14 +3284,15 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
     {
         auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        const auto draw = [&](VkClearColorValue value) {
+        const auto clear = [&](const auto& target, VkClearColorValue value) {
             const auto commands = recorder.Commands();
-            recorder.Keep(image);
+            recorder.Keep(target);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, target->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-            image->MarkDirty();
+            target->MarkDirty();
         };
+        const auto draw = [&](VkClearColorValue value) { clear(image, value); };
         const auto settle = [&] {
             image->Refresh();
             image->Refresh();
@@ -3295,6 +3310,72 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
         settle();
         expectProved("an unchanged surface was not proved current");
         expectProved("a proved surface was not proved again");
+        if (multisampleSupported) {
+            struct ClearMultisample {
+                Recorder& recorder;
+                VkDevice device;
+                ~ClearMultisample() {
+                    recorder.Sync();
+                    ClearMultisampleColors(device);
+                }
+            } clearSurfaces{recorder, context.device};
+            const MultisampleColorLayout layout(32, 64, 4, 8);
+            ColorTarget target{};
+            target.address = target.surfaceAddress = address;
+            target.extent = target.surfaceExtent = {32, 64};
+            target.bytes = layout.Bytes();
+            target.format = VK_FORMAT_R8G8B8A8_UNORM;
+            target.componentMapping = 0xe4u;
+            target.tileMode = ColorTileMode::RenderTarget;
+            target.elementBytes = 4;
+            target.samples = VK_SAMPLE_COUNT_8_BIT;
+            auto multisample = CachedMultisampleColorSurface(context, target);
+            settle();
+            expectProved("the storage proof was not established before a multisample write");
+            const auto generation = AgcDriver::GuestMemory::CollectWrites(address, surfaceBytes);
+            clear(multisample, VkClearColorValue{{1.0f, 0.0f, 0.0f, 1.0f}});
+            Require(AnyPendingMultisampleColors(address, surfaceBytes), "the multisample write did not remain pending");
+            Require(AgcDriver::GuestMemory::CollectWrites(address, surfaceBytes) != 0 && AgcDriver::GuestMemory::UnchangedSince(address, surfaceBytes, generation), "the pending multisample write unexpectedly stamped guest bytes");
+            Require(texels[layout.Offset(0, 0, 0)] == 0x55, "the multisample write reached guest bytes before the storage refresh");
+            expectFull("overlapping multisample results were answered from the storage refresh proof");
+            Require(!multisample->Dirty() && !AnyPendingMultisampleColors(address, surfaceBytes), "the full storage refresh left overlapping multisample results pending");
+            constexpr std::array<std::uint8_t, 4> expected{255, 0, 0, 255};
+            for (std::uint32_t sample = 0; sample < 8; ++sample) {
+                const auto offset = layout.Offset(0, 0, sample);
+                for (std::size_t channel = 0; channel < expected.size(); ++channel) Require(texels[offset + channel] == expected[channel], "the storage refresh did not publish the multisample payload");
+            }
+            settle();
+            expectProved("the storage proof was not taken again after multisample publication");
+            target.address = target.surfaceAddress = resource.dccAddress;
+            auto metadata = CachedMultisampleColorSurface(context, target);
+            settle();
+            expectProved("the storage proof was not established before a multisample key write");
+            const auto keyGeneration = AgcDriver::GuestMemory::CollectWrites(resource.dccAddress, keyCount);
+            clear(metadata, VkClearColorValue{});
+            Require(AnyPendingMultisampleColors(resource.dccAddress, keyCount), "the multisample key write did not remain pending");
+            Require(AgcDriver::GuestMemory::CollectWrites(resource.dccAddress, keyCount) != 0 && AgcDriver::GuestMemory::UnchangedSince(resource.dccAddress, keyCount, keyGeneration), "the pending multisample key write unexpectedly stamped guest bytes");
+            expectFull("pending multisample results over DCC keys were answered from the storage refresh proof");
+            Require(!metadata->Dirty() && image->UploadedKeys() == DccKeys::Clear0000 && std::all_of(keys, keys + keyCount, [](std::uint8_t key) { return key == 0; }), "the storage refresh did not publish and revalidate its multisample DCC keys");
+            settle();
+            expectProved("the storage proof was not taken again after multisample key publication");
+        }
+        std::memset(keys, 0, keyCount);
+        settle();
+        auto keyResource = resource;
+        keyResource.baseAddress = resource.dccAddress;
+        keyResource.dccAddress = 0;
+        keyResource.width = keyResource.height = 128;
+        auto keyImage = std::make_shared<StorageTexture>(context, detiler, keyResource, 0);
+        settle();
+        expectProved("the storage proof was not established before another image wrote its keys");
+        const auto keyGeneration = AgcDriver::GuestMemory::CollectWrites(resource.dccAddress, keyCount);
+        clear(keyImage, VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}});
+        Require(PendingStorageOverlaps(resource.dccAddress, keyCount, image.get()), "the image's key write did not remain pending");
+        Require(AgcDriver::GuestMemory::CollectWrites(resource.dccAddress, keyCount) != 0 && AgcDriver::GuestMemory::UnchangedSince(resource.dccAddress, keyCount, keyGeneration), "the pending image key write unexpectedly stamped guest bytes");
+        expectFull("another image's results over DCC keys were answered from the storage refresh proof");
+        Require(image->UploadedKeys() == DccKeys::Uncompressed && std::all_of(keys, keys + keyCount, [](std::uint8_t key) { return key == 0xff; }), "the storage refresh did not publish and revalidate another image's DCC keys");
+        settle();
+        expectProved("the storage proof was not taken again after another image's key publication");
         draw({{1.0f, 0.0f, 0.0f, 1.0f}});
         settle();
         expectProved("a target holding its own pending results was not proved current");
@@ -3331,6 +3412,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
         recorder.Sync();
     }
     recorder.Sync();
+    return true;
 }
 
 
@@ -5231,6 +5313,22 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-only") {
+            bool tested = drawSnapshotReuseTests(device, recorder);
+            tested = drawSnapshotEvictionTests(device) && tested;
+            gpu.unlock();
+            tested = drawSnapshotPatchTests(device) && tested;
+            gpu.lock();
+            recorder.Activate();
+            if (!tested) return 77;
+            std::cout << "Draw snapshot reuse, eviction and patching tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--refresh-proof-only") {
+            if (!refreshProofTests(device, recorder, true)) return 77;
+            std::cout << "Storage refresh proof and multisample publication tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--read-only-staging-only") {
             return readOnlyStagingTests(device, recorder) ? 0 : 77;
         }

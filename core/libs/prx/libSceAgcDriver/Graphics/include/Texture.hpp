@@ -382,6 +382,7 @@ private:
     bool refreshProved();
     void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;
+    bool otherPendingOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);

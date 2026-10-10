@@ -742,6 +742,13 @@ if(BUILD_TESTING)
         set_tests_properties(agc_host_import_unmap PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_refresh_proof COMMAND agc_driver_recorder_tests --refresh-proof-only)
+    add_test(NAME agc_draw_snapshot COMMAND agc_driver_recorder_tests --draw-snapshot-only)
+    set_tests_properties(agc_refresh_proof agc_draw_snapshot PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "APS5_WRITE_WATCH_IMPORTS=watch")
+    if(WIN32)
+        set_tests_properties(agc_refresh_proof agc_draw_snapshot PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set(agcReadOnlyStagingEnvironment
         --unset=APS5_READONLY_STAGING
         --unset=APS5_READONLY_STAGE_MIN_KIB

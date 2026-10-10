@@ -1395,6 +1395,15 @@ bool StorageTexture::Refresh() {
     // flush below and the compare through the hook skip it).
     refreshing = this;
     NoteProved();
+    const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
+    if (descriptor.dccAddress != 0 && keyCount != 0 && otherPendingOverlaps(descriptor.dccAddress, keyCount)) {
+        bool published = false;
+        const bool flushed = FlushPending(descriptor.dccAddress, keyCount, this, "storage key refresh", PublishScope::Whole, &published);
+        if (flushed || published) {
+            if (auto* recorder = Recorder::Active()) recorder->Sync();
+        }
+        keyProof = {};
+    }
     // Results of other images pending in this memory must reach it first, except an alias's: its
     // units are taken on the device below (borrowUnits), so it stays pending. The keys read for
     // that decision are read again after the flush, which may store keys itself. The exemption
@@ -1676,9 +1685,16 @@ std::uint64_t StorageTexture::SinglePassMoves() {
 }
 
 bool StorageTexture::otherPendingOverlaps() const {
+    if (otherPendingOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return true;
+    const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
+    return descriptor.dccAddress != 0 && keyCount != 0 && otherPendingOverlaps(descriptor.dccAddress, keyCount);
+}
+
+bool StorageTexture::otherPendingOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (AnyPendingMultisampleColors(address, bytes)) return true;
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
-    const auto other = [&](const StorageTexture* texture) { return texture != this && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); };
+    const auto other = [&](const StorageTexture* texture) { return texture != this && texture->overlaps(address, bytes); };
     return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
