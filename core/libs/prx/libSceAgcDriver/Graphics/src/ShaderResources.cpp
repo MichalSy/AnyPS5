@@ -517,7 +517,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return depth;
     }
     std::shared_ptr<StorageTexture> depthStorage;
-    if (!depthCompare && DepthSurfaceAt(resource.baseAddress)) depthStorage = cachedStorageTexture(context, words, resource, 0, guestBytes);
+    if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+    if (!depthCompare && DepthSurfaceAt(resource.baseAddress, guestBytes)) depthStorage = cachedStorageTexture(context, words, resource, 0, guestBytes);
     const auto depthBitsWidth = words.size() >= 4 ? ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) : 0u;
     const bool storageDepthBits = depthStorage != nullptr;
     if (depthBitsWidth == 32u && !storageDepthBits) {
@@ -540,7 +541,6 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (profile && resource.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, scanStart);
         return keys;
     };
-    if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
     auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
@@ -820,7 +820,7 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
 
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
     auto texture = lookupStorageTexture(context, words, viewed, mip, guestBytes);
-    if (DepthSurfaceAt(viewed.baseAddress)) SeedStorageFromDepth(context, texture);
+    if (DepthSurfaceAt(texture->Descriptor().baseAddress, texture->GuestBytes())) SeedStorageFromDepth(context, texture);
     return texture;
 }
 
@@ -2098,9 +2098,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& image) {
-            return image != nullptr && DepthSurfaceAt(image->Descriptor().baseAddress);
+            return image != nullptr && DepthSurfaceAt(image->Descriptor().baseAddress, image->GuestBytes());
         }) || std::any_of(validatedTextures.begin(), validatedTextures.end(), [](const auto& image) {
-            return !image.depth && DepthSurfaceAt(image.resource.baseAddress);
+            return !image.depth && DepthSurfaceAt(image.resource.baseAddress, image.bytes);
         })) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
@@ -2142,7 +2142,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
                         if (storageIndex >= storageTextures.size()) return false;
                         const auto resource = DecodeTextureResource(words);
-                        if (storageWritten[storageIndex] && !DepthSurfaceAt(resource.baseAddress)) RetireDepthSurfaces(context.device, resource.baseAddress, storageTextures[storageIndex]->GuestBytes());
+                        if (storageWritten[storageIndex] && !DepthSurfaceAt(resource.baseAddress, storageTextures[storageIndex]->GuestBytes())) RetireDepthSurfaces(context.device, resource.baseAddress, storageTextures[storageIndex]->GuestBytes());
                         std::shared_ptr<StorageTexture> expected;
                         if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
                         else expected = cachedStorageTexture(context, words, resource, storageMips[storageIndex]);
@@ -2978,7 +2978,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     // between the stages marks them uncompressed).
     const auto address = record.resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(record.guestBytes);
-    if (DepthSurfaceAt(address)) return nullptr;
+    if (DepthSurfaceAt(address, bytes)) return nullptr;
     if (GuestMemory::CollectWrites(address, bytes) == 0) return nullptr;
     if (PendingStorageOverlaps(address, bytes, record.source.get())) return nullptr;
     auto keys = record.keys;
@@ -3112,7 +3112,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
         const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
-        if (written && !DepthSurfaceAt(resource.baseAddress)) RetireDepthSurfaces(context.device, resource.baseAddress, guestBytes);
+        if (written && !DepthSurfaceAt(resource.baseAddress, guestBytes)) RetireDepthSurfaces(context.device, resource.baseAddress, guestBytes);
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes));

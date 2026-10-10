@@ -190,19 +190,24 @@ public:
         else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
     }
 
-    void Transfer(StorageTexture& storage, bool intoStorage) {
+    void Transfer(StorageTexture& storage, bool intoStorage, std::uint32_t layer) {
         const auto& descriptor = storage.Descriptor();
+        const auto geometry = DescribeSurface(descriptor);
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const bool d32 = target.format == VK_FORMAT_D32_SFLOAT || target.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
         const auto extent = surfaceExtent(target);
+        const auto stride = DepthSliceBytes(extent, d16 ? 2u : 4u);
+        const auto offset = geometry.GuestLayerOffset(layer);
         const bool sized = !IsConvertedTextureFormat(descriptor.format) && BlockWidth(descriptor.format) == 1u &&
             BlockHeight(descriptor.format) == 1u && BytesPerElement(descriptor.format) == (d16 ? 2u : 4u) &&
             storage.StorageFormat() == ResolveTextureFormat(descriptor.format);
         if (target.samples != VK_SAMPLE_COUNT_1_BIT || target.mipCount != 1u || target.mip != 0u || target.address == 0 ||
-            (!d16 && !d32) || !sized || descriptor.baseAddress != target.address || descriptor.width != extent.width ||
+            (!d16 && !d32) || !sized || offset > std::numeric_limits<std::uint64_t>::max() - descriptor.baseAddress ||
+            descriptor.baseAddress + offset != target.address || (storage.ImageLayers() > 1u && geometry.layerBytes != stride) || descriptor.width != extent.width ||
             descriptor.height != extent.height || descriptor.mipCount != 1u || descriptor.baseLevel != 0u ||
-            descriptor.lastLevel != 0u || descriptor.baseArray != 0u || descriptor.depthOrLastArray != 0u ||
-            descriptor.dimension != TextureDimension::k2D || storage.ImageLayers() != 1u || storage.ImageDepth() != 1u) {
+            descriptor.lastLevel != 0u || descriptor.baseArray >= storage.ImageLayers() || layer >= storage.ImageLayers() ||
+            (descriptor.dimension != TextureDimension::k2D && descriptor.dimension != TextureDimension::k2DArray) ||
+            (descriptor.dimension == TextureDimension::k2D && descriptor.depthOrLastArray != 0u) || storage.ImageDepth() != 1u) {
             char text[320];
             std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d, %u samples, %u mips) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented",
                 static_cast<unsigned long long>(target.address), extent.width, extent.height, static_cast<int>(target.format),
@@ -227,6 +232,7 @@ public:
         depthRegion.imageExtent = {extent.width, extent.height, 1};
         auto storageRegion = depthRegion;
         storageRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        storageRegion.imageSubresource.baseArrayLayer = layer;
         context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, intoStorage ? image : storage.Image(), VK_IMAGE_LAYOUT_GENERAL, transferBuffer->Handle(), 1, intoStorage ? &depthRegion : &storageRegion);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, transferBuffer->Handle(), intoStorage ? storage.Image() : image, VK_IMAGE_LAYOUT_GENERAL, 1, intoStorage ? &storageRegion : &depthRegion);
@@ -237,7 +243,7 @@ public:
 
     std::shared_ptr<StorageTexture> TakeWrites() {
         if (writer == nullptr) return nullptr;
-        Transfer(*writer, false);
+        Transfer(*writer, false, writerLayer);
         return std::exchange(writer, nullptr);
     }
 
@@ -247,13 +253,13 @@ public:
         return writer->StorageFormat() == format && format != VK_FORMAT_R32_SFLOAT && format != VK_FORMAT_R16_UNORM;
     }
 
-    std::shared_ptr<StorageTexture> SeedStorage(const std::shared_ptr<StorageTexture>& storage) {
-        Require(storage->Descriptor().baseAddress == target.address, "storage access to a depth surface's stencil plane is not implemented");
+    std::shared_ptr<StorageTexture> SeedStorage(const std::shared_ptr<StorageTexture>& storage, std::uint32_t layer) {
         ApplyFastClear();
-        if (writer == storage) return nullptr;
+        if (writer == storage && writerLayer == layer) return nullptr;
         auto consumed = TakeWrites();
-        Transfer(*storage, true);
+        Transfer(*storage, true, layer);
         writer = storage;
+        writerLayer = layer;
         return consumed;
     }
 
@@ -368,6 +374,7 @@ private:
     std::map<std::array<std::uint32_t, 12>, std::shared_ptr<Texture>> textures;
     std::unique_ptr<DeviceBuffer> transferBuffer;
     std::shared_ptr<StorageTexture> writer;
+    std::uint32_t writerLayer = 0;
     std::uint64_t depthWritten = 0;
     std::uint64_t stencilWritten = 0;
 
@@ -576,23 +583,38 @@ bool DepthSurfaceHolds(const Context& context, std::span<const std::uint32_t> wo
 
 void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageTexture>& storage) {
     Require(storage != nullptr, "a depth surface cannot seed a null storage image");
+    const auto& descriptor = storage->Descriptor();
+    const auto geometry = DescribeSurface(descriptor);
+    Require(geometry.layerBytes != 0 && geometry.guestBytes <= std::numeric_limits<std::uint64_t>::max() - descriptor.baseAddress, "invalid storage image depth range");
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
-    const auto address = storage->Descriptor().baseAddress;
-    const auto& list = surfaces();
-    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
-        return !surface->retired && !surface->mappingInvalidated && surface->context.device == context.device &&
-            (surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address));
-    });
-    if (found != list.rend()) {
-        auto consumed = (*found)->SeedStorage(storage);
-        finishStorageWrites(lock, found->get(), consumed);
+    for (const auto& surface : surfaces()) {
+        if (surface->retired || surface->mappingInvalidated || surface->context.device != context.device || !surface->Overlaps(descriptor.baseAddress, geometry.guestBytes)) continue;
+        Require((descriptor.dimension == TextureDimension::k2D || descriptor.dimension == TextureDimension::k2DArray) && storage->ImageDepth() == 1u,
+            "storage access to a depth surface requires a 2D image or array");
+        Require(surface->target.address >= descriptor.baseAddress && surface->target.address - descriptor.baseAddress < geometry.guestBytes &&
+            (surface->target.address - descriptor.baseAddress) % geometry.layerBytes == 0u,
+            "storage access to a depth surface requires an aligned depth array layer");
+    }
+    for (std::uint32_t layer = 0; layer < storage->ImageLayers(); ++layer) {
+        const auto address = descriptor.baseAddress + geometry.GuestLayerOffset(layer);
+        const auto& list = surfaces();
+        const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
+            return !surface->retired && !surface->mappingInvalidated && surface->context.device == context.device && surface->target.address == address;
+        });
+        if (found == list.rend()) continue;
+        auto* surface = found->get();
+        auto consumed = surface->SeedStorage(storage, layer);
+        finishStorageWrites(lock, surface, consumed);
     }
 }
 
-bool DepthSurfaceAt(std::uint64_t address) {
+bool DepthSurfaceAt(std::uint64_t address, std::uint64_t bytes) {
     std::lock_guard lock(surfacesMutex());
-    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return !surface->retired && (surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address)); });
+    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) {
+        return !surface->retired && !surface->mappingInvalidated && (bytes != 0 ? surface->Overlaps(address, bytes) :
+            surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address));
+    });
 }
 
 }

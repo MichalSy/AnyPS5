@@ -21,6 +21,7 @@
 #include <array>
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -536,6 +537,103 @@ void StorageRoundTripTest(const Context& context) {
     Require(retained.expired(), "a completed depth rebind retained the consumed storage writer");
 }
 
+void StorageArrayRoundTripTest(const Context& context, bool firstLayerResident) {
+    constexpr std::uint32_t layers = 3;
+    constexpr std::uint32_t texels = Extent.width * Extent.height;
+    const auto sliceBytes = DepthSliceBytes(Extent, 2);
+    GuestBlock memory(layers * sliceBytes);
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearCachedTextures(device); ClearDepthSurfaces(device); }
+    } cleanup{context.device};
+    std::memset(memory.data, 0x33, layers * sliceBytes);
+    AgcDriver::GuestMemory::MarkWritten(memory.Address(), layers * sliceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    auto first = Depth(memory.Address());
+    first.format = VK_FORMAT_D16_UNORM;
+    first.clearDepth = 0.0f;
+    auto last = first;
+    last.address += 2 * sliceBytes;
+    last.clearDepth = 1.0f;
+    if (firstLayerResident) DepthSurfaceView(context, first);
+    DepthSurfaceView(context, last);
+    auto resource = View(Extent.width, Extent.height, memory.Address());
+    resource.format = 7; // R16_UNORM, sharing the D16 depth plane's native pixel bits.
+    resource.dimension = TextureDimension::k2DArray;
+    resource.depthOrLastArray = layers - 1;
+    resource.tileMode = TextureTileMode::kZ64KBX;
+    if (!firstLayerResident) {
+        auto volume = resource;
+        volume.dimension = TextureDimension::k3D;
+        bool refused = false;
+        try {
+            CachedStorageSurface(context, volume);
+        } catch (const std::runtime_error& error) {
+            refused = std::string(error.what()).find("requires a 2D image or array") != std::string::npos;
+        }
+        Require(refused && DepthSurfaceAt(last.address), "a volume view bypassed its last resident depth slice");
+    }
+    auto writer = CachedStorageSurface(context, resource);
+    Buffer readback(context, layers * texels * sizeof(std::uint16_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    {
+        CommandBatch batch(context);
+        const auto commands = batch.Handle();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
+        copy.imageExtent = {Extent.width, Extent.height, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, writer->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+    }
+    const std::array<std::uint16_t, layers> expected{firstLayerResident ? std::uint16_t{0} : std::uint16_t{0x3333}, 0x3333, 65535};
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        for (std::uint32_t pixel = 0; pixel < texels; ++pixel) {
+            std::uint16_t value;
+            std::memcpy(&value, readback.Bytes().data() + (layer * texels + pixel) * sizeof(value), sizeof(value));
+            Require(value == expected[layer], "depth array seeding changed or duplicated a slice: layer=" + std::to_string(layer) + " value=" + std::to_string(value));
+        }
+    }
+    {
+        CommandBatch batch(context);
+        const auto commands = batch.Handle();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkClearColorValue clear{};
+        clear.float32[0] = 0.5f;
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layers - 1, 1};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, writer->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        batch.SubmitAndWait();
+    }
+    writer->MarkDirty();
+    const std::weak_ptr<StorageTexture> retained = writer;
+    ClearCachedTextures(context.device);
+    Check(context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device), "vkDeviceWaitIdle");
+    writer.reset();
+    Require(!retained.expired(), "cache eviction lost the depth array's storage writer");
+    DepthSurfaceView(context, last);
+    auto lastView = resource;
+    lastView.baseAddress = last.address;
+    lastView.dimension = TextureDimension::k2D;
+    lastView.depthOrLastArray = 0;
+    SampleProgram sampler(context);
+    const auto rebound = Sample(context, lastView);
+    Require(rebound != nullptr && std::abs(std::bit_cast<float>(sampler.RedBits(*rebound)) - 0.5f) <= 1.0f / 65535.0f,
+        "depth array rebind imported another layer's pixel bits");
+    if (firstLayerResident) {
+        DepthSurfaceView(context, first);
+        lastView.baseAddress = first.address;
+        const auto preserved = Sample(context, lastView);
+        Require(preserved != nullptr && sampler.RedBits(*preserved) == std::bit_cast<std::uint32_t>(0.0f),
+            "writing the last depth array layer changed the first layer");
+    }
+    Require(retained.expired(), "consuming all depth array slices retained the storage writer");
+}
+
 void MultisampleRefusalTest(const Context& context) {
     if (!context.sampleLocations || (context.sampleLocationProperties.sampleLocationSampleCounts & VK_SAMPLE_COUNT_8_BIT) == 0 ||
         (context.limits.framebufferDepthSampleCounts & VK_SAMPLE_COUNT_8_BIT) == 0 || context.sampleLocationProperties.sampleLocationSubPixelBits < 4) {
@@ -652,6 +750,8 @@ int main() {
         Run(device->GetContext());
         RemappedColorTest(*device);
         StorageRoundTripTest(device->GetContext());
+        StorageArrayRoundTripTest(device->GetContext(), true);
+        StorageArrayRoundTripTest(device->GetContext(), false);
         MultisampleRefusalTest(device->GetContext());
         std::puts("depth surface last writer tests passed");
         return 0;
