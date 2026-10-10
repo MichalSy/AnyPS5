@@ -720,6 +720,64 @@ if(BUILD_TESTING)
         set_tests_properties(agc_host_import_unmap PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    set(agcReadOnlyStagingEnvironment
+        --unset=APS5_READONLY_STAGING
+        --unset=APS5_READONLY_STAGE_MIN_KIB
+        --unset=APS5_READONLY_STAGE_MAX_KIB
+        --unset=APS5_CPU_COPIES
+        --unset=APS5_ALL_BUFFERS_WRITTEN
+        --unset=APS5_GPU_NO_WRITEBACK
+        APS5_NO_WRITTEN_SHADOW=1
+        APS5_NO_ATOMIC_STAGING=1)
+    set(agcReadOnlyStagingTests)
+    foreach(mode IN ITEMS unset off on max min cpu invalid_flag invalid_size overflow reversed)
+        set(settings)
+        if(mode STREQUAL "off")
+            set(settings APS5_READONLY_STAGING=0)
+        elseif(mode STREQUAL "on")
+            set(settings APS5_READONLY_STAGING=1)
+        elseif(mode STREQUAL "max")
+            set(settings APS5_READONLY_STAGING=1 APS5_READONLY_STAGE_MAX_KIB=1)
+        elseif(mode STREQUAL "min")
+            set(settings APS5_READONLY_STAGING=1 APS5_READONLY_STAGE_MIN_KIB=3)
+        elseif(mode STREQUAL "cpu")
+            set(settings APS5_READONLY_STAGING=1 APS5_CPU_COPIES=1)
+        elseif(mode STREQUAL "invalid_flag")
+            set(settings APS5_READONLY_STAGING=yes)
+        elseif(mode STREQUAL "invalid_size")
+            set(settings APS5_READONLY_STAGE_MAX_KIB=-1)
+        elseif(mode STREQUAL "overflow")
+            set(settings APS5_READONLY_STAGE_MAX_KIB=18446744073709551615)
+        elseif(mode STREQUAL "reversed")
+            set(settings APS5_READONLY_STAGE_MIN_KIB=2 APS5_READONLY_STAGE_MAX_KIB=1)
+        endif()
+        set(testName agc_read_only_staging_${mode})
+        add_test(NAME ${testName} COMMAND ${CMAKE_COMMAND} -E env
+            ${agcReadOnlyStagingEnvironment} ${settings}
+            $<TARGET_FILE:agc_driver_recorder_tests> --read-only-staging-only)
+        list(APPEND agcReadOnlyStagingTests ${testName})
+        if(mode MATCHES "^(invalid_flag|invalid_size|overflow|reversed)$")
+            set_tests_properties(${testName} PROPERTIES WILL_FAIL TRUE)
+        endif()
+    endforeach()
+    add_test(NAME agc_read_written_staging COMMAND ${CMAKE_COMMAND} -E env
+        --unset=APS5_READONLY_STAGING
+        --unset=APS5_READONLY_STAGE_MIN_KIB
+        --unset=APS5_READONLY_STAGE_MAX_KIB
+        --unset=APS5_CPU_COPIES
+        --unset=APS5_ALL_BUFFERS_WRITTEN
+        --unset=APS5_GPU_NO_WRITEBACK
+        --unset=APS5_NO_WRITTEN_SHADOW
+        --unset=APS5_NO_ATOMIC_STAGING
+        --unset=APS5_WRITTEN_SHADOW_MIN_KIB
+        --unset=APS5_WRITTEN_SHADOW_MAX_KIB
+        $<TARGET_FILE:agc_driver_recorder_tests> --read-written-staging-only)
+    set_tests_properties(${agcReadOnlyStagingTests} agc_read_written_staging PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(${agcReadOnlyStagingTests} agc_read_written_staging PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 add_test_executable(agc_recorder_kept_bytes_tests EXCLUDE_FROM_ALL tests/RecorderKeptBytes.cpp)

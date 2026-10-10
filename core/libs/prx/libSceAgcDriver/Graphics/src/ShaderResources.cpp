@@ -1284,7 +1284,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                         // vector) counts as written, like imageWritten below.
                         const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                         const bool atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
-                        const bool read = element < binding.bufferRead.size() && binding.bufferRead[element];
+                        const bool read = element < binding.bufferRead.size() && binding.bufferRead[element] && (written || element < binding.bufferAtomic.size());
                         const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic, read);
                         const auto& push = shader.program->pushConstants;
                         if (!push.empty()) {
@@ -1331,6 +1331,22 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         // For every build, locked ones included: their stage B then takes the fast path too, and the
         // collects cost the same wherever they run.
         if (precollectImages()) phase(BuildPhase::Precollect);
+        if (!usesBda && guestMemory.HasReadOnlyStagingCandidates()) {
+            std::size_t recordIndex = 0;
+            for (const auto& deferred : deferredImages) {
+                const auto& binding = *deferred.binding;
+                const auto elementWords = binding.guestDescriptor.size() / binding.count;
+                for (std::uint32_t element = 0; element < binding.count; ++element, ++recordIndex) {
+                    const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+                    if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
+                    const auto* record = recordIndex < imageRecords.size() && imageRecords[recordIndex].decoded ? &imageRecords[recordIndex] : nullptr;
+                    const auto resource = record != nullptr ? record->resource : DecodeTextureResource(words);
+                    const auto bytes = record != nullptr ? record->guestBytes : DescribeSurface(resource).guestBytes;
+                    guestMemory.ExcludeReadOnlyStaging(resource.baseAddress, static_cast<std::size_t>(bytes));
+                    if (resource.dccAddress != 0) guestMemory.ExcludeReadOnlyStaging(resource.dccAddress, DccKeyBytes(bytes));
+                }
+            }
+        }
         if (drawBuild && !usesBda && std::all_of(allocations.begin(), allocations.end(), [&](const Allocation& allocation) { return !allocation.guest || allocation.pushByte >= 0 || (allocation.dataAllocation >= 0 && allocation.dataByte < allocations[static_cast<std::size_t>(allocation.dataAllocation)].size); })) guestMemory.AllowAdjustedRegions();
         guestMemory.UploadPrepare(usesBda);
         timing.uploadMs = phase(BuildPhase::Upload);
@@ -2639,7 +2655,7 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     const bool swept = read && dispatchThreads != 0 && descriptor.Stride() != 0 && dispatchThreads * descriptor.Stride() * 2u >= byteSize;
     if (written) guestMemory.AddWritable(address, size, atomic, swept);
     else {
-        guestMemory.AddReadable(address, size);
+        guestMemory.AddReadable(address, size, read && !atomic);
         ++readOnlyBuffers;
     }
     if (BuildProfiled()) {

@@ -185,7 +185,9 @@ public:
     // element the shader updates atomically (DescriptorBinding::bufferAtomic), staged in device
     // memory whatever its size (see AllowDeviceStaging).
     void AddWritable(std::uint64_t address, std::size_t bytes, bool atomic = false, bool swept = false);
-    void AddReadable(std::uint64_t address, std::size_t bytes);
+    void AddReadable(std::uint64_t address, std::size_t bytes, bool certifiedReadOnly = false);
+    bool HasReadOnlyStagingCandidates() const;
+    void ExcludeReadOnlyStaging(std::uint64_t address, std::size_t bytes);
     // Device-local staging of written and atomic elements inside host imports (see
     // GuestBufferMemory.cpp): allowed only for a build whose every use records its work and then
     // calls RecordCopyBacks (a dispatch), since a staged region's results reach guest memory by
@@ -296,6 +298,7 @@ private:
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         bool swept = false;
+        bool readOnlyStagingCandidate = false;
         // The gpuCopy buffer is a device-local staging shadow (see stagingEligible): no host
         // mapping, so nothing is ever stored from it by the CPU, and the region is taken even when
         // the import could bind it in place.
@@ -329,7 +332,7 @@ private:
     // The region of a descriptor-bound range (AddWritable/AddReadable), committed pages only. A
     // range inside a base region of the space adds nothing: the region serves it, as today's merge
     // of the two did.
-    void addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept);
+    void addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept, bool certifiedReadOnly);
     // Gives a region a buffer of its own with its bytes (guest memory for host-backed and writable
     // ranges, plus the write-back's reference copy for a range a descriptor writes; else its snapshot).
     void copyRegion(Region& region, bool addressable);

@@ -22,6 +22,7 @@
 #include <unistd.h>
 #endif
 #include <atomic>
+#include <charconv>
 #include <tuple>
 #include <functional>
 #include <bit>
@@ -108,6 +109,34 @@ struct GuestBufferMemory::AddressSpace {
 };
 
 namespace {
+
+struct ReadOnlyStagingSettings {
+    bool enabled;
+    std::uint64_t minBytes;
+    std::uint64_t maxBytes;
+};
+
+std::uint64_t readOnlyKibSetting(const char* name, std::uint64_t defaultKib) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return defaultKib * 1024u;
+    std::uint64_t kib = 0;
+    const auto* end = value + std::strlen(value);
+    const auto result = std::from_chars(value, end, kib);
+    Require(result.ec == std::errc{} && result.ptr == end && kib <= std::numeric_limits<std::size_t>::max() / 1024u, std::string(name) + " must be an unsigned decimal KiB value within the host size limit");
+    return kib * 1024u;
+}
+
+const ReadOnlyStagingSettings& readOnlyStagingSettings() {
+    static const ReadOnlyStagingSettings settings = [] {
+        const char* value = std::getenv("APS5_READONLY_STAGING");
+        Require(value == nullptr || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0, "APS5_READONLY_STAGING must be 0 or 1");
+        const auto minBytes = readOnlyKibSetting("APS5_READONLY_STAGE_MIN_KIB", 0);
+        const auto maxBytes = readOnlyKibSetting("APS5_READONLY_STAGE_MAX_KIB", 4096);
+        Require(minBytes <= maxBytes, "APS5_READONLY_STAGE_MIN_KIB must not exceed APS5_READONLY_STAGE_MAX_KIB");
+        return ReadOnlyStagingSettings{value != nullptr && std::strcmp(value, "1") == 0, minBytes, maxBytes};
+    }();
+    return settings;
+}
 
 struct AddressSpaceCache {
     std::atomic<std::shared_ptr<const GuestBufferMemory::AddressSpace>> current;
@@ -1703,7 +1732,9 @@ bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t
     return state.device == context.device && findImport(state, address, address + bytes) != nullptr;
 }
 
-GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context) {}
+GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context) {
+    static_cast<void>(readOnlyStagingSettings());
+}
 
 bool GuestBufferMemory::WritesOverlap(std::uint64_t address, std::size_t bytes) const {
     return std::any_of(writes.begin(), writes.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
@@ -2003,7 +2034,7 @@ const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address)
     return own;
 }
 
-void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept) {
+void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept, bool certifiedReadOnly) {
     validate(address, bytes);
     const auto begin = address & ~std::uint64_t{3};
     const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
@@ -2022,6 +2053,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     Region region{begin, end, true, {}, nullptr};
     region.atomic = atomic;
     region.swept = swept;
+    region.readOnlyStagingCandidate = certifiedReadOnly && readOnlyStagingSettings().enabled;
     auto committed = GuestMemory::DescribeCommitted(begin, static_cast<std::size_t>(end - begin));
     if (!committed.whole) {
         // A GPU heap bound whole while the guest commits its pages on demand, or a descriptor left
@@ -2033,15 +2065,27 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
 }
 
 void GuestBufferMemory::AddWritable(std::uint64_t address, std::size_t bytes, bool atomic, bool swept) {
-    addDescriptorRegion(address, bytes, atomic, swept);
+    addDescriptorRegion(address, bytes, atomic, swept, false);
     writes.emplace_back(address, address + bytes);
 }
 
-void GuestBufferMemory::AddReadable(std::uint64_t address, std::size_t bytes) {
+void GuestBufferMemory::AddReadable(std::uint64_t address, std::size_t bytes, bool certifiedReadOnly) {
     // Not in `writes`: no reference copy (copyRegion), no write-back, no pending-write note, no
     // direct-write mark, and UploadPrepare copies it without the device lock. A written descriptor
     // overlapping the range still covers it through its own Writes() entry.
-    addDescriptorRegion(address, bytes, false, false);
+    addDescriptorRegion(address, bytes, false, false, certifiedReadOnly);
+}
+
+bool GuestBufferMemory::HasReadOnlyStagingCandidates() const {
+    return stagingAllowed && std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.readOnlyStagingCandidate; });
+}
+
+void GuestBufferMemory::ExcludeReadOnlyStaging(std::uint64_t address, std::size_t bytes) {
+    Require(!prepared, "read-only staging exclusions must be added before upload");
+    validate(address, bytes);
+    for (auto& region : regions) {
+        if (address < region.end && region.begin < address + bytes) region.readOnlyStagingCandidate = false;
+    }
 }
 
 void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
@@ -2220,6 +2264,7 @@ struct CopyStats {
     // (counted when the build is reused or destroyed), and shadows the device refused.
     std::atomic<std::uint64_t> staged{0};
     std::atomic<std::uint64_t> stagedAtomic{0};
+    std::atomic<std::uint64_t> stagedReadOnly{0};
     std::atomic<std::uint64_t> stagedReused{0};
     std::atomic<std::uint64_t> stagedInBytes{0};
     std::atomic<std::uint64_t> stagedOutBytes{0};
@@ -2249,14 +2294,14 @@ std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes,
 
 // APS5_TRACE_STAGING=1: every distinct staged range once, with its size and whether an atomic
 // element lies in it, to see which elements the staging window admits at a stage.
-void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
+void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic, bool readOnly) {
     static const bool trace = std::getenv("APS5_TRACE_STAGING") != nullptr;
     if (!trace) return;
     static std::mutex mutex;
     static std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
     std::lock_guard lock(mutex);
     if (!seen.insert({begin, end}).second) return;
-    std::fprintf(stderr, "[staging] 0x%llx+0x%llx (%.1f KiB)%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "");
+    std::fprintf(stderr, "[staging] 0x%llx+0x%llx (%.1f KiB)%s%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "", readOnly ? " read-only" : "");
 }
 
 void reportStaging() {
@@ -2269,7 +2314,7 @@ void reportStaging() {
     const auto staged = stats.staged.load();
     const auto in = stats.stagedInBytes.load();
     const auto out = stats.stagedOutBytes.load();
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu read-only, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu written without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReadOnly.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
@@ -2287,7 +2332,7 @@ GuestBufferMemory::~GuestBufferMemory() {
     // A staged region whose last use recorded its copy-in but no copy-back (the use threw before
     // RecordCopyBacks, or never dispatched): whatever the shader stored stayed in the shadow.
     for (const auto& region : regions) {
-        if (region.gpuCopy && region.deviceLocal && !region.copiedBack) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
+        if (region.gpuCopy && region.deviceLocal && !region.copiedBack && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -2304,7 +2349,10 @@ bool GuestBufferMemory::bindableInPlace(std::uint64_t offset, bool addressable) 
 bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) const {
     if (!stagingAllowed || addressable || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;
-    if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
+    if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) {
+        const auto& settings = readOnlyStagingSettings();
+        return region.readOnlyStagingCandidate && !region.atomic && settings.enabled && bytes >= settings.minBytes && bytes <= settings.maxBytes;
+    }
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
     return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(), SweptShadowMax) : writtenShadowMax());
 }
@@ -2348,6 +2396,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             if (region.end > previous.end) previous.direct = nullptr;
             previous.atomic = previous.atomic || region.atomic;
             previous.swept = previous.swept || region.swept;
+            previous.readOnlyStagingCandidate = previous.readOnlyStagingCandidate && region.readOnlyStagingCandidate;
             // A range starting before the mirror (only possible after the swap) keeps its prefix; the
             // earlier merged region ends at or before it, so the merged list stays sorted.
             previous.begin = std::min(previous.begin, region.begin);
@@ -2782,7 +2831,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         // source is a live import or one retireImport already handed to this batch.
         recorder->Keep(region->buffer);
         region->snapshot.clear();
-        if (region->deviceLocal) traceStaged(region->begin, region->end, region->atomic);
+        if (region->deviceLocal) traceStaged(region->begin, region->end, region->atomic, !writable);
         if (profile) {
             Copies().gpuCopies.fetch_add(1, std::memory_order_relaxed);
             Copies().gpuCopyBytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -2791,6 +2840,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 Copies().staged.fetch_add(1, std::memory_order_relaxed);
                 Copies().stagedInBytes.fetch_add(bytes, std::memory_order_relaxed);
                 if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
+                if (!writable) Copies().stagedReadOnly.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -3180,7 +3230,7 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // threw first: counted); this use records its own after its work, from the shadow this
         // copy-in refills. The import is the one the region was taken from (the caller checked its
         // serial), so the copy source still stands.
-        if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
+        if (!region.copiedBack && profile && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
         region.copiedBack = false;
         copies.push_back(&region);
     }
