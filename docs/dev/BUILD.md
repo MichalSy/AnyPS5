@@ -98,7 +98,7 @@ systemd user manager; a failed setup does not fall back to an unguarded launch.
 
 `ANYPS5_MEMORY_MAX_MIB` caps the game group, defaulting to 18432 MiB. The actual
 limit is the smaller of this cap and available RAM minus
-`ANYPS5_MEMORY_RESERVE_MIB`, which defaults to 6144 MiB. Limits apply to resident
+`ANYPS5_MEMORY_RESERVE_MIB`, which defaults to 4096 MiB. Limits apply to resident
 cgroup memory, including charged file and shared memory, rather than the large
 virtual guest address reservation. No CPU or memory-high throttling is applied.
 
