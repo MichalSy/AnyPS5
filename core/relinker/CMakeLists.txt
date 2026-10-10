@@ -271,6 +271,8 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:relinker> $<TARGET_FILE:libkernel>)
             set_tests_properties(guest_module_start PROPERTIES TIMEOUT 60)
         endif()
+        add_test(NAME sce_module_path COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_sce_module_path.py $<TARGET_FILE:relinker>)
         add_test(NAME linux_guest_stack COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_guest_stack.py $<TARGET_FILE:relinker>)
         add_test(NAME guest_symbol_names COMMAND ${Python3_EXECUTABLE}

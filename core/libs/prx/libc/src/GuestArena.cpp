@@ -7,10 +7,11 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <cerrno>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <sys/mman.h>
 #endif
-#include <sstream>
-#include <fstream>
 #include <cstdio>
 #include <iterator>
 #include <map>
@@ -174,13 +175,13 @@ private:
 #if defined(__linux__)
     void SeedLinuxUsedRanges() {
         std::ifstream maps("/proc/self/maps");
-        if (!maps) throw std::runtime_error("Cannot inspect occupied memory ranges");
+        if (!maps.is_open()) throw std::runtime_error("guest arena: cannot open /proc/self/maps");
         std::string line;
         while (std::getline(maps, line)) {
             std::istringstream fields(line);
             std::uintptr_t begin = 0, end = 0;
             char dash = 0;
-            if (!(fields >> std::hex >> begin >> dash >> end) || end <= begin) continue;
+            if (!(fields >> std::hex >> begin >> dash >> end) || dash != '-' || end <= begin) throw std::runtime_error("guest arena: malformed /proc/self/maps line: " + line);
             if (end <= ArenaStart || begin >= ApplicationAreaEnd) continue;
             const auto first = std::max(begin, ArenaStart);
             const auto last = std::min(end, ApplicationAreaEnd);
@@ -252,7 +253,6 @@ private:
             _hostRegions.emplace_back(from, to);
         }
     }
-
 #endif
 
     std::mutex _lock;

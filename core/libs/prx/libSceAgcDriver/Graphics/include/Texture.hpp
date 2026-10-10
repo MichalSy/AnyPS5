@@ -292,12 +292,14 @@ public:
     DccKeys UploadedKeys() const { return uploadedKeys; }
     DccKeys FilledKeys() const { return filledKeys; }
     DccKeyProof& KeyProof() const { return keyProof; }
+    DccRangeProof& TargetKeyProof() const { return targetKeyProof; }
     DccKeys ProvedKeys() const;
     bool ServesKeysAt(std::uint64_t dccAddress) const;
     // Brings the image up to date with guest memory before another use; returns whether its content
     // was still current (nothing uploaded).
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
     bool Refresh();
+    static std::uint64_t SinglePassMoves();
     std::uint64_t GuestBytes() const;
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
 
@@ -435,6 +437,10 @@ private:
     VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format) const;
     VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format, TextureDimension requestedDimension) const;
     VkImageView requestedView(std::uint32_t mip, bool firstLayer, VkFormat format, TextureDimension requestedDimension);
+    bool singlePass();
+    VkImageView elementLayerView(std::uint32_t level, std::uint32_t layer);
+    void recordDirectUploadBarrier(VkCommandBuffer commands, bool discard);
+    void recordDirectUploadDone(VkCommandBuffer commands);
     void release() noexcept;
 
     Context context;
@@ -452,6 +458,7 @@ private:
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     mutable DccKeys filledKeys = DccKeys::Uncompressed;
     mutable DccKeyProof keyProof;
+    mutable DccRangeProof targetKeyProof;
     struct ForeignKeyProof {
         std::uint64_t dccAddress = 0;
         DccKeyProof proof;
@@ -489,6 +496,8 @@ private:
     std::map<std::pair<std::uint32_t, bool>, VkImageView> uintViews;
     std::map<std::tuple<VkFormat, std::uint32_t, VkImageViewType, std::uint32_t, std::uint32_t>, VkImageView> requestedViews;
     VkImageView elementView = VK_NULL_HANDLE;
+    std::map<std::uint32_t, VkImageView> elementLayerViews;
+    std::int8_t singlePassState = -1;
     bool attachable = false;
     std::map<std::tuple<VkFormat, std::uint32_t, std::uint32_t>, VkImageView> attachmentViews;
     VkImage proxyImage = VK_NULL_HANDLE;

@@ -53,6 +53,8 @@ struct DeviceFunctions {
     PFN_vkCmdDispatchIndirect cmdDispatchIndirect = nullptr;
     PFN_vkCmdBeginRenderPass cmdBeginRenderPass = nullptr;
     PFN_vkCmdEndRenderPass cmdEndRenderPass = nullptr;
+    PFN_vkCmdBeginRenderingKHR cmdBeginRendering = nullptr;
+    PFN_vkCmdEndRenderingKHR cmdEndRendering = nullptr;
     PFN_vkCmdSetViewport cmdSetViewport = nullptr;
     PFN_vkCmdSetScissor cmdSetScissor = nullptr;
     PFN_vkCmdSetDepthBounds cmdSetDepthBounds = nullptr;
@@ -168,6 +170,7 @@ struct Context {
     std::array<VkExtent2D, 7> sampleLocationGridSizes{};
     bool provokingVertexLast = false;
     bool provokingVertexModePerPipeline = false;
+    bool singlePassStorage = false;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {
@@ -192,6 +195,11 @@ struct Context {
         throw std::runtime_error("AGC graphics: required Vulkan memory type is unavailable");
     }
 };
+
+inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
+    if (context.graphicsPipelineLibrary) context.Resolved(&DeviceFunctions::cmdEndRendering, "vkCmdEndRenderingKHR")(commands);
+    else context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
+}
 
 }
 
