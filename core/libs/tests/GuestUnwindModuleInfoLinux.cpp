@@ -121,7 +121,7 @@ static void CheckImage(const void* address) {
 }
 
 int main(int argc, char** argv) {
-    Require(argc == 2);
+    Require(argc == 3);
     CheckImage(reinterpret_cast<const void*>(&Query));
     CheckImage(reinterpret_cast<const void*>(&sceKernelGetModuleInfoForUnwind));
     void* module = dlopen_nid_postfix(argv[1], 2);
@@ -133,6 +133,14 @@ int main(int argc, char** argv) {
     CheckImage(reinterpret_cast<const void*>(info.eh_frame_hdr_addr));
     Require(dlclose_nid_postfix(module) == 0);
     Query(code, 1, SCE_KERNEL_ERROR_ESRCH);
+    void* noHeader = dlopen_nid_postfix(argv[2], 2);
+    Require(noHeader != nullptr);
+    const auto* noHeaderCode = dlsym_nid_postfix(noHeader, "GuestModuleAdd");
+    Require(noHeaderCode != nullptr);
+    const auto withoutTables = Query(noHeaderCode);
+    Require(withoutTables.seg0_addr != 0 && withoutTables.seg0_size != 0);
+    Require(withoutTables.eh_frame_hdr_addr == 0 && withoutTables.eh_frame_addr == 0 && withoutTables.eh_frame_size == 0);
+    Require(dlclose_nid_postfix(noHeader) == 0);
     void* anonymous = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     Require(anonymous != MAP_FAILED);
     const auto anon = Query(anonymous);

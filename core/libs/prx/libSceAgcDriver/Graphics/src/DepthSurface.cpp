@@ -432,8 +432,8 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     const auto& list = surfaces();
     const auto found = std::find_if(list.rbegin(), list.rend(), matches);
     if (found == list.rend()) return nullptr;
-    if ((*found)->target.samples == VK_SAMPLE_COUNT_1_BIT && !(*found)->SampledAccepts(words, resource) && (*found)->OverwrittenInMemory()) {
-        (*found)->retired = true;
+    if ((*found)->target.samples == VK_SAMPLE_COUNT_1_BIT && !(*found)->SampledAccepts(words, resource)) {
+        if ((*found)->OverwrittenInMemory()) (*found)->retired = true;
         return nullptr;
     }
     auto texture = (*found)->Sampled(words, resource, components);

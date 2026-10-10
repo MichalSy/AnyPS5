@@ -322,6 +322,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     };
     const bool depthReadOnly = (view & 0x01000000u) != 0;
     const bool stencilReadOnly = (view & 0x02000000u) != 0;
+    Require(!stencilClear || (stencil && !stencilReadOnly), "stencil clear requires a writable stencil plane");
     DepthTarget depth{};
     depth.mipCount = mipCount;
     depth.mip = mip;
@@ -370,8 +371,17 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     }
     result.stencilTest = (depthControl & 1u) != 0;
     if (stencilClear) {
-        result.stencilFront = {VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_ALWAYS, 0xffu, 0xffu, depth.clearStencil};
-        result.stencilBack = result.stencilFront;
+        VkStencilOpState clear{};
+        clear.failOp = VK_STENCIL_OP_REPLACE;
+        clear.passOp = VK_STENCIL_OP_REPLACE;
+        clear.depthFailOp = VK_STENCIL_OP_REPLACE;
+        clear.compareOp = VK_COMPARE_OP_ALWAYS;
+        clear.compareMask = 0xffu;
+        clear.writeMask = 0xffu;
+        clear.reference = depth.clearStencil;
+        result.stencilTest = true;
+        result.stencilFront = clear;
+        result.stencilBack = clear;
     } else if (result.stencilTest) {
         const auto ops = read(cx, 0x10b);
         result.stencilFront = stencilFace((depthControl >> 8u) & 7u, ops, read(cx, 0x10c), stencilReadOnly);
@@ -629,12 +639,11 @@ std::string DepthMaintenanceRejection(const QueueState& queue) {
         return std::string(detail);
     };
     if (control->second != 2u && control->second != 0x22u) return reject("with additional control flags");
-    if ((depthControl & ~0x007007f1u) != 0 || (depthControl & 0xfu) != 1u) return reject("with disabled stencil or depth work");
-    if (((depthControl >> 8u) & 7u) != 7u || ((depthControl & 0x80u) != 0 && ((depthControl >> 20u) & 7u) != 7u)) return reject("with conditional stencil comparisons");
-    if (((frontMask >> 16u) & 0xffu) != 0xffu || ((depthControl & 0x80u) != 0 && ((backMask >> 16u) & 0xffu) != 0xffu)) return reject("with partial stencil write masks");
-    if (view != 0) return reject("with read-only, mipmapped or array views");
+    if (((word(0x010) >> 2u) & 3u) != 0u && view != 0u) return reject("with read-only, mipmapped or array views");
+    if ((view & ~0x01000000u) != 0) return reject((view & 0x02000000u) != 0 ? "without a writable stencil plane" : "with read-only, mipmapped or array views");
     const auto zInfo = word(0x010);
     const auto stencilInfo = word(0x011);
+    if ((stencilInfo & 1u) == 0) return reject("without a writable stencil plane");
     const auto samples = (zInfo >> 2u) & 3u;
     if ((zInfo & 3u) == 2u || (zInfo & 0x000f1000u) != 0 || (samples != 0u && samples != 3u) || (stencilInfo & 0x1001u) != 1u) return reject("without a supported stencil plane");
     if (auto reason = multisampleRejection(cx); !reason.empty()) return reason;
@@ -681,7 +690,9 @@ State DecodeState(const QueueState& queue) {
     zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
     {
         const auto depthControl = read(cx, 0x200);
-        if (!inertDepth(cx, depthControl) && (depthControl & 0xbu) != 0 && depthSurfaceBound(cx)) {
+        const auto renderControl = find(cx, 0x000);
+        const bool stencilClear = renderControl != cx.end() && (renderControl->second & 2u) != 0;
+        if (stencilClear || (!inertDepth(cx, depthControl) && (depthControl & 0xbu) != 0 && depthSurfaceBound(cx))) {
             decodeDepth(cx, depthControl, result);
         } else if (depthPassThrough(depthControl) || ((depthControl & 3u) != 0 && depthPlanesAbsent(cx))) {
             static bool reported = false;
@@ -1093,7 +1104,13 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     }
     if (auto reason = nonzero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
     if (value(cx, 0x200, word)) {
-        const bool surface = (word & 0xbu) != 0 && depthSurfaceBound(cx);
+        const auto renderControl = find(cx, 0x000);
+        const bool stencilClear = renderControl != cx.end() && (renderControl->second & 2u) != 0;
+        if (stencilClear) {
+            std::uint32_t stencil = 0, view = 0;
+            if ((value(cx, 0x011, stencil) && (stencil & 1u) == 0) || (value(cx, 0x002, view) && (view & 0x02000000u) != 0)) return require(false, "stencil clear requires a writable stencil plane");
+        }
+        const bool surface = ((word & 0xbu) != 0 || stencilClear) && depthSurfaceBound(cx);
         if (!surface && !((word & 3u) != 0 && depthPlanesAbsent(cx)) && !depthPassThrough(word) && !IgnoreDepthTest() && (effectiveDepthControl(word) & DepthControlMask) != 0) return zeroMessage(0x200, word, "depth, stencil or conditional color writes");
         if (auto reason = require((word & 8u) == 0 || surface, "depth bounds without a depth surface"); !reason.empty()) return reason;
         if (auto reason = require((word & 0xc0000000u) == 0, "depth-conditional color writes are unsupported"); !reason.empty()) return reason;
