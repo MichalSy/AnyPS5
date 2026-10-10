@@ -16,6 +16,7 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -87,6 +88,13 @@ public:
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
+    // Counts `bytes` held by `owner` in the open batch's kept bytes once per batch: memory several
+    // keeps of one batch share (a cached ShaderResources kept by every draw or dispatch using it, a
+    // reused draw snapshot) counts once. The caller keeps `owner` alive in the same batch, so its
+    // address names one object for the batch's lifetime.
+    void KeepBytes(const void* owner, std::size_t bytes);
+    // The kept bytes of the open batch (0 with none open), for tests.
+    std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
     void BoundKeptBytes();
     std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
@@ -513,6 +521,8 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
+        // The owners KeepBytes counted in this batch.
+        std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;

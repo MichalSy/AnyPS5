@@ -3333,9 +3333,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         writes.push_back(write);
     }
     update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    std::size_t snapshotBytes = 0;
-    for (const auto& snapshot : result->snapshots) snapshotBytes += snapshot.buffer->Bytes().size();
-    recorder.Keep(result, snapshotBytes);
+    recorder.Keep(result);
+    // A reused snapshot (Recorder::ReusableDrawSnapshot) is one buffer however many draws bind it.
+    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
 }
 
