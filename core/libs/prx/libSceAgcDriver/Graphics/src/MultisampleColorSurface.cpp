@@ -41,7 +41,7 @@ bool overlaps(std::uint64_t address, std::size_t bytes, const ColorTarget& targe
 }
 
 bool supportedFormat(VkFormat format) {
-    return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB || format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB || format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
 }
 
 void validateTarget(const ColorTarget& target) {
@@ -74,12 +74,15 @@ MultisampleColorSurface::MultisampleColorSurface(const Context& context, const C
     acquireBacking();
     GuestMemory::CheckRange(reinterpret_cast<const void*>(target.address), target.bytes, geometry.Alignment(), true);
     nativeFormat = target.elementBytes == 8u ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
-    const auto storageFormat = target.elementBytes == 8u ? VK_FORMAT_R16G16B16A16_UINT : VK_FORMAT_R8G8B8A8_UNORM;
+    const auto storageFormat = target.elementBytes == 8u ? VK_FORMAT_R16G16B16A16_UINT : VK_FORMAT_R8G8B8A8_UINT;
     VkFormatProperties storageProperties{};
     context.formatProperties(context.physical, storageFormat, &storageProperties);
     Require((storageProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0, "multisample color transfer format cannot be a storage image");
     constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     constexpr VkImageCreateFlags flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    VkImageFormatProperties storageSupported{};
+    Check(context.imageFormatProperties(context.physical, storageFormat, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_STORAGE_BIT, flags, &storageSupported), "vkGetPhysicalDeviceImageFormatProperties multisample color storage");
+    Require((storageSupported.sampleCounts & target.samples) != 0, "device does not support this multisample color storage view");
     VkImageFormatProperties supported{};
     Check(context.imageFormatProperties(context.physical, nativeFormat, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, flags, &supported), "vkGetPhysicalDeviceImageFormatProperties multisample color");
     Require((supported.sampleCounts & target.samples) != 0 && target.extent.width <= supported.maxExtent.width && target.extent.height <= supported.maxExtent.height, "device does not support this multisample color image");
@@ -218,6 +221,9 @@ VkImageView MultisampleColorSurface::AttachmentView(VkFormat format) {
     VkFormatProperties properties{};
     context.formatProperties(context.physical, format, &properties);
     Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0, "multisample color format cannot be an attachment");
+    VkImageFormatProperties supported{};
+    Check(context.imageFormatProperties(context.physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT, &supported), "vkGetPhysicalDeviceImageFormatProperties multisample color attachment");
+    Require((supported.sampleCounts & target.samples) != 0 && target.extent.width <= supported.maxExtent.width && target.extent.height <= supported.maxExtent.height, "device does not support this multisample color attachment view");
     const auto entry = attachmentViews.emplace(format, VK_NULL_HANDLE).first;
     try {
         VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};

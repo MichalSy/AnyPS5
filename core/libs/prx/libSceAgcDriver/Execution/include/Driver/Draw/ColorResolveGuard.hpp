@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <span>
+#include <sstream>
 #include <string>
 
 namespace AgcDriver::DriverDetail {
@@ -20,9 +21,28 @@ inline constexpr std::array<std::uint32_t, 27> RectangleVertexInstructions{
     0x4a0606c1u, 0x4a0404c1u, 0x7e060b03u, 0x7e040b02u,
     0xf80008cfu, 0x01000302u, 0xbf810000u
 };
+inline constexpr std::array<std::uint32_t, 28> PackedCountRectangleVertexInstructions{
+    0xbfa00001u, 0x93eaff03u, 0x00080008u, 0x876bff03u, 0x000000ffu,
+    0x8f6a8c6au, 0x887c6a6bu, 0xbf900009u, 0x906a8803u, 0x81ea6a80u,
+    0x90fe6ac1u, 0xf8000941u, 0x00000000u, 0x81ea0380u, 0xbf8cff0fu,
+    0x90fe6ac1u, 0x34040a81u, 0x36060ac2u, 0x7e000280u, 0x7e0202f2u,
+    0x36040482u, 0x4a0606c1u, 0x4a0404c1u, 0x7e060b03u, 0x7e040b02u,
+    0xf80008cfu, 0x01000302u, 0xbf810000u
+};
 inline constexpr std::array<std::uint32_t, 5> ConstantFragmentInstructions{
     0x7e0002ffu, 0x3c003c00u, 0xf8001c0fu, 0x00000000u, 0xbf810000u
 };
+
+inline void RequireInstructions(std::span<const std::uint32_t> actual, std::span<const std::uint32_t> expected, const char* reason,
+    std::span<const std::uint32_t> alternative = {}) {
+    if (actual.size() >= expected.size() && std::equal(expected.begin(), expected.end(), actual.begin())) return;
+    if (!alternative.empty() && actual.size() >= alternative.size() && std::equal(alternative.begin(), alternative.end(), actual.begin())) return;
+    std::ostringstream message;
+    message << reason << " (words:" << std::hex;
+    for (const auto word : actual.first(std::min(actual.size(), std::size_t{32}))) message << " 0x" << word;
+    message << ')';
+    Graphics::Require(false, message.str());
+}
 
 inline std::uint32_t Read(const Registers& registers, std::uint32_t offset, Graphics::RegisterBank bank) {
     Graphics::NoteRegisterRead(bank, offset);
@@ -52,7 +72,7 @@ inline std::span<const std::uint32_t> RegisteredCode(const QueueState& queue, co
     Graphics::Require(snapshot.type == type, "fixed color resolve program has an incompatible shader binary type");
     const auto offset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
     Graphics::Require(words <= snapshot.code.size() - offset, "fixed color resolve registered program is truncated");
-    return std::span(snapshot.code).subspan(offset, words);
+    return std::span(snapshot.code).subspan(offset);
 }
 
 }
@@ -85,9 +105,9 @@ inline void RequireFixedColorResolvePrograms(const QueueState& queue, const Shad
         "fixed color resolve has unsupported alpha-to-coverage or sample masks");
     const auto vertex = RegisteredCode(queue, registry, 0xc8u, 2u, RectangleVertexInstructions.size());
     const auto fragment = RegisteredCode(queue, registry, 0x8u, 1u, ConstantFragmentInstructions.size());
-    Graphics::Require(std::equal(vertex.begin(), vertex.end(), RectangleVertexInstructions.begin()),
-        "fixed color resolve has unsupported vertex instructions or coverage");
-    Graphics::Require(std::equal(fragment.begin(), fragment.end(), ConstantFragmentInstructions.begin()),
+    RequireInstructions(vertex, RectangleVertexInstructions,
+        "fixed color resolve has unsupported vertex instructions or coverage", PackedCountRectangleVertexInstructions);
+    RequireInstructions(fragment, ConstantFragmentInstructions,
         "fixed color resolve has unsupported fragment instructions or effects");
 }
 

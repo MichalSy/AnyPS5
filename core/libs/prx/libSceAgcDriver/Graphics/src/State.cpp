@@ -1022,7 +1022,6 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     APS5_LOG_OUT_DEBUG("Color %u info=0x%x number=%u swap=%u", slot, info, number, swap);
     const auto format = (info >> 2u) & 0x1fu;
     const auto decoded = DecodeColorFormat(format, number, swap);
-    // ROUND_MODE (bit 18) only affects unorm rounding. With DCC_ENABLE (bit 28) the target is written
     if ((info & ~(0x00039f7cu | 0x00040000u | 0x10000000u | 0x00002000u)) != 0) throw std::runtime_error("AGC graphics: color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported (CB_COLOR_INFO 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", info); return std::string(text); }() + ")");
     Require((info & 0x8000u) != 0 || number == 7 || number == 4 || number == 5, "unclamped normalized color is unsupported");
     const auto view = read(cx, 0x31b + stride);
@@ -1043,7 +1042,15 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     color.tileMode = DecodeColorTileMode(attrib3);
     const bool volume = ((attrib3 >> 24u) & 3u) == 2u;
     if (color.samples != VK_SAMPLE_COUNT_1_BIT) {
-        Require(color.tileMode == ColorTileMode::RenderTarget && ((decoded.elementBytes == 4u && (decoded.format == VK_FORMAT_R8G8B8A8_UNORM || decoded.format == VK_FORMAT_B8G8R8A8_UNORM || decoded.format == VK_FORMAT_R8G8B8A8_SRGB || decoded.format == VK_FORMAT_B8G8R8A8_SRGB)) || (decoded.elementBytes == 8u && decoded.format == VK_FORMAT_R16G16B16A16_SFLOAT)), "multisampled color requires SW_64KB_R_X and RGBA8 or RGBA16F elements");
+        if (!(color.tileMode == ColorTileMode::RenderTarget && ((decoded.elementBytes == 4u && (decoded.format == VK_FORMAT_R8G8B8A8_UNORM || decoded.format == VK_FORMAT_B8G8R8A8_UNORM || decoded.format == VK_FORMAT_R8G8B8A8_SRGB || decoded.format == VK_FORMAT_B8G8R8A8_SRGB || decoded.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)) || (decoded.elementBytes == 8u && decoded.format == VK_FORMAT_R16G16B16A16_SFLOAT)))) {
+            std::ostringstream message;
+            message << "AGC graphics: multisampled color requires SW_64KB_R_X and RGBA8, RGBA16F or R11G11B10F elements"
+                << " (slot=" << slot << ", samples=" << (1u << samples) << ", format=" << format << ", number=" << number
+                << ", swap=" << swap << ", elementBytes=" << decoded.elementBytes << ", vkFormat=" << decoded.format
+                << ", CB_COLOR_INFO=0x" << std::hex << info << ", CB_COLOR_ATTRIB=0x" << attrib
+                << ", CB_COLOR_ATTRIB2=0x" << attrib2 << ", CB_COLOR_ATTRIB3=0x" << attrib3 << ", CB_COLOR_VIEW=0x" << view << ')';
+            throw std::runtime_error(message.str());
+        }
         Require(!volume && maxMip == 0u && viewMip == 0u && slice == 0u, "multisampled mipmapped, array or volume color views are unsupported");
         Require((info & 0x10002000u) == 0u, "multisampled DCC or CMASK color metadata is unsupported");
     }
@@ -1146,8 +1153,10 @@ std::optional<ColorResolvePass> DecodeColorResolvePass(const QueueState& queue) 
         const auto stride = slot * 0xfu;
         Require((read(cx, 0x31d + stride) & 0x0001f000u) == (slot == 0u ? (samplesLog2 << 12u) | (samplesLog2 << 15u) : 0u),
             "color resolve requires matching multisampled source samples/fragments and one destination sample/fragment");
-        Require((read(cx, 0x31c + stride) & 0x10006000u) == 0u, "color resolve with compressed, DCC or CMASK color is unsupported");
-        Require((read(cx, 0x31c + stride) & ~0x00009f7cu) == 0u,
+        const auto info = read(cx, 0x31c + stride);
+        const auto rounding = ((info >> 8u) & 7u) == 7u ? 0x00040000u : 0u;
+        Require((info & 0x10006000u) == 0u, "color resolve with compressed, DCC or CMASK color is unsupported");
+        Require((info & ~(0x00009f7cu | rounding)) == 0u,
             "color resolve with nonstandard rounding, optimization or color-control flags is unsupported");
         Require(read(cx, 0x31b + stride) == 0u && (read(cx, 0x3b0 + slot) >> 28u) == 0u &&
             ((read(cx, 0x3b8 + slot) >> 24u) & 3u) == 1u,
@@ -1161,9 +1170,9 @@ std::optional<ColorResolvePass> DecodeColorResolvePass(const QueueState& queue) 
     Require(pass.source.samples != VK_SAMPLE_COUNT_1_BIT && pass.destination.samples == VK_SAMPLE_COUNT_1_BIT,
         "color resolve requires a multisampled source and one destination sample");
     Require((pass.source.format == VK_FORMAT_R8G8B8A8_UNORM || pass.source.format == VK_FORMAT_B8G8R8A8_UNORM || pass.source.format == VK_FORMAT_R8G8B8A8_SRGB ||
-        pass.source.format == VK_FORMAT_B8G8R8A8_SRGB || pass.source.format == VK_FORMAT_R16G16B16A16_SFLOAT) &&
+        pass.source.format == VK_FORMAT_B8G8R8A8_SRGB || pass.source.format == VK_FORMAT_R16G16B16A16_SFLOAT || pass.source.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
         pass.destination.format == pass.source.format && pass.source.componentMapping == 0xe4u && pass.destination.componentMapping == 0xe4u,
-        "color resolve requires matching RGBA8, BGRA8 or RGBA16F formats and identity component mappings");
+        "color resolve requires matching RGBA8, BGRA8, RGBA16F or R11G11B10F formats and identity component mappings");
     Require(pass.source.tileMode == ColorTileMode::RenderTarget && pass.destination.tileMode == ColorTileMode::RenderTarget,
         "color resolve requires SW_64KB_R_X source and destination surfaces");
     Require(pass.source.extent.width == pass.destination.extent.width && pass.source.extent.height == pass.destination.extent.height,
