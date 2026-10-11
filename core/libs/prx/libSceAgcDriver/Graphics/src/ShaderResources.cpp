@@ -819,7 +819,8 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 }
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
-void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
+std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
+    auto texture = it->texture;
     it->texture->SetCached(false);
     noteUncached(it->texture);
     it->texture->Flush();
@@ -830,6 +831,7 @@ void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::i
 #ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
     DebugBridgePublishStorageCache_nid_no_patch(cache.bytes.load(std::memory_order_relaxed), 0);
 #endif
+    return texture;
 }
 
 // Storage images are shared by every descriptor of one surface (address, extent, layers, format, tile
@@ -896,50 +898,55 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
     const auto resource = StorageSurface(context, viewed);
     const StorageKey key{context.device, SurfaceKey(context, resource)};
     auto& cache = StorageTextures();
-    std::lock_guard lock(cache.mutex);
-    if (resource.mipCount > AllocatedLevels(resource)) {
-        auto allocated = resource;
-        allocated.mipCount = AllocatedLevels(resource);
-        if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evictStorage(cache, found);
-    }
-    auto it = findStorage(cache, key);
-    if (it != cache.entries.end() && MetadataMoved(*it->texture, resource)) {
-        evictStorage(cache, it);
-        it = cache.entries.end();
-    }
-    if (it != cache.entries.end()) {
-        it->texture->Refresh();
-        cache.entries.splice(cache.entries.begin(), cache.entries, it);
-        counters.storageHits.fetch_add(1, std::memory_order_relaxed);
-        if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
-        return it->texture;
-    }
-    // Results other images hold over this memory reach it before the new image reads it: a hit's
-    // Refresh flushes them, the constructor's upload does not, and a GPU-direct upload reads the
-    // import buffer without the flush hook. The flush is recorded ahead of the upload in the batch.
-    if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
-    if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
-    CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip)};
-    // The constructor's upload may have recorded into the open batch (a GPU clear, a direct
-    // detile) before the image could keep itself (no weak_from_this yet): the batch keeps it here,
-    // so an eviction or a failed view before it ran cannot destroy a referenced image.
-    // APS5_NO_KEEP_NEW_STORAGE=1 leaves the image to its cache entry alone, as before.
-    static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
-    if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
-    entry.accounted = heldBytes(*entry.texture);
-    const auto budget = storageBudget(context);
-    while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) evictStorage(cache, std::prev(cache.entries.end()));
-    cache.bytes += entry.accounted;
+    std::vector<std::shared_ptr<StorageTexture>> evicted;
+    std::shared_ptr<StorageTexture> texture;
+    {
+        std::lock_guard lock(cache.mutex);
+        if (resource.mipCount > AllocatedLevels(resource)) {
+            auto allocated = resource;
+            allocated.mipCount = AllocatedLevels(resource);
+            if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evicted.push_back(evictStorage(cache, found));
+        }
+        auto it = findStorage(cache, key);
+        if (it != cache.entries.end() && MetadataMoved(*it->texture, resource)) {
+            evicted.push_back(evictStorage(cache, it));
+            it = cache.entries.end();
+        }
+        if (it != cache.entries.end()) {
+            it->texture->Refresh();
+            cache.entries.splice(cache.entries.begin(), cache.entries, it);
+            texture = it->texture;
+            counters.storageHits.fetch_add(1, std::memory_order_relaxed);
+            if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
+        } else {
+            if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+            if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
+            CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip)};
+            static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
+            if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
+            entry.accounted = heldBytes(*entry.texture);
+            const auto budget = storageBudget(context);
+            while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) evicted.push_back(evictStorage(cache, std::prev(cache.entries.end())));
+            cache.bytes += entry.accounted;
 #ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
-    DebugBridgePublishStorageCache_nid_no_patch(cache.bytes.load(std::memory_order_relaxed), budget);
+            DebugBridgePublishStorageCache_nid_no_patch(cache.bytes.load(std::memory_order_relaxed), budget);
 #endif
-    auto texture = entry.texture;
-    cache.entries.push_front(std::move(entry));
-    cache.index[key] = cache.entries.begin();
-    cache.byImage[texture.get()] = cache.entries.begin();
-    texture->SetCached(true);
-    counters.storageCreated.fetch_add(1, std::memory_order_relaxed);
-    if (profile) LookupOutcomes::Add(LookupOutcomes::StorageMade, start);
+            texture = entry.texture;
+            cache.entries.push_front(std::move(entry));
+            cache.index[key] = cache.entries.begin();
+            cache.byImage[texture.get()] = cache.entries.begin();
+            texture->SetCached(true);
+            counters.storageCreated.fetch_add(1, std::memory_order_relaxed);
+            if (profile) LookupOutcomes::Add(LookupOutcomes::StorageMade, start);
+        }
+    }
+    for (const auto& image : evicted) {
+        std::vector<std::shared_ptr<ShaderResources>> resources;
+        SharedResourceCache().RemoveImage(image.get(), &resources);
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) {
+            for (auto& resource : resources) recorder->Keep(std::move(resource));
+        }
+    }
     return texture;
 }
 
@@ -1508,7 +1515,7 @@ void ShaderResources::buildComplete() {
                         write.pImageInfo = images.data() + images.size();
                         for (const auto index : binding.imageAllocations) {
                             if (index == std::numeric_limits<std::size_t>::max()) images.push_back(absentImage(binding.layout.binding));
-                            else images.push_back({VK_NULL_HANDLE, textureFirstLayer[index] ? textures[index]->FirstLayerView() : textures[index]->View(), textures[index]->Layout()});
+                            else images.push_back({VK_NULL_HANDLE, textureBaseLevel[index] ? textures[index]->BaseLevelView() : textureFirstLayer[index] ? textures[index]->FirstLayerView() : textures[index]->View(), textures[index]->Layout()});
                         }
                         Require(binding.imageAllocations.size() == binding.layout.descriptorCount, "descriptor allocations disagree with compact binding");
                         break;
@@ -1683,6 +1690,7 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
         packBits(binding.samplerUnnormalized);
         packBits(binding.samplerIntegerBorder);
         packBits(binding.imageUnnormalized);
+        packBits(binding.imageUnnormalizedBaseLevel);
         // Read-only elements are bound without a write set: an object built for one written set
         // must not serve a build with another (the variant implies it, this makes it explicit).
         packBits(binding.bufferWritten);
@@ -2640,6 +2648,19 @@ void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
     erase(key);
 }
 
+void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    std::lock_guard lock(mutex);
+    for (auto it = entries.begin(); it != entries.end();) {
+        if (!it->second->ReadsImage(image)) {
+            ++it;
+            continue;
+        }
+        if (evicted != nullptr) evicted->push_back(std::move(it->second));
+        index.erase(it->first);
+        it = entries.erase(it);
+    }
+}
+
 bool ResourceCache::Touch(const Key& key) {
     resourceCacheTouches.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(mutex);
@@ -3284,10 +3305,14 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
             }
             if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare);
+            bool baseLevel = false;
             if (element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) {
                 const auto range = texture->SampledViewRange(firstLayer);
-                const bool singleLevel = range.levels == 1u && range.layers == 1u && resource.baseLevel == 0u && EffectiveMinLod(resource) == 0.0f;
-                if (!singleLevel || (range.type != VK_IMAGE_VIEW_TYPE_1D && range.type != VK_IMAGE_VIEW_TYPE_2D)) throw std::runtime_error("AGC graphics: guest texture sampled with unnormalized coordinates is not a single-level, single-layer 1D or 2D view starting at mip 0, which is not implemented (base level " + std::to_string(resource.baseLevel) + ", levels " + std::to_string(range.levels) + ", layers " + std::to_string(range.layers) + ", view type " + std::to_string(static_cast<int>(range.type)) + ")");
+                const bool exactAtBase = element < binding.imageUnnormalizedBaseLevel.size() && binding.imageUnnormalizedBaseLevel[element];
+                const bool singleLevel = range.levels == 1u && resource.baseLevel == 0u;
+                const bool supported = range.layers == 1u && EffectiveMinLod(resource) == 0.0f && (singleLevel || exactAtBase);
+                if (!supported || (range.type != VK_IMAGE_VIEW_TYPE_1D && range.type != VK_IMAGE_VIEW_TYPE_2D)) throw std::runtime_error("AGC graphics: guest texture sampled with unnormalized coordinates is not a single-layer 1D or 2D view without a minimum LOD clamp, and is neither a single-level view at mip 0 nor read only by image_sample_lz through an S# without minimum LOD or bias, which is not implemented (base level " + std::to_string(resource.baseLevel) + ", levels " + std::to_string(range.levels) + ", layers " + std::to_string(range.layers) + ", view type " + std::to_string(static_cast<int>(range.type)) + ")");
+                baseLevel = range.levels > 1u;
             }
             RequireFilterMinmax(context, texture->ViewFormat(), binding.imageSamplers[element], shaderSamplers);
             RequireBorderSwizzle(resource.bcSwizzle, binding.imageSamplers[element], shaderSamplers);
@@ -3307,6 +3332,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             }
             textures.push_back(std::move(texture));
             textureFirstLayer.push_back(firstLayer);
+            textureBaseLevel.push_back(baseLevel);
             describedRanges.push_back({"texture", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress});
             item.imageAllocations.push_back(textures.size() - 1);
         }

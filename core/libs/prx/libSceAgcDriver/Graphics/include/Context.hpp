@@ -166,6 +166,7 @@ struct Context {
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
     bool graphicsPipelineLibrary = false;
+    bool pipelineLinkTimeOptimization = true;
     std::uint32_t srgbDecodeFormats = 0;
     bool shaderStorageImageMultisample = false;
     bool sampleLocations = false;

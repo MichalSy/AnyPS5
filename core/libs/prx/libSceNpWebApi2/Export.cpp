@@ -113,9 +113,11 @@ int APS5_VABI sceNpWebApi2PushEventCreateHandle(int lib_ctx_id) {
     return g_nextHandle.fetch_add(1, std::memory_order_relaxed);
 }
 
-int APS5_VABI sceNpWebApi2PushEventAbortHandle(int handleId) {
+int APS5_VABI sceNpWebApi2PushEventAbortHandle(int libCtxId, int handleId) {
+    (void)libCtxId;
     (void)handleId;
-    return SCE_NP_WEBAPI2_ERROR_UNAVAILABLE;
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
 }
 
 int APS5_VABI sceNpWebApi2PushEventDeleteHandle(int lib_ctx_id, int handle_id) {

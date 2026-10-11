@@ -453,6 +453,7 @@ private:
     std::uint64_t dispatchThreads = 0;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
+    std::vector<bool> textureBaseLevel;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
     std::vector<std::uint32_t> storageMips;
     std::vector<TextureDimension> storageDimensions;
@@ -557,6 +558,7 @@ public:
     // With `object`, erases the entry only while it still holds that object (a replacement made
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
+    void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);

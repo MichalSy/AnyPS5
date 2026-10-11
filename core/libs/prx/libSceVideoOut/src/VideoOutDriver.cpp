@@ -32,6 +32,9 @@
 
 namespace {
 
+constexpr std::uint64_t FLIP_ROOM_WAIT_MICROS = 60000000;
+constexpr std::uint64_t PRESENT_POLL_MICROS = 10000;
+
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("VideoOut: ") + reason);
 }
@@ -122,7 +125,7 @@ public:
 
     void WaitForFlipRoom() override {
         std::unique_lock queueLock(queue->mutex);
-        const bool room = queue->changed.wait_for(queueLock, std::chrono::seconds(60), [&] {
+        const bool room = queue->changed.WaitUntil(queueLock, TimedWait::DeadlineNanos(FLIP_ROOM_WAIT_MICROS), [&] {
             return queue->failure || queue->stopping || cfg->shutdownToken.stop_requested() || queue->reservations.load() < VIDEO_OUT_FLIP_QUEUE_CAPACITY;
         });
         if (queue->failure) std::rethrow_exception(queue->failure);
@@ -167,7 +170,7 @@ public:
             if (!cfg->failure) cfg->failure = error;
             cfg->vblankCond.notify_all();
         }
-        queue->changed.notify_all();
+        queue->changed.NotifyAll();
     }
 
 private:
@@ -200,7 +203,7 @@ void FlipRequest::Cancel() noexcept {
         std::lock_guard lock(cfg->mutex);
         ReleaseLocked();
     }
-    queue->changed.notify_all();
+    queue->changed.NotifyAll();
 }
 
 void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameTiming) {
@@ -225,7 +228,7 @@ void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameT
         queue->requests.push_back(shared_from_this());
         ready = true;
     }
-    queue->changed.notify_all();
+    queue->changed.NotifyAll();
     // The worker is done once the request is queued: hardware does not stall the command processor
     // on a flip, and the title observes completion through flipPendingNum, which processFlip drops
     // once the frame's GPU work and its presentation have completed (see Driver::Present). A
@@ -244,7 +247,7 @@ void FlipRequest::Fail(std::exception_ptr error) noexcept {
     std::lock_guard lock(cfg->mutex);
     if (!cfg->failure) cfg->failure = error;
     ReleaseLocked();
-    queue->changed.notify_all();
+    queue->changed.NotifyAll();
 }
 
 VideoOutDriver& VideoOutDriver::Get() {
@@ -279,12 +282,12 @@ VideoOutDriver::VideoOutDriver() {
     } catch (...) {
         if (vblankThread.joinable()) {
             vblankThread.request_stop();
-            flipQueue->changed.notify_all();
+            flipQueue->changed.NotifyAll();
             vblankThread.join();
         }
         if (presentThread.joinable()) {
             presentThread.request_stop();
-            flipQueue->changed.notify_all();
+            flipQueue->changed.NotifyAll();
             presentThread.join();
         }
         SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER);
@@ -307,7 +310,7 @@ void VideoOutDriver::Shutdown() {
     }
     presentThread.request_stop();
     vblankThread.request_stop();
-    flipQueue->changed.notify_all();
+    flipQueue->changed.NotifyAll();
     presentThread.join();
     vblankThread.join();
     {
@@ -383,7 +386,7 @@ bool VideoOutDriver::close(int handle) {
     cfg->outputModeEvents.clear();
     cfg->vrrStatusEvents.clear();
     cfg->vblankCond.notify_all();
-    flipQueue->changed.notify_all();
+    flipQueue->changed.NotifyAll();
     return true;
 }
 
@@ -577,7 +580,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
-                flipQueue->changed.wait_for(lock, std::chrono::milliseconds(10), [&] { return token.stop_requested() || flipQueue->failure || !flipQueue->requests.empty(); });
+                flipQueue->changed.WaitUntil(lock, TimedWait::DeadlineNanos(PRESENT_POLL_MICROS), [&] { return token.stop_requested() || flipQueue->failure || !flipQueue->requests.empty(); });
                 if (flipQueue->failure) std::rethrow_exception(flipQueue->failure);
                 if (token.stop_requested()) break;
                 if (!flipQueue->requests.empty()) {
@@ -627,7 +630,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
             }
             if (current) {
                 current.reset();
-                flipQueue->changed.notify_all();
+                flipQueue->changed.NotifyAll();
             }
         }
     } catch (const ProcessShutdown&) {

@@ -224,6 +224,7 @@ int APS5_VABI sceKernelStat(const char* path, FileStat* sb) {
     if (sb == nullptr) {
         throw std::invalid_argument(std::string(__func__) + ": sb is null");
     }
+    if (*path == '\0') return SceErrorFromErrno(2);
     std::filesystem::path native;
     try {
         native = ResolvePath_nid_no_patch(path);
@@ -247,6 +248,7 @@ int APS5_VABI sceKernelUnlink(const char* path) {
     if (path == nullptr) {
         throw std::invalid_argument(std::string(__func__) + ": path is null");
     }
+    if (*path == '\0') return SceErrorFromErrno(2);
     auto native = ResolvePath_nid_no_patch(path);
     constexpr int GuestEperm = 1;
     std::error_code error;

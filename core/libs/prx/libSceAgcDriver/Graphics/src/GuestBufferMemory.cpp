@@ -160,6 +160,8 @@ struct HostImports {
     VkDevice watchDevice = VK_NULL_HANDLE;
     bool unwatchImports = false;
     bool unwatchDmaBufImports = false;
+    // Whether making an import of each kind was seen to stamp the imported pages (the probe's
+    // writtenAtImport): its import window then stamps a range the import leaves watched.
     bool importsStampPages = true;
     bool dmaBufImportsStampPages = true;
 };
@@ -499,6 +501,7 @@ void decideImportWatch(const Context& context, HostImports& state) {
     state.dmaBufImportsStampPages = false;
     if (context.hostImportAlignment == 0 || !GuestMemory::WriteWatched()) return;
     if (request == ImportWatchRequest::Watch) {
+        // Not probed: whether an import stamps its pages is unknown.
         state.importsStampPages = true;
         state.dmaBufImportsStampPages = true;
         std::fprintf(stderr, "[write-watch] host imports stay watched (APS5_WRITE_WATCH_IMPORTS=watch)\n");
@@ -571,13 +574,28 @@ std::size_t leasedIndexContaining(const GuestAllocations::Lease& lease, std::uin
     return range.readable && address < range.address + range.bytes ? index : lease.size();
 }
 
+std::atomic<std::uint64_t> importWindow{0};
+
 ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address) {
     const auto index = leasedIndexContaining(lease, address);
     if (index == lease.size()) return {};
+    const auto& containing = *lease[index];
+    std::uint64_t low = 0;
+    std::uint64_t high = std::numeric_limits<std::uint64_t>::max();
+    const auto window = importWindow.load(std::memory_order_relaxed);
+    if (window != 0) {
+        low = address / window * window;
+        high = low + window;
+        if (containing.address < low || containing.address + containing.bytes > high) {
+            low = containing.address;
+            high = containing.address + containing.bytes;
+        }
+    }
     auto first = index;
-    while (first > 0 && continuesRun(*lease[first - 1], *lease[first])) --first;
+    while (first > 0 && lease[first - 1]->address >= low && continuesRun(*lease[first - 1], *lease[first])) --first;
     auto last = index;
-    while (last + 1 < lease.size() && continuesRun(*lease[last], *lease[last + 1])) ++last;
+    while (last + 1 < lease.size() && lease[last + 1]->address + lease[last + 1]->bytes <= high && continuesRun(*lease[last], *lease[last + 1])) ++last;
+    if (window != 0 && (lease[first]->address != low || lease[last]->address + lease[last]->bytes != high)) first = last = index;
     if (first != last && Imports().unaliasedSpans.contains(lease[first]->address)) return {lease[index]->address, lease[index]->bytes, {lease[index]}};
     ImportRun run{lease[first]->address, lease[last]->address + lease[last]->bytes - lease[first]->address, {}};
     run.ranges.assign(lease.begin() + static_cast<std::ptrdiff_t>(first), lease.begin() + static_cast<std::ptrdiff_t>(last) + 1);
@@ -1970,6 +1988,10 @@ void SetImportWatch(const Context& context, ImportWatch watch) {
     state.watchDevice = context.device;
     state.unwatchImports = watch == ImportWatch::Unwatch;
     state.unwatchDmaBufImports = state.unwatchImports;
+}
+
+void SetHostImportWindow(std::uint64_t bytes) {
+    importWindow.store(bytes, std::memory_order_relaxed);
 }
 
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {

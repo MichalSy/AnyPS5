@@ -67,6 +67,7 @@ public:
     int Close();
     void Lock();
     void Unlock();
+    void SyncUnlockedStatus();
 };
 static_assert(std::is_standard_layout_v<FileStream>);
 

@@ -396,7 +396,10 @@ int APS5_VABI pthread_sigmask_nid_postfix(int how, const GuestSignalSet* set, Gu
 }
 GuestHandler APS5_VABI signal_nid_postfix(int guest, GuestHandler handler) {
     const auto invalid = reinterpret_cast<GuestHandler>(static_cast<std::uintptr_t>(-1));
-    if (!NativeSignal(guest) || handler == invalid) { Fail(guestInvalid); return invalid; }
+    if (!ValidSetSignal(guest) || handler == invalid || ((guest == 9 || guest == 17) && handler != nullptr)) {
+        Fail(guestInvalid);
+        return invalid;
+    }
 #ifdef _WIN32
     std::lock_guard lock(registration);
     const GuestSignalAction action{handler, guestRestart, {}};
@@ -405,6 +408,8 @@ GuestHandler APS5_VABI signal_nid_postfix(int guest, GuestHandler handler) {
     dispositions[guest] = action;
     return previous;
 #else
+    if (!NativeSignal(guest)) { Fail(guestInvalid); return invalid; }
+    if (guest == 9 || guest == 17) return nullptr;
     const GuestSignalAction action{handler, guestRestart, {}};
     GuestSignalAction previous{};
     if (sigaction_nid_postfix(guest, &action, &previous)) return invalid;
@@ -440,6 +445,13 @@ int APS5_VABI pthread_kill_nid_postfix(Pthread thread, int guest) {
     const int result = raise_nid_postfix(guest) == 0 ? 0 : *__error_nid_postfix();
     *__error_nid_postfix() = savedError;
     return result;
+}
+int APS5_VABI sigtimedwait_nid_postfix(const GuestSignalSet* set, void* info, const void* timeout) {
+    (void)set;
+    (void)info;
+    (void)timeout;
+    NotImplemented_nid_no_patch("sigtimedwait: waiting for a pending signal");
+    return -1;
 }
 int APS5_VABI sigaltstack_nid_postfix(const GuestStack* stack, GuestStack* previous) {
     GuestStack replacement = alternateStack;

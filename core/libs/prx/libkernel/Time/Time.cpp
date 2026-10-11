@@ -82,6 +82,8 @@ static std::uint64_t GetStartNanos() {
     return start;
 }
 
+static const std::uint64_t g_processStart = GetStartNanos();
+
 #ifdef _WIN32
 // Every relative wait in the process (winpthreads nanosleep, std::condition_variable::wait_for, the
 // GPU driver's poll sleeps) rounds up to the scheduler tick, 15.6 ms by default; a console game and
