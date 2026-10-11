@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -12,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -817,7 +819,7 @@ private:
 
 // Storage images whose results have not reached guest memory yet.
 struct PendingWrites {
-    std::mutex mutex;
+    SlimMutex mutex;
     PendingList textures;
     // Images taken out of `textures` by a FlushPending still storing them (see adjacentPendingUnchanged).
     std::vector<StorageTexture*> flushing;
@@ -1394,6 +1396,22 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+namespace {
+
+bool targetProofMemo() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_TARGET_PROOF_MEMO"); return text == nullptr || std::strcmp(text, "0") != 0; }();
+    return enabled;
+}
+
+std::atomic<std::uint64_t> targetProofHits{0};
+std::atomic<std::uint64_t> targetProofMisses{0};
+
+}
+
+std::pair<std::uint64_t, std::uint64_t> StorageTexture::TargetProofCounts() {
+    return {targetProofHits.load(std::memory_order_relaxed), targetProofMisses.load(std::memory_order_relaxed)};
+}
+
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1738,20 +1756,30 @@ bool StorageTexture::refreshProved() {
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
         if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return false;
-        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
-    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
     const auto serial = PendingSerial();
+    if (targetProofMemo() && epoch != 0 && epoch == refreshProof.epoch && serial == refreshProof.pendingSerial && GuestMemory::UnwatchSerial() == refreshProof.unwatched && GuestAllocations::GuestAllocationsGeneration_nid_postfix() == refreshProof.registryGeneration && GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) {
+        targetProofHits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    if (targetProofMemo()) targetProofMisses.fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < used; ++i) {
+        if (GuestMemory::CollectWrites(queries[i].address, queries[i].bytes) == 0) return false;
+    }
+    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
     if (serial != refreshProof.pendingSerial) {
         if (otherPendingOverlaps()) return false;
         refreshProof.pendingSerial = serial;
     }
+    refreshProof.epoch = epoch;
+    refreshProof.unwatched = GuestMemory::UnwatchSerial();
+    refreshProof.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     return true;
 }
 
@@ -1761,7 +1789,7 @@ void StorageTexture::takeRefreshProof(bool aliased) {
     if (descriptor.dccAddress != 0 && (keyProof.generation == 0 || keyProof.keys != uploadedKeys)) return;
     const auto serial = PendingSerial();
     if (otherPendingOverlaps()) return;
-    refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
+    refreshProof = {generation, serial, keyProof.generation, uploadedKeys, GuestMemory::ThreadCollectEpoch(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {

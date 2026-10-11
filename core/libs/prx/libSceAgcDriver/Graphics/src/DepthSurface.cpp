@@ -54,14 +54,15 @@ public:
         const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
         const auto usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
             (target.samples == VK_SAMPLE_COUNT_1_BIT ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
-        Require(target.samples == VK_SAMPLE_COUNT_1_BIT || target.samples == VK_SAMPLE_COUNT_8_BIT, "depth sample count other than one or eight is unsupported");
+        Require(target.samples == VK_SAMPLE_COUNT_1_BIT || target.samples == VK_SAMPLE_COUNT_2_BIT || target.samples == VK_SAMPLE_COUNT_4_BIT || target.samples == VK_SAMPLE_COUNT_8_BIT, "depth sample count greater than eight is unsupported");
         Require(target.samples == VK_SAMPLE_COUNT_1_BIT || target.mipCount == 1u, "multisampled depth mip chains are unsupported");
         Require((context.limits.framebufferDepthSampleCounts & target.samples) != 0, "depth sample count exceeds framebuffer capabilities");
         Require(target.stencilAddress == 0 || (context.limits.framebufferStencilSampleCounts & target.samples) != 0, "stencil sample count exceeds framebuffer capabilities");
-        if (target.samples != VK_SAMPLE_COUNT_1_BIT) {
+        if (!target.sampleLocations.empty()) {
+            Require(target.samples != VK_SAMPLE_COUNT_1_BIT, "custom single-sample depth locations are unsupported");
             Require(context.sampleLocations && (context.sampleLocationProperties.sampleLocationSampleCounts & target.samples) != 0, "custom depth sample locations are unsupported on this device");
             const auto& grid = context.sampleLocationGridSizes[std::countr_zero(static_cast<std::uint32_t>(target.samples))];
-            Require(target.sampleLocationsGrid.width == 1u && target.sampleLocationsGrid.height == 1u && grid.width >= 1u && grid.height >= 1u && target.sampleLocations.size() == 8u, "custom depth sample location grid is unsupported");
+            Require(target.sampleLocationsGrid.width == 1u && target.sampleLocationsGrid.height == 1u && grid.width >= 1u && grid.height >= 1u && target.sampleLocations.size() == static_cast<std::uint32_t>(target.samples), "custom depth sample location grid is unsupported");
             Require(context.sampleLocationProperties.sampleLocationSubPixelBits >= 4u, "depth sample locations require four subpixel bits");
             const auto scale = std::ldexp(1.0f, static_cast<int>(std::min(context.sampleLocationProperties.sampleLocationSubPixelBits, 23u)));
             for (const auto& location : target.sampleLocations) {
@@ -70,7 +71,7 @@ public:
                 Require(location.x >= context.sampleLocationProperties.sampleLocationCoordinateRange[0] && location.x <= context.sampleLocationProperties.sampleLocationCoordinateRange[1] &&
                     location.y >= context.sampleLocationProperties.sampleLocationCoordinateRange[0] && location.y <= context.sampleLocationProperties.sampleLocationCoordinateRange[1], "depth sample location exceeds device coordinates");
             }
-        } else Require(target.sampleLocations.empty(), "custom single-sample depth locations are unsupported");
+        }
         VkImageFormatProperties supported{};
         Check(context.imageFormatProperties(context.physical, target.format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage,
             target.sampleLocations.empty() ? 0u : VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT, &supported), "vkGetPhysicalDeviceImageFormatProperties depth");

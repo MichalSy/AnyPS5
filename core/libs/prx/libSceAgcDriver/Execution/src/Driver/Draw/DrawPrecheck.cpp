@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ColorResolveGuard.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
@@ -15,6 +16,7 @@ bool Driver::drawPrecheck() {
 std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
     if (const auto pass = Graphics::DecodeColorResolvePass(queue)) {
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         require(submission.shaders != nullptr, "fixed color resolve has no registered shader snapshots");
@@ -26,6 +28,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         return DrawVerdict::Drawn;
     }
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture);
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());

@@ -27,6 +27,11 @@ class Recorder;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
+struct LookupMemoCounts {
+    std::uint64_t hits;
+    std::uint64_t misses;
+};
+LookupMemoCounts LookupMemoCounters();
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes);
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport);
@@ -77,6 +82,8 @@ public:
     };
     SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false);
     void Free(const SetAllocation& allocation) noexcept;
+    SetAllocation AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false);
+    void Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
     struct Stats {
         std::uint64_t layoutHits = 0;
@@ -89,6 +96,7 @@ public:
     std::shared_ptr<const BindingPlan> Plan(std::span<const CompiledShader> shaders, std::uint32_t colorAttachments = 0) { return plans.Get(shaders, colorAttachments); }
 
 private:
+    void freeLocked(const SetAllocation& allocation) noexcept;
     Context context;
     PFN_vkDestroyDescriptorSetLayout destroyLayout;
     PFN_vkDestroyDescriptorPool destroyPool;
@@ -98,6 +106,7 @@ private:
     std::vector<VkDescriptorPool> pools;
     std::vector<VkDescriptorPool> updateAfterBindPools;
     std::vector<VkDescriptorPool> dedicated;
+    std::unordered_map<VkDescriptorSetLayout, std::vector<SetAllocation>> recycled;
     Stats stats;
     BindingPlanCache plans;
 };
@@ -127,8 +136,12 @@ public:
         struct Snapshot {
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
+            VkDeviceSize offset = 0;
+            std::size_t bytes = 0;
+            std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
         };
         DescriptorCache* cache = nullptr;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
         ~DrawBindings();
@@ -152,6 +165,7 @@ public:
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
+    bool UsesAddressTable() const { return usesBda; }
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     // Whether a region the recorded work reads in place through a host import overlaps the range.
@@ -191,6 +205,8 @@ public:
     bool Reusable() const { return reusable; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
+    bool ChecksFaults() const { return bda != nullptr; }
+    void CheckFaults() const;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
@@ -465,6 +481,22 @@ private:
     std::uint64_t pendingSerialSeen = 0;
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
+    struct RangeStamp {
+        std::uint64_t address;
+        std::size_t bytes;
+        std::uint64_t generation;
+    };
+    struct LookupMemo {
+        std::uint64_t epoch = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t registryGeneration = 0;
+        std::vector<RangeStamp> stamps;
+        std::vector<const StorageTexture*> images;
+        bool keysKept = true;
+    };
+    LookupMemo lookupMemo;
+    bool lookupMemoHolds(std::uint64_t serialBefore);
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
     void rehashDataWords();

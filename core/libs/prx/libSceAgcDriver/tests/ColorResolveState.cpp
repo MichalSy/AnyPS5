@@ -17,7 +17,7 @@ using namespace AgcDriver::Graphics;
 constexpr std::uint32_t Width = 37u;
 constexpr std::uint32_t Height = 69u;
 const auto sourceStorage = MakeAlignedByteArray<262144, 65536>();
-const auto destinationStorage = MakeAlignedByteArray<65536, 65536>();
+const auto destinationStorage = MakeAlignedByteArray<131072, 65536>();
 auto& sourceMemory = *sourceStorage;
 auto& destinationMemory = *destinationStorage;
 
@@ -107,7 +107,7 @@ void fields(const ColorResolvePass& pass) {
     Require(pass.source.samples == VK_SAMPLE_COUNT_8_BIT && pass.destination.samples == VK_SAMPLE_COUNT_1_BIT, "resolve sample counts changed");
     Require(pass.source.format == VK_FORMAT_B8G8R8A8_UNORM && pass.destination.format == pass.source.format, "captured resolve BGRA format changed");
     Require(pass.source.address == reinterpret_cast<std::uintptr_t>(sourceMemory.data()) && pass.destination.address == reinterpret_cast<std::uintptr_t>(destinationMemory.data()), "resolve source and destination addresses changed");
-    Require(pass.source.bytes == sourceMemory.size() && pass.destination.bytes == destinationMemory.size(), "resolve guest layouts were multiplied or interchanged");
+    Require(pass.source.bytes == sourceMemory.size() && pass.destination.bytes == 65536u, "resolve guest layouts were multiplied or interchanged");
     Require(pass.source.componentMapping == 0xe4u && pass.destination.componentMapping == 0xe4u, "resolve component mappings changed");
     Require(pass.source.extent.width == Width && pass.source.extent.height == Height && pass.destination.extent.width == Width && pass.destination.extent.height == Height, "resolve surface extents changed");
 }
@@ -142,11 +142,26 @@ void RunColorResolveStateTests() {
     fields(*disabledRasterizer);
     Require(disabledRasterizer->region.extent.width == Width && disabledRasterizer->region.extent.height == Height, "rasterizer sample count changed the resolve region");
     for (const auto read : reads) Require(DrawKeyCovers(read), "single-sample rasterizer resolve reads an unkeyed register");
+    for (const auto sampleLog : {1u, 2u}) {
+        auto smaller = queue;
+        smaller.context[0x31d] = (sampleLog << 12u) | (sampleLog << 15u);
+        smaller.context[0x201] = 0x100000u | sampleLog | (sampleLog << 4u) | (sampleLog << 12u);
+        const auto pass = DecodeColorResolvePass(smaller);
+        Require(pass && pass->source.samples == static_cast<VkSampleCountFlagBits>(1u << sampleLog), "two or four-sample source resolve was rejected with single-sample rasterization");
+        smaller.context[0x2f8] = captured.context.at(0x2f8);
+        rejects(smaller, "matching source coverage");
+    }
+    auto wide = queue;
+    wide.context[0x31d] = 0x12000u;
+    wide.context[0x201] = 0x102022u;
+    wide.context[0x31c] = wide.context[0x32b] = 0x0730u;
+    const auto widePass = DecodeColorResolvePass(wide);
+    Require(widePass && widePass->source.format == VK_FORMAT_R16G16B16A16_SFLOAT && widePass->source.elementBytes == 8u && widePass->source.bytes == 3u * 65536u && widePass->destination.bytes == 2u * 65536u, "four-sample half-float resolve layouts changed");
     queue.context[0x31d] = 0u;
-    rejects(queue, "eight source samples/fragments");
+    rejects(queue, "matching multisampled source samples/fragments");
     queue = captured;
     queue.context[0x2f8] = 0x01000000u;
-    rejects(queue, "matching eight coverage");
+    rejects(queue, "matching source coverage");
     queue = captured;
     queue.context[0x090] = (9u << 16u) | 5u;
     queue.context[0x091] = (21u << 16u) | 19u;
@@ -180,12 +195,12 @@ void RunColorResolveStateTests() {
     queue = captured; queue.context[0x000] |= 2u; rejects(queue,"depth or stencil");
     queue = captured; queue.context[0x292] = 1u; rejects(queue,"disabled MSAA");
     queue = captured; queue.context[0x293] |= 0x10000u; rejects(queue,"sample iteration");
-    queue = captured; queue.context[0x2f8] = 0x20e003u; rejects(queue,"matching eight coverage");
+    queue = captured; queue.context[0x2f8] = 0x20e003u; rejects(queue,"matching source coverage");
     for (const auto eqaa : {0x103032u,0x113033u,0x003033u,0x104033u}) {
         queue = captured; queue.context[0x201] = eqaa; rejects(queue,"EQAA");
     }
-    queue = captured; queue.context[0x31d] = 0u; rejects(queue,"eight source samples/fragments");
-    queue = captured; queue.context[0x31d] = 0x13000u; rejects(queue,"eight source samples/fragments");
+    queue = captured; queue.context[0x31d] = 0u; rejects(queue,"matching multisampled source samples/fragments");
+    queue = captured; queue.context[0x31d] = 0x13000u; rejects(queue,"matching multisampled source samples/fragments");
     queue = captured; queue.context[0x32c] = 0x1b000u; rejects(queue,"one destination sample/fragment");
     for (const auto bit : {0x10000000u,0x4000u,0x2000u}) {
         for (const auto offset : {0x31cu,0x32bu}) {
@@ -196,8 +211,9 @@ void RunColorResolveStateTests() {
         queue = captured; queue.context[offset] = 1u; rejects(queue,"CMASK, FMASK or DCC addresses");
     }
     queue = captured; queue.context[0x31c] |= 0x40000u; rejects(queue,"nonstandard rounding");
-    queue = captured; queue.context[0x32b] = 0x8028u; rejects(queue,"matching RGBA8 or BGRA8");
-    queue = captured; queue.context[0x31c] = queue.context[0x32b] = 0x8e28u; rejects(queue,"matching RGBA8 or BGRA8");
+    queue = captured; queue.context[0x32b] = 0x8028u; rejects(queue,"matching RGBA8, BGRA8 or RGBA16F");
+    queue = captured; queue.context[0x31c] = queue.context[0x32b] = 0x8e28u;
+    Require(DecodeColorResolvePass(queue)->source.format == VK_FORMAT_B8G8R8A8_SRGB, "matching sRGB resolve was rejected");
     queue = captured; queue.context[0x31b] = 1u; rejects(queue,"mipmapped, array or volume");
     queue = captured; queue.context[0x3b1] |= 1u << 28u; rejects(queue,"mipmapped, array or volume");
     queue = captured; queue.context[0x3b9] = 0x0ac6c000u; rejects(queue,"mipmapped, array or volume");

@@ -617,9 +617,11 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         const std::array<CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::TessellationControl, &control, 0}}};
         const std::array<GuestMemorySnapshot, 1> unusedSnapshots{{{0, source}}};
         ShaderResources resources(disabled, stages, ColorTarget{}, 0, 0, 0, unusedSnapshots);
-        Require(ShaderResources::NeverReusable(stages) && !resources.Reusable(), "a fault-buffer build is reusable");
+        Require(!ShaderResources::NeverReusable(stages), "a fault-buffer build is refused the resource cache");
+        Require(!resources.Reusable(), "a fault-buffer build with copied writes is reusable");
+        Require(resources.NeedsCompletion() && !resources.UsesAddressTable(), "a fault-buffer build reaches guest memory through the BDA table");
         const auto fault = access.bytes(access.descriptor(5).buffer);
-        for (const auto byte : fault) Require(byte == std::byte{}, "rect-list fault buffer was not initialized");
+        for (const auto byte : fault.first(ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t))) Require(byte == std::byte{}, "rect-list fault buffer was not initialized");
         const ShaderRecompiler::BdaAbi::Fault report{ShaderRecompiler::BdaAbi::FaultState::Ready, ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle, 0, 0, 0, 0, 0};
         std::memcpy(fault.data(), &report, sizeof(report));
         reject([&] { resources.WriteBack(); }, "rect-list requires");
@@ -630,8 +632,22 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         Require(guest[1] == changed, "rect-list fault-only path lost guest buffer writes");
     }
     {
+        ShaderRecompiler::RecompileResult control;
+        control.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+        control.bindings = {binding(Role::FaultBuffer, 5)};
+        const std::array<CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::TessellationControl, &control, 0}}};
+        ShaderResources resources(disabled, stages, ColorTarget{}, 0, 0, 0, {});
+        Require(!ShaderResources::NeverReusable(stages) && resources.Reusable() && resources.ChecksFaults(), "a fault-only build is not reusable");
+        resources.CheckFaults();
+        const auto fault = access.bytes(access.descriptor(5).buffer);
+        const ShaderRecompiler::BdaAbi::Fault report{ShaderRecompiler::BdaAbi::FaultState::Ready, ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle, 0, 0, 0, 0, 0};
+        std::memcpy(fault.data(), &report, sizeof(report));
+        reject([&] { resources.CheckFaults(); }, "rect-list requires");
+    }
+    {
         ShaderResources resources(context, compiled, snapshots);
         Require(ShaderResources::NeverReusable(std::span<const CompiledShader>(&compiled, 1)) && !resources.Reusable(), "an address-based build is reusable");
+        Require(resources.UsesAddressTable(), "an address-based build does not use the BDA table");
         ShaderRecompiler::RecompileResult plain;
         plain.bindings = {binding(Role::GuestBuffers, 6)};
         const CompiledShader plainStage{ShaderRecompiler::ShaderStage::Compute, &plain, 0};
@@ -644,7 +660,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         std::memcpy(&range, table.data() + sizeof(header), sizeof(range));
         Require(range.begin == snapshots[0].address && range.end == range.begin + source.size(), "64-bit guest address was truncated");
         const auto fault = access.bytes(access.descriptor(5).buffer);
-        for (const auto byte : fault) Require(byte == std::byte{}, "fault buffer was not initialized");
+        for (const auto byte : fault.first(ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t))) Require(byte == std::byte{}, "fault buffer was not initialized");
         const ShaderRecompiler::BdaAbi::Fault denied{ShaderRecompiler::BdaAbi::FaultState::Ready, ShaderRecompiler::BdaAbi::FaultReason::Permission, snapshots[0].address + 4, 4, 0, 0x88, 0};
         std::memcpy(fault.data(), &denied, sizeof(denied));
         reject([&] { resources.WriteBack(); }, "read-only in the BDA table");

@@ -58,17 +58,30 @@ add_custom_command(
 )
 
 set(agcMultisampleColorShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/MultisampleColorTransfer.comp)
-set(agcMultisampleColorShaderSpv ${agcTextureDetileGeneratedDir}/MultisampleColorTransfer.spv)
-set(agcMultisampleColorShaderHeader ${agcTextureDetileGeneratedDir}/MultisampleColorTransfer_spv.h)
-add_custom_command(
-        OUTPUT "${agcMultisampleColorShaderHeader}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
-        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcMultisampleColorShaderSpv}" "${agcMultisampleColorShaderSource}"
-        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcMultisampleColorShaderSpv} -DOUTPUT=${agcMultisampleColorShaderHeader}
-        -DSYMBOL=MULTISAMPLE_COLOR_TRANSFER_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
-        DEPENDS "${agcMultisampleColorShaderSource}" glslang-standalone
-        VERBATIM
-)
+set(agcMultisampleColorShaderHeaders)
+foreach(agcMultisampleColorBits IN ITEMS 32 64)
+    if(agcMultisampleColorBits EQUAL 64)
+        set(agcMultisampleColorVariant Wide)
+        set(agcMultisampleColorWide 1)
+        set(agcMultisampleColorSymbol MULTISAMPLE_COLOR_TRANSFER_WIDE_SPV)
+    else()
+        set(agcMultisampleColorVariant "")
+        set(agcMultisampleColorWide 0)
+        set(agcMultisampleColorSymbol MULTISAMPLE_COLOR_TRANSFER_SPV)
+    endif()
+    set(agcMultisampleColorShaderSpv ${agcTextureDetileGeneratedDir}/MultisampleColorTransfer${agcMultisampleColorVariant}.spv)
+    set(agcMultisampleColorShaderHeader ${agcTextureDetileGeneratedDir}/MultisampleColorTransfer${agcMultisampleColorVariant}_spv.h)
+    list(APPEND agcMultisampleColorShaderHeaders ${agcMultisampleColorShaderHeader})
+    add_custom_command(
+            OUTPUT "${agcMultisampleColorShaderHeader}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+            COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -DWIDE_TEXEL=${agcMultisampleColorWide} -o "${agcMultisampleColorShaderSpv}" "${agcMultisampleColorShaderSource}"
+            COMMAND ${CMAKE_COMMAND} -DINPUT=${agcMultisampleColorShaderSpv} -DOUTPUT=${agcMultisampleColorShaderHeader}
+            -DSYMBOL=${agcMultisampleColorSymbol} -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+            DEPENDS "${agcMultisampleColorShaderSource}" glslang-standalone
+            VERBATIM
+    )
+endforeach()
 
 set(agcMeshArgumentsShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/MeshArguments.comp)
 set(agcMeshArgumentsShaderSpv ${agcTextureDetileGeneratedDir}/MeshArguments.spv)
@@ -144,6 +157,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawDecode.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawLookup.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPrecheck.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
@@ -217,7 +231,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
-        ${agcMultisampleColorShaderHeader}
+        ${agcMultisampleColorShaderHeaders}
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcTextureDetileImageShaderHeader}
@@ -774,9 +788,13 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_refresh_proof COMMAND agc_driver_recorder_tests --refresh-proof-only)
     add_test(NAME agc_draw_snapshot COMMAND agc_driver_recorder_tests --draw-snapshot-only)
+    add_test(NAME agc_draw_commit_optimizations COMMAND agc_driver_recorder_tests --draw-commit-optimizations-only)
+    set_tests_properties(agc_draw_commit_optimizations PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "APS5_WRITE_WATCH_IMPORTS=watch;APS5_DRAW_INPUT_MEMO=1")
     set_tests_properties(agc_refresh_proof agc_draw_snapshot PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "APS5_WRITE_WATCH_IMPORTS=watch")
     if(WIN32)
         set_tests_properties(agc_refresh_proof agc_draw_snapshot PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_tests_properties(agc_draw_commit_optimizations PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_read_written_staging COMMAND ${CMAKE_COMMAND} -E env
@@ -873,7 +891,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/ParallelCompare.cpp
         Graphics/src/ShaderInputState.cpp
         ${agcTextureDetileShaderHeader}
-        ${agcMultisampleColorShaderHeader}
+        ${agcMultisampleColorShaderHeaders}
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcTextureDetileImageShaderHeader}
@@ -1072,7 +1090,8 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_pm4_failure COMMAND agc_driver_pm4_tests failure)
-    set_tests_properties(agc_driver_pm4_failure PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_driver PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=0")
+    set_tests_properties(agc_driver_pm4_failure PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=0" SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_driver_pm4_failure PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

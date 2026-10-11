@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleColorLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleColorSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -139,10 +140,10 @@ ColorTarget Target(const Block& block, VkFormat format, VkSampleCountFlagBits sa
     target.address = target.surfaceAddress = block.Address();
     target.extent = target.surfaceExtent = {Width, Height};
     target.format = format;
-    target.bytes = samples == VK_SAMPLE_COUNT_8_BIT ? StorageBytes : AgcDriver::Graphics::ColorTargetLayout(Width, Height, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
+    target.elementBytes = format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8u : 4u;
+    target.bytes = samples == VK_SAMPLE_COUNT_1_BIT ? AgcDriver::Graphics::ColorTargetLayout(Width, Height, AgcDriver::Graphics::ColorTileMode::RenderTarget, target.elementBytes).Bytes() : AgcDriver::Graphics::MultisampleColorLayout(Width, Height, target.elementBytes, static_cast<std::uint32_t>(samples)).Bytes();
     target.componentMapping = 0xe4u;
     target.tileMode = AgcDriver::Graphics::ColorTileMode::RenderTarget;
-    target.elementBytes = 4;
     target.samples = samples;
     return target;
 }
@@ -191,12 +192,12 @@ void Draw(AgcDriver::VulkanDevice& device, const ColorTarget& color, VkRect2D re
     const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(PixelCode.data()), std::as_bytes(std::span(PixelCode))}}};
     ShaderRecompiler::RecompileRequest fragment{
         {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(PixelCode.data()), PixelCode, 0, {}},
-        {WaveSize, 0, pixelUser, std::nullopt, pixel, std::nullopt, pixelMemory}, target, {0, 0, vertexPush, 128 - vertexPush}
+        {WaveSize, 0, pixelUser, std::nullopt, pixel, std::nullopt, pixelMemory}, target, PixelPushLayout(vertexPush, target)
     };
     fragment.useCache = false;
     const auto pixelResult = ShaderRecompiler::Recompile(fragment);
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
-        {ShaderStage::Vertex, &vertexResult, 0}, {ShaderStage::Fragment, &pixelResult, vertexPush}
+        {ShaderStage::Vertex, &vertexResult, 0}, {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}
     }};
     AgcDriver::Graphics::State state{};
     state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0, WaveSize, WaveSize, std::nullopt, std::nullopt};
@@ -206,6 +207,7 @@ void Draw(AgcDriver::VulkanDevice& device, const ColorTarget& color, VkRect2D re
     state.rasterizationSamples = color.samples;
     state.sampleMask = sampleMask;
     if (color.samples == VK_SAMPLE_COUNT_8_BIT) state.sampleLocations.assign(Locations.begin(), Locations.end());
+    if (color.samples == VK_SAMPLE_COUNT_4_BIT) state.sampleLocations = {{0.25f, 0.25f}, {0.75f, 0.25f}, {0.25f, 0.75f}, {0.75f, 0.75f}};
     state.renderExtent = {Width, Height};
     state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
@@ -283,6 +285,56 @@ void FormatTests(AgcDriver::VulkanDevice& device, Block& block, VkFormat format,
     Check(block, expected, name + " real per-sample mask and partial component write");
 }
 
+void SmallSampleTests(AgcDriver::VulkanDevice& device, Block& block) {
+    for (const auto format : {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT}) {
+        const auto color = Target(block, format, VK_SAMPLE_COUNT_4_BIT);
+        const AgcDriver::Graphics::MultisampleColorLayout layout(Width, Height, color.elementBytes, 4u);
+        std::vector<std::byte> expected(StorageBytes, std::byte{0xa9});
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) {
+                for (std::uint32_t sample = 0; sample < 4u; ++sample) {
+                    const auto offset = layout.Offset(x, y, sample);
+                    for (std::uint32_t channel = 0; channel < 4u; ++channel) {
+                        if (color.elementBytes == 8u) {
+                            constexpr std::array<std::uint16_t, 4> payload{0x3800u, 0x8000u, 0x7e01u, 0x3c00u};
+                            const auto value = payload[(sample + channel) % payload.size()];
+                            std::memcpy(expected.data() + offset + channel * 2u, &value, sizeof(value));
+                        } else expected[offset + channel] = static_cast<std::byte>((x + y + sample * 7u + channel * 11u) % 201u);
+                    }
+                }
+            }
+        }
+        std::memcpy(block.data, expected.data(), expected.size());
+        AgcDriver::GuestMemory::MarkWritten(block.Address(), expected.size());
+        Draw(device, color, Whole, 0);
+        Flush(device, block);
+        Check(block, expected, "four-sample upload preserves raw texels, including half-float NaNs and signed zero");
+        Draw(device, color, Partial, VK_COLOR_COMPONENT_R_BIT, 0x5u);
+        for (std::uint32_t y = 0; y < Partial.extent.height; ++y) {
+            for (std::uint32_t x = 0; x < Partial.extent.width; ++x) {
+                for (const auto sample : {0u, 2u}) {
+                    const auto offset = layout.Offset(Partial.offset.x + x, Partial.offset.y + y, sample);
+                    expected[offset] = color.elementBytes == 8u ? std::byte{0x00} : std::byte{0xff};
+                    if (color.elementBytes == 8u) expected[offset + 1u] = std::byte{0x3c};
+                }
+            }
+        }
+        const auto conflict = layout.Offset(4, 5, 0);
+        block.Store(conflict, std::byte{0x2a});
+        expected[conflict] = std::byte{0x2a};
+        Flush(device, block);
+        Check(block, expected, "four-sample masks preserve other samples, CPU byte conflicts and padding");
+        Draw(device, color, Whole, VK_COLOR_COMPONENT_G_BIT);
+        AgcDriver::Graphics::StorageTexture::FlushPending(block.Address(), color.bytes, nullptr, "buffer fill");
+        std::fill_n(block.data, color.bytes, std::byte{0});
+        std::fill_n(expected.begin(), color.bytes, std::byte{0});
+        AgcDriver::GuestMemory::MarkWritten(block.Address(), color.bytes);
+        Draw(device, color, Whole, 0);
+        Flush(device, block);
+        Check(block, expected, "a full guest clear refreshes the cached four-sample image");
+    }
+}
+
 void AliasTests(AgcDriver::VulkanDevice& device, Block& block) {
     auto expected = Seed(block);
     const auto rgba = Target(block, VK_FORMAT_R8G8B8A8_UNORM);
@@ -331,8 +383,9 @@ int main() {
         FormatTests(*device, block, VK_FORMAT_R8G8B8A8_SRGB, "RGBA8 SRGB");
         FormatTests(*device, block, VK_FORMAT_B8G8R8A8_SRGB, "BGRA8 SRGB");
         AliasTests(*device, block);
+        SmallSampleTests(*device, block);
         Flush(*device, block);
-        std::puts("real eight-sample color upload, draw, masks, byte conflicts, refresh, padding and aliases passed");
+        std::puts("real four/eight-sample color upload, draw, masks, byte conflicts, refresh, padding and aliases passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

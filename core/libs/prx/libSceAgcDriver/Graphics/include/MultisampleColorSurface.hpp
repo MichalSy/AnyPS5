@@ -18,6 +18,7 @@ public:
     MultisampleColorSurface& operator=(const MultisampleColorSurface&) = delete;
 
     VkImage Image() const { return image; }
+    VkFormat NativeFormat() const { return nativeFormat; }
     VkImageView AttachmentView(VkFormat format);
     const ColorTarget& Target() const { return target; }
     void Refresh();
@@ -37,6 +38,7 @@ private:
     std::vector<std::byte> snapshot;
     GuestAllocations::Lease backing;
     std::unique_ptr<Buffer> linear;
+    VkFormat nativeFormat = VK_FORMAT_UNDEFINED;
     VkImage image = VK_NULL_HANDLE;
     VkImageView storageView = VK_NULL_HANDLE;
     std::map<VkFormat, VkImageView> attachmentViews;

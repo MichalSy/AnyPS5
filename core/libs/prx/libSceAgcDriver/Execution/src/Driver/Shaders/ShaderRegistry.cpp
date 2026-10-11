@@ -1226,6 +1226,23 @@ ShaderSnapshot PrepareNullPixelProgram(const VulkanDevice& device) {
     return null;
 }
 
+std::uint64_t SnapshotCodeHash(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_CODE_HASH_MEMO"); return text == nullptr || std::strcmp(text, "0") != 0; }();
+    if (!enabled) return 0;
+    auto& memo = *snapshot.prepared;
+    {
+        std::lock_guard lock(memo.mutex);
+        for (const auto& entry : memo.codeHashes) {
+            if (entry.offset == codeOffset) return entry.hash;
+        }
+    }
+    const auto hash = ShaderRecompiler::RecompileCacheKey::HashCode(std::span(snapshot.code).subspan(codeOffset));
+    std::lock_guard lock(memo.mutex);
+    memo.codeHashes[memo.nextCodeHash] = {codeOffset, hash};
+    memo.nextCodeHash = (memo.nextCodeHash + 1) % memo.codeHashes.size();
+    return hash;
+}
+
 void Driver::RegisterShader(const Shader* shader) {
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.Register");

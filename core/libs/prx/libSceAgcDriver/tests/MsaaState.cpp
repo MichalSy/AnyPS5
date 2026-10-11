@@ -148,7 +148,7 @@ void sharedRejections() {
     rejects(queue, "locations differing across a pixel quad");
     queue = reference();
     for (const auto offset : {0x300u,0x304u,0x308u,0x30cu}) queue.context[offset] = 1u;
-    rejects(queue, "locations beyond the eight active samples");
+    rejects(queue, "locations beyond the active samples");
     for (const auto offset : {0x30eu,0x30fu}) {
         queue = reference();
         queue.context[offset] &= ~1u;
@@ -159,18 +159,18 @@ void sharedRejections() {
     rejects(queue, "maximum sample distance does not match");
     queue = reference();
     queue.context[0x292] &= ~1u;
-    rejects(queue, "eight-sample coverage requires MSAA scan conversion");
+    rejects(queue, "multisample coverage requires MSAA scan conversion");
     queue = reference();
     queue.context[0x2f8] = 0u;
     rejects(queue, "MSAA scan conversion without a multisample coverage count");
-    for (const auto count : {1u,2u}) {
+    for (const auto count : {4u,5u}) {
         queue = reference();
         queue.context[0x2f8] = (count << 20u) | (7u << 13u) | count;
-        rejects(queue, "matching eight coverage and exposed samples");
+        rejects(queue, "matching two, four or eight coverage and exposed samples");
     }
     queue = reference();
     queue.context[0x2f8] = 0x20e003u;
-    rejects(queue, "matching eight coverage and exposed samples");
+    rejects(queue, "matching two, four or eight coverage and exposed samples");
     for (const auto invalid : {0x103032u,0x003033u,0x113033u,0x103043u,0x103433u,0x104033u}) {
         queue = reference();
         queue.context[0x201] = invalid;
@@ -221,10 +221,10 @@ void colorRejections() {
     rejects(queue, "multisampled mipmapped, array or volume color views", false);
     queue = reference();
     queue.context[0x3b8] = 0x09000000u;
-    rejects(queue, "multisampled color requires SW_64KB_R_X and four-byte elements", false);
+    rejects(queue, "multisampled color requires SW_64KB_R_X and RGBA8 or RGBA16F elements", false);
     queue = reference();
     queue.context[0x31c] = 0x872cu;
-    rejects(queue, "multisampled color requires SW_64KB_R_X and four-byte elements", false);
+    rejects(queue, "multisampled color requires SW_64KB_R_X and RGBA8 or RGBA16F elements", false);
     for (const auto metadata : {0x10000000u,0x2000u}) {
         queue = reference();
         queue.context[0x31c] |= metadata;
@@ -273,8 +273,46 @@ void RunMsaaStateTests() {
     Require(state.renderExtent.width == 37u && state.renderExtent.height == 69u, "actual attachment extents disagree");
     locations(state);
     keyCoverage(queue);
+    auto standard8 = queue;
+    for (std::uint32_t pixel = 0; pixel < 4u; ++pixel) {
+        standard8.context[0x2feu + pixel * 4u] = 0xbd153fd1u;
+        standard8.context[0x2ffu + pixel * 4u] = 0x9773f95bu;
+    }
+    const auto standardState = DecodeState(standard8);
+    Require(standardState.sampleLocations.empty() && standardState.depth->sampleLocations.empty(), "standard eight-sample pattern must use sample seven at (7, -7)");
     sharedRejections();
     colorRejections();
+    for (const auto samplesLog2 : {1u, 2u}) {
+        auto smaller = queue;
+        const auto samples = 1u << samplesLog2;
+        smaller.context[0x010] = (smaller.context[0x010] & ~0xcu) | (samplesLog2 << 2u);
+        smaller.context[0x31d] = (samplesLog2 << 12u) | (samplesLog2 << 15u);
+        smaller.context[0x201] = 0x100000u | samplesLog2 | (samplesLog2 << 4u) | (samplesLog2 << 12u);
+        smaller.context[0x2f8] = (samplesLog2 << 20u) | (4u << 13u) | samplesLog2;
+        for (std::uint32_t offset = 0x2feu; offset <= 0x30du; ++offset) smaller.context[offset] = 0u;
+        for (std::uint32_t pixel = 0; pixel < 4u; ++pixel) smaller.context[0x2feu + pixel * 4u] = samples == 4u ? 0x444cc4ccu : 0xcc44u;
+        std::vector<RegisterRead> reads;
+        State decoded;
+        {
+            ReadLog log(reads);
+            decoded = DecodeState(smaller);
+            Require(DrawRejection(smaller, false).empty(), "matching two or four-sample state was rejected");
+        }
+        Require(decoded.rasterizationSamples == static_cast<VkSampleCountFlagBits>(samples) && decoded.depth->samples == decoded.rasterizationSamples && decoded.color.samples == decoded.rasterizationSamples, "small MSAA attachment sample counts differ");
+        for (const auto read : reads) Require(DrawKeyCovers(read), "small MSAA state reads an unkeyed register");
+        if (samples == 4u) {
+            Require(decoded.sampleLocations.size() == 4u && decoded.sampleLocations[0].x == 0.25f && decoded.sampleLocations[0].y == 0.25f && decoded.sampleLocations[3].x == 0.75f && decoded.sampleLocations[3].y == 0.75f, "Hades custom four-sample positions changed");
+            smaller.context[0x31c] = 0x0730u;
+            const auto wide = DecodeState(smaller);
+            Require(wide.color.format == VK_FORMAT_R16G16B16A16_SFLOAT && wide.color.elementBytes == 8u && wide.color.bytes == 3u * 65536u, "four-sample half-float target layout changed");
+            for (std::uint32_t pixel = 0; pixel < 4u; ++pixel) smaller.context[0x2feu + pixel * 4u] = 0x622ae6aeu;
+            smaller.context[0x2f8] = (samplesLog2 << 20u) | (6u << 13u) | samplesLog2;
+        }
+        const auto standard = DecodeState(smaller);
+        Require(standard.sampleLocations.empty() && standard.depth->sampleLocations.empty(), "standard sample pattern unnecessarily requires the custom-location extension");
+        smaller.context[0x302] ^= 1u;
+        rejects(smaller, "locations differing across a pixel quad");
+    }
     auto single = queue;
     single.context[0x010] = 0xa0000183u;
     single.context[0x31d] = 0u;

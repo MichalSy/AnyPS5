@@ -64,6 +64,12 @@ struct PreparedShaderState {
     std::vector<std::weak_ptr<const ShaderSnapshot>> fragments;
     bool rectangleRequested = false;
     bool deferred = false;
+    struct CodeHash {
+        std::size_t offset = ~std::size_t{0};
+        std::uint64_t hash = 0;
+    };
+    std::array<CodeHash, 4> codeHashes{};
+    std::size_t nextCodeHash = 0;
 };
 struct PreparedShaders : PreparedShaderState {
     std::mutex mutex;
@@ -94,6 +100,7 @@ std::shared_ptr<const ShaderSnapshot> ReadRawComputeShader(std::uint64_t address
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation = nullptr);
 
 std::uint64_t NullPixelProgramAddress();
+std::uint64_t SnapshotCodeHash(const ShaderSnapshot& snapshot, std::size_t codeOffset);
 ShaderSnapshot PrepareNullPixelProgram(const VulkanDevice& device);
 std::optional<ShaderRecompiler::ShaderFloatMode> RegisteredFloatMode(const ShaderSnapshot& snapshot);
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot);

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleColorLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorResolve.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleColorSurface.hpp"
@@ -35,6 +36,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -172,10 +174,10 @@ ColorTarget Target(const Block& block, VkFormat format, VkSampleCountFlagBits sa
     target.address = target.surfaceAddress = block.Address();
     target.extent = target.surfaceExtent = {Width, Height};
     target.format = format;
-    target.bytes = samples == VK_SAMPLE_COUNT_8_BIT ? StorageBytes : AgcDriver::Graphics::ColorTargetLayout(Width, Height, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
+    target.elementBytes = format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8u : 4u;
+    target.bytes = samples == VK_SAMPLE_COUNT_1_BIT ? AgcDriver::Graphics::ColorTargetLayout(Width, Height, AgcDriver::Graphics::ColorTileMode::RenderTarget, target.elementBytes).Bytes() : AgcDriver::Graphics::MultisampleColorLayout(Width, Height, target.elementBytes, static_cast<std::uint32_t>(samples)).Bytes();
     target.componentMapping = 0xe4u;
     target.tileMode = AgcDriver::Graphics::ColorTileMode::RenderTarget;
-    target.elementBytes = 4;
     target.samples = samples;
     return target;
 }
@@ -224,12 +226,12 @@ void Draw(AgcDriver::VulkanDevice& device, const ColorTarget& color, VkRect2D re
     const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(pixelCode.data()), std::as_bytes(pixelCode)}}};
     ShaderRecompiler::RecompileRequest fragment{
         {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(pixelCode.data()), pixelCode, 0, {}},
-        {WaveSize, 0, pixelUser, std::nullopt, pixel, std::nullopt, pixelMemory}, target, {0, 0, vertexPush, 128 - vertexPush}
+        {WaveSize, 0, pixelUser, std::nullopt, pixel, std::nullopt, pixelMemory}, target, PixelPushLayout(vertexPush, target)
     };
     fragment.useCache = false;
     const auto pixelResult = ShaderRecompiler::Recompile(fragment);
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
-        {ShaderStage::Vertex, &vertexResult, 0}, {ShaderStage::Fragment, &pixelResult, vertexPush}
+        {ShaderStage::Vertex, &vertexResult, 0}, {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}
     }};
     AgcDriver::Graphics::State state{};
     state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0, WaveSize, WaveSize, std::nullopt, std::nullopt};
@@ -239,6 +241,7 @@ void Draw(AgcDriver::VulkanDevice& device, const ColorTarget& color, VkRect2D re
     state.rasterizationSamples = color.samples;
     state.sampleMask = sampleMask;
     if (color.samples == VK_SAMPLE_COUNT_8_BIT) state.sampleLocations.assign(Locations.begin(), Locations.end());
+    if (color.samples == VK_SAMPLE_COUNT_4_BIT) state.sampleLocations = {{0.25f, 0.25f}, {0.75f, 0.25f}, {0.25f, 0.75f}, {0.75f, 0.75f}};
     state.renderExtent = {Width, Height};
     state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
@@ -334,6 +337,63 @@ std::size_t FirstUnitPadding() {
     const auto found = std::find(occupied.begin(), occupied.end(), false);
     Require(found != occupied.end(), "the first destination unit must contain padding");
     return static_cast<std::size_t>(found - occupied.begin()) * 4u;
+}
+
+void SmallSampleTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Block& destinationBlock) {
+    constexpr std::array cases{
+        std::pair{VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_2_BIT},
+        std::pair{VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_4_BIT},
+        std::pair{VK_FORMAT_R8G8B8A8_SRGB, VK_SAMPLE_COUNT_4_BIT},
+        std::pair{VK_FORMAT_R16G16B16A16_SFLOAT, VK_SAMPLE_COUNT_4_BIT}
+    };
+    for (const auto [format, samples] : cases) {
+        auto sourceTarget = Target(sourceBlock, format, samples);
+        auto destinationTarget = Target(destinationBlock, format, VK_SAMPLE_COUNT_1_BIT);
+        sourceTarget.pipeBankXor = destinationTarget.pipeBankXor = 0x5600u;
+        const AgcDriver::Graphics::MultisampleColorLayout sourceLayout(Width, Height, sourceTarget.elementBytes, static_cast<std::uint32_t>(samples), sourceTarget.pipeBankXor);
+        const AgcDriver::Graphics::ColorTargetLayout destinationLayout(Width, Height, destinationTarget.tileMode, destinationTarget.elementBytes, destinationTarget.pipeBankXor);
+        std::vector<std::byte> source(StorageBytes, std::byte{0xa9});
+        std::vector<std::byte> expected(StorageBytes, std::byte{0xb6});
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) {
+                for (std::uint32_t sample = 0; sample < static_cast<std::uint32_t>(samples); ++sample) {
+                    const auto offset = sourceLayout.Offset(x, y, sample);
+                    for (std::uint32_t channel = 0; channel < 4u; ++channel) {
+                        if (sourceTarget.elementBytes == 8u) {
+                            constexpr std::array<std::uint16_t, 4> values{0x0000u, 0x3800u, 0x3c00u, 0x3e00u};
+                            const auto value = values[sample];
+                            std::memcpy(source.data() + offset + channel * 2u, &value, sizeof(value));
+                        } else source[offset + channel] = static_cast<std::byte>(format == VK_FORMAT_R8G8B8A8_SRGB ? (sample % 2u ? 255u : 0u) : (sample % 2u ? 192u : 64u));
+                    }
+                }
+            }
+        }
+        std::memcpy(sourceBlock.data, source.data(), source.size());
+        std::memcpy(destinationBlock.data, expected.data(), expected.size());
+        AgcDriver::GuestMemory::MarkWritten(sourceBlock.Address(), source.size());
+        AgcDriver::GuestMemory::MarkWritten(destinationBlock.Address(), expected.size());
+        Resolve(device, sourceTarget, destinationTarget, Partial);
+        Flush(device, destinationBlock);
+        Flush(device, sourceBlock);
+        Check(sourceBlock, source, "two/four-sample resolve preserves all source samples and padding");
+        for (std::uint32_t y = 0; y < Partial.extent.height; ++y) {
+            for (std::uint32_t x = 0; x < Partial.extent.width; ++x) {
+                const auto offset = destinationLayout.Offset(Partial.offset.x + x, Partial.offset.y + y);
+                for (std::uint32_t channel = 0; channel < 4u; ++channel) {
+                    if (destinationTarget.elementBytes == 8u) {
+                        constexpr std::uint16_t average = 0x3a00u;
+                        std::memcpy(expected.data() + offset + channel * 2u, &average, sizeof(average));
+                    } else {
+                        const auto average = format == VK_FORMAT_R8G8B8A8_SRGB && channel != 3u ? 188 : 128;
+                        const auto actual = std::to_integer<int>(destinationBlock.data[offset + channel]);
+                        Require(std::abs(actual - average) <= 1, "two/four-sample resolve must average linear values before sRGB encoding");
+                        expected[offset + channel] = destinationBlock.data[offset + channel];
+                    }
+                }
+            }
+        }
+        Check(destinationBlock, expected, "two/four-sample partial resolve preserves uncovered pixels and padding");
+    }
 }
 
 void BasicTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Block& destinationBlock, VkFormat format, const std::string& name) {
@@ -570,7 +630,7 @@ void SharedFormatTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Bloc
     reject(invalid, "format is unsupported");
     invalid = sourceTarget;
     invalid.elementBytes = 8;
-    reject(invalid, "unsupported multisample color geometry");
+    reject(invalid, "format and element size disagree");
     invalid = sourceTarget;
     invalid.depth = 2;
     reject(invalid, "arrays, volumes and mipmaps are unsupported");
@@ -752,10 +812,11 @@ int main() {
             SharedFormatTests(*device, source, destination, format, name);
             GeometryAliasTests(*device, source, format, name);
         }
+        SmallSampleTests(*device, source, destination);
         Flush(*device, source);
         Flush(*device, destination);
         LifetimeTests(*device, gpuLock);
-        std::puts("real eight-to-one color averages, partial regions, pending draws, CPU units, padding and aliases passed");
+        std::puts("real two/four/eight-to-one color averages, partial regions, pending draws, CPU units, padding and aliases passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -159,16 +159,18 @@ std::string multisampleRejection(const Registers& cx, State* output = nullptr, b
         if ((*mode & 1u) != 0) return "MSAA scan conversion without a multisample coverage count is unsupported";
         return attachmentRejection(VK_SAMPLE_COUNT_1_BIT);
     }
-    if ((*aa & ~0x0071e007u) != 0 || (*aa & 7u) != 3u || ((*aa >> 20u) & 7u) != 3u)
-        return zeroMessage(0x2f8, *aa, "multisampling other than matching eight coverage and exposed samples");
-    if ((*mode & 1u) == 0) return "eight-sample coverage requires MSAA scan conversion";
-    if (auto reason = attachmentRejection(VK_SAMPLE_COUNT_8_BIT); !reason.empty()) return reason;
+    const auto samplesLog2 = *aa & 7u;
+    if ((*aa & ~0x0071e007u) != 0 || samplesLog2 == 0u || samplesLog2 > 3u || ((*aa >> 20u) & 7u) != samplesLog2)
+        return zeroMessage(0x2f8, *aa, "multisampling other than matching two, four or eight coverage and exposed samples");
+    const auto samples = 1u << samplesLog2;
+    if ((*mode & 1u) == 0) return "multisample coverage requires MSAA scan conversion";
+    if (auto reason = attachmentRejection(static_cast<VkSampleCountFlagBits>(samples)); !reason.empty()) return reason;
     const auto eqaa = word(0x201);
     const auto shader = word(0x203);
     const auto inputs = word(0x1b3);
     if (!eqaa || !shader || !inputs) return {};
-    if ((*eqaa & ~0x00107777u) != 0 || (*eqaa & 7u) != 3u || ((*eqaa >> 4u) & 7u) > 3u ||
-        ((*eqaa >> 8u) & 7u) > 3u || ((*eqaa >> 12u) & 7u) > 3u || (*eqaa & 0x100000u) == 0)
+    if ((*eqaa & ~0x00107777u) != 0 || (*eqaa & 7u) != samplesLog2 || ((*eqaa >> 4u) & 7u) > samplesLog2 ||
+        ((*eqaa >> 8u) & 7u) > samplesLog2 || ((*eqaa >> 12u) & 7u) > samplesLog2 || (*eqaa & 0x100000u) == 0)
         return zeroMessage(0x201, *eqaa, "mixed anchor counts, overrasterization or unsupported EQAA state");
     if ((*shader & 0x180u) != 0) return "multisampled shader coverage and sample-mask exports are unsupported";
     if ((*inputs & 0x44u) != 0) return "multisampled centroid interpolation with guest centroid priorities is unsupported";
@@ -181,11 +183,14 @@ std::string multisampleRejection(const Registers& cx, State* output = nullptr, b
             else if (*location != first[group]) return "multisample locations differing across a pixel quad are unsupported";
         }
     }
-    if (first[2] != 0 || first[3] != 0) return "multisample locations beyond the eight active samples are unsupported";
+    const auto groups = (samples + 3u) / 4u;
+    for (std::uint32_t group = groups; group < first.size(); ++group)
+        if (first[group] != 0u) return "multisample locations beyond the active samples are unsupported";
+    if (samples == 2u && (first[0] >> 16u) != 0u) return "multisample locations beyond the active samples are unsupported";
     std::vector<VkSampleLocationEXT> locations;
-    locations.reserve(8);
+    locations.reserve(samples);
     std::uint32_t distance = 0;
-    for (std::uint32_t sample = 0; sample < 8; ++sample) {
+    for (std::uint32_t sample = 0; sample < samples; ++sample) {
         const auto value = first[sample / 4u] >> ((sample % 4u) * 8u);
         const auto signedNibble = [](std::uint32_t nibble) { return static_cast<std::int32_t>(nibble & 7u) - static_cast<std::int32_t>(nibble & 8u); };
         const auto x = signedNibble(value & 15u);
@@ -195,7 +200,16 @@ std::string multisampleRejection(const Registers& cx, State* output = nullptr, b
     }
     if (((*aa >> 13u) & 15u) != distance) return "multisample maximum sample distance does not match the programmed locations";
     if (output != nullptr) {
-        output->rasterizationSamples = VK_SAMPLE_COUNT_8_BIT;
+        constexpr std::array<std::array<int, 2>, 2> standard2{{{4, 4}, {-4, -4}}};
+        constexpr std::array<std::array<int, 2>, 4> standard4{{{-2, -6}, {6, -2}, {-6, 2}, {2, 6}}};
+        constexpr std::array<std::array<int, 2>, 8> standard8{{{1, -3}, {-1, 3}, {5, 1}, {-3, -5}, {-5, 5}, {-7, -1}, {3, 7}, {7, -7}}};
+        bool standard = true;
+        for (std::uint32_t sample = 0; sample < samples; ++sample) {
+            const auto position = samples == 2u ? standard2[sample] : samples == 4u ? standard4[sample] : standard8[sample];
+            standard &= locations[sample].x == 0.5f + position[0] / 16.0f && locations[sample].y == 0.5f + position[1] / 16.0f;
+        }
+        if (standard) locations.clear();
+        output->rasterizationSamples = static_cast<VkSampleCountFlagBits>(samples);
         output->sampleLocations = std::move(locations);
         output->sampleLocationsGrid = {1, 1};
     }
@@ -303,7 +317,6 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     };
     requireMip(mip < mipCount, "depth view mip exceeds its surface mip chain");
     const auto depthSamples = (zInfo >> 2u) & 3u;
-    Require(depthSamples == 0u || depthSamples == 3u, "depth sample count other than one or eight is unsupported");
     const auto samples = static_cast<VkSampleCountFlagBits>(1u << depthSamples);
     Require(samples == result.rasterizationSamples, "depth and rasterization sample counts differ");
     requireMip(samples == VK_SAMPLE_COUNT_1_BIT || (view == 0u && mipCount == 1u), "multisampled read-only, mipmapped or array depth views are unsupported");
@@ -691,7 +704,7 @@ std::string DepthMaintenanceRejection(const QueueState& queue) {
     const auto stencilInfo = word(0x011);
     if ((stencilInfo & 1u) == 0) return reject("without a writable stencil plane");
     const auto samples = (zInfo >> 2u) & 3u;
-    if ((zInfo & 3u) == 2u || (zInfo & 0x000f1000u) != 0 || (samples != 0u && samples != 3u) || (stencilInfo & 0x1001u) != 1u) return reject("without a supported stencil plane");
+    if ((zInfo & 3u) == 2u || (zInfo & 0x000f1000u) != 0 || (stencilInfo & 0x1001u) != 1u) return reject("without a supported stencil plane");
     if (auto reason = multisampleRejection(cx); !reason.empty()) return reason;
     const auto aa = find(cx, 0x2f8);
     if (aa != cx.end() && (aa->second & 7u) != samples) return reject("with differing depth and rasterization sample counts");
@@ -990,7 +1003,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     Require((attrib & ~0x0003f000u) == 0, "unsupported color attribute flags");
     const auto samples = (attrib >> 12u) & 7u;
     const auto fragments = (attrib >> 15u) & 3u;
-    Require(samples == fragments && (samples == 0u || samples == 3u), "mixed color samples/fragments or sample counts other than one or eight are unsupported");
+    Require(samples == fragments && samples <= 3u, "mixed color samples/fragments or sample counts greater than eight are unsupported");
     color.samples = static_cast<VkSampleCountFlagBits>(1u << samples);
     const auto attrib2 = read(cx, 0x3b0 + slot);
     const auto maxMip = attrib2 >> 28u;
@@ -999,7 +1012,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     color.tileMode = DecodeColorTileMode(attrib3);
     const bool volume = ((attrib3 >> 24u) & 3u) == 2u;
     if (color.samples != VK_SAMPLE_COUNT_1_BIT) {
-        Require(color.tileMode == ColorTileMode::RenderTarget && decoded.elementBytes == 4u, "multisampled color requires SW_64KB_R_X and four-byte elements");
+        Require(color.tileMode == ColorTileMode::RenderTarget && ((decoded.elementBytes == 4u && (decoded.format == VK_FORMAT_R8G8B8A8_UNORM || decoded.format == VK_FORMAT_B8G8R8A8_UNORM || decoded.format == VK_FORMAT_R8G8B8A8_SRGB || decoded.format == VK_FORMAT_B8G8R8A8_SRGB)) || (decoded.elementBytes == 8u && decoded.format == VK_FORMAT_R16G16B16A16_SFLOAT)), "multisampled color requires SW_64KB_R_X and RGBA8 or RGBA16F elements");
         Require(!volume && maxMip == 0u && viewMip == 0u && slice == 0u, "multisampled mipmapped, array or volume color views are unsupported");
         Require((info & 0x10002000u) == 0u, "multisampled DCC or CMASK color metadata is unsupported");
     }
@@ -1036,7 +1049,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     }
     if (slice != 0 && !volume) color.surfaceAddress += slice * ComputeSurfaceSize(ComputeElementMipLayout(ColorTextureTileMode(color.tileMode), color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount), 1);
     color.address = color.surfaceAddress + mipOffset;
-    color.bytes = color.samples == VK_SAMPLE_COUNT_1_BIT ? colorLayout.Bytes() : MultisampleColorLayout(color.extent.width, color.extent.height, color.elementBytes, static_cast<std::uint32_t>(color.samples)).Bytes();
+    color.bytes = color.samples == VK_SAMPLE_COUNT_1_BIT ? colorLayout.Bytes() : MultisampleColorLayout(color.extent.width, color.extent.height, color.elementBytes, static_cast<std::uint32_t>(color.samples), color.pipeBankXor).Bytes();
     GuestMemory::CheckRange(reinterpret_cast<const void*>(color.address), color.bytes, colorLayout.Alignment(), true);
     color.format = decoded.format;
     color.componentMapping = decoded.componentMapping;
@@ -1085,11 +1098,14 @@ std::optional<ColorResolvePass> DecodeColorResolvePass(const QueueState& queue) 
     Require((mode & ~0x22u) == 0u, "color resolve requires disabled MSAA scan conversion without unsupported scan modes");
     zero(cx, 0x293, ScanControlMask, "color resolve sample iteration or unsupported scan control");
     const auto aa = read(cx, 0x2f8);
-    Require(aa == 0u || ((aa & ~0x0071e007u) == 0u && (aa & 7u) == 3u && ((aa >> 20u) & 7u) == 3u),
-        "color resolve requires matching eight coverage and exposed samples without coverage conversion");
+    const auto samplesLog2 = (read(cx, 0x31d) >> 12u) & 7u;
+    Require(samplesLog2 >= 1u && samplesLog2 <= 3u && ((read(cx, 0x31d) >> 15u) & 3u) == samplesLog2,
+        "color resolve requires matching multisampled source samples/fragments");
+    Require(aa == 0u || ((aa & ~0x0071e007u) == 0u && (aa & 7u) == samplesLog2 && ((aa >> 20u) & 7u) == samplesLog2),
+        "color resolve requires matching source coverage and exposed samples without coverage conversion");
     const auto eqaa = read(cx, 0x201);
-    Require((eqaa & ~0x00107777u) == 0u && (eqaa & 7u) == 3u && ((eqaa >> 4u) & 7u) <= 3u &&
-        ((eqaa >> 8u) & 7u) <= 3u && ((eqaa >> 12u) & 7u) <= 3u && (eqaa & 0x100000u) != 0u,
+    Require((eqaa & ~0x00107777u) == 0u && (eqaa & 7u) == samplesLog2 && ((eqaa >> 4u) & 7u) <= samplesLog2 &&
+        ((eqaa >> 8u) & 7u) <= samplesLog2 && ((eqaa >> 12u) & 7u) <= samplesLog2 && (eqaa & 0x100000u) != 0u,
         "color resolve with mixed anchor counts, overrasterization or unsupported EQAA state is unsupported");
     Require(read(cx, 0x8e) == 0xfu && read(cx, 0x8f) == 0xfu, "color resolve requires all source components in MRT0");
     zero(cx, 0x80, ~0u, "color resolve window offset");
@@ -1097,8 +1113,8 @@ std::optional<ColorResolvePass> DecodeColorResolvePass(const QueueState& queue) 
     Require(read(cx, 0x313) == 0x6000u, "color resolve with conservative rasterization is unsupported");
     for (std::uint32_t slot = 0; slot < 2u; ++slot) {
         const auto stride = slot * 0xfu;
-        Require((read(cx, 0x31d + stride) & 0x0001f000u) == (slot == 0u ? 0x0001b000u : 0u),
-            "color resolve requires eight source samples/fragments and one destination sample/fragment");
+        Require((read(cx, 0x31d + stride) & 0x0001f000u) == (slot == 0u ? (samplesLog2 << 12u) | (samplesLog2 << 15u) : 0u),
+            "color resolve requires matching multisampled source samples/fragments and one destination sample/fragment");
         Require((read(cx, 0x31c + stride) & 0x10006000u) == 0u, "color resolve with compressed, DCC or CMASK color is unsupported");
         Require((read(cx, 0x31c + stride) & ~0x00009f7cu) == 0u,
             "color resolve with nonstandard rounding, optimization or color-control flags is unsupported");
@@ -1111,11 +1127,12 @@ std::optional<ColorResolvePass> DecodeColorResolvePass(const QueueState& queue) 
         }
     }
     ColorResolvePass pass{DecodeColorBuffer(cx, 0u), DecodeColorBuffer(cx, 1u), {}};
-    Require(pass.source.samples == VK_SAMPLE_COUNT_8_BIT && pass.destination.samples == VK_SAMPLE_COUNT_1_BIT,
-        "color resolve requires eight source samples and one destination sample");
-    Require((pass.source.format == VK_FORMAT_R8G8B8A8_UNORM || pass.source.format == VK_FORMAT_B8G8R8A8_UNORM) &&
+    Require(pass.source.samples != VK_SAMPLE_COUNT_1_BIT && pass.destination.samples == VK_SAMPLE_COUNT_1_BIT,
+        "color resolve requires a multisampled source and one destination sample");
+    Require((pass.source.format == VK_FORMAT_R8G8B8A8_UNORM || pass.source.format == VK_FORMAT_B8G8R8A8_UNORM || pass.source.format == VK_FORMAT_R8G8B8A8_SRGB ||
+        pass.source.format == VK_FORMAT_B8G8R8A8_SRGB || pass.source.format == VK_FORMAT_R16G16B16A16_SFLOAT) &&
         pass.destination.format == pass.source.format && pass.source.componentMapping == 0xe4u && pass.destination.componentMapping == 0xe4u,
-        "color resolve requires matching RGBA8 or BGRA8 UNORM formats and identity component mappings");
+        "color resolve requires matching RGBA8, BGRA8 or RGBA16F formats and identity component mappings");
     Require(pass.source.tileMode == ColorTileMode::RenderTarget && pass.destination.tileMode == ColorTileMode::RenderTarget,
         "color resolve requires SW_64KB_R_X source and destination surfaces");
     Require(pass.source.extent.width == pass.destination.extent.width && pass.source.extent.height == pass.destination.extent.height,
