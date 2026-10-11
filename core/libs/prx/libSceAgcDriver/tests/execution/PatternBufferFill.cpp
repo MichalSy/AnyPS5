@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferFill.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "VulkanTestDevice.hpp"
 #include <chrono>
@@ -18,7 +19,7 @@ alignas(256) std::array<std::uint32_t, 4> Pattern{0, 0x12345678u, 0xdeadbeefu, 0
 alignas(256) std::array<std::uint32_t, 4> Control{};
 alignas(256) std::array<std::uint32_t, 260> Output{};
 
-std::array<std::uint32_t, 12> UserData(void* output, std::uint32_t records) {
+std::array<std::uint32_t, 12> UserData(void* output, std::uint32_t records, const void* pattern = Pattern.data()) {
     std::array<std::uint32_t, 12> data{};
     const auto descriptor = [&](std::size_t first, const void* pointer, std::uint32_t stride, std::uint32_t count, std::uint32_t format) {
         const auto address = reinterpret_cast<std::uintptr_t>(pointer);
@@ -27,7 +28,7 @@ std::array<std::uint32_t, 12> UserData(void* output, std::uint32_t records) {
         data[first + 2] = count;
         data[first + 3] = format;
     };
-    descriptor(0, Pattern.data(), 4, Pattern.size(), 0x14004u);
+    descriptor(0, pattern, 4, Pattern.size(), 0x14004u);
     descriptor(4, output, 4, records, 0x14004u);
     descriptor(8, Control.data(), 16, 1, 0x4dfacu);
     return data;
@@ -167,6 +168,24 @@ void ExecuteTests() {
     }
 }
 
+void BatchedFillTests() {
+    const auto count = std::max<std::size_t>(DrawPipeline::Depth() * 2 + 1, 17);
+    std::vector<std::array<std::uint32_t, 4>> patterns(count);
+    std::vector<std::uint32_t> words;
+    Output.fill(0xcafebabeu);
+    Control = {128, 0, 0, 0};
+    for (std::size_t i = 0; i < count; ++i) {
+        patterns[i].fill(0x12340000u + static_cast<std::uint32_t>(i));
+        const auto fill = Commands(UserData(Output.data(), 256, patterns[i].data()), 128, 32, false, false);
+        words.insert(words.end(), fill.begin(), fill.end());
+    }
+    Submit(words);
+    for (std::size_t i = 0; i < Output.size(); ++i) {
+        const auto expected = i < 128 ? patterns.back()[0] : 0xcafebabeu;
+        Require(Output[i] == expected, "batched pattern fills did not finish in order or exceeded their range");
+    }
+}
+
 void PartialGroupTests() {
     for (const auto wave : {32u, 64u}) {
         Output.fill(0xcafebabeu);
@@ -216,6 +235,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark") Benchmark();
         else {
             ExecuteTests();
+            BatchedFillTests();
             PartialGroupTests();
         }
         AgcDriverShutdown_nid_postfix();

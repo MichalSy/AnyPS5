@@ -59,6 +59,7 @@ void DrawPipeline::rethrowFailure() {
 }
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline enqueue under the GPU lock");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::unique_lock lock(mutex);
     rethrowFailure();

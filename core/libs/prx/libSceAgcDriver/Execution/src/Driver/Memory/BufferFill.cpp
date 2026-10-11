@@ -130,7 +130,6 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     std::uint64_t base;
     std::size_t bytes;
     std::array<std::uint32_t, 4> pattern;
-    std::unique_lock inputLock(GuestMemory::GpuMutex(), std::defer_lock);
     if (dwordFill) {
         base = dwordFill->base;
         bytes = dwordFill->bytes;
@@ -140,7 +139,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         if (!range) return false;
         if (range->invocations == 0) return true;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
-        inputLock.lock();
+        std::lock_guard inputLock(GuestMemory::GpuMutex());
         recordLabelsForPacket(localDevice.get(), queueId);
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range->control), 8)) return false;
         std::array<std::uint32_t, 2> control;
