@@ -372,7 +372,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
         const bool pipeAligned = metadataSurface != cx.end() && (metadataSurface->second & (1u << 18u)) != 0;
         const bool vrs = metadataSurface != cx.end() && (metadataSurface->second & (3u << 19u)) != 0;
         if (metadata != cx.end() && pipeAligned && !vrs && zFormat != 0 &&
-            ((zInfo >> 4u) & 0x1fu) == 24u && mipCount == 1u && mip == 0u && slice == 0u && samples == VK_SAMPLE_COUNT_1_BIT) {
+            ((zInfo >> 4u) & 0x1fu) == 24u && mipCount == 1u && mip == 0u && slice == 0u) {
             depth.htileAddress = base(0x005, 0x01e);
             if ((depth.htileAddress & 0x7fffu) != 0) depth.htileAddress = 0;
         }

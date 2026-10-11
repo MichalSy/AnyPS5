@@ -154,7 +154,7 @@ public:
     }
 
     bool AcceptsHtileFill() const {
-        return !retired && htileAddress != 0 && (!htileStencil || target.stencilAddress != 0) && target.address != 0 && target.samples == VK_SAMPLE_COUNT_1_BIT &&
+        return !retired && htileAddress != 0 && (!htileStencil || target.stencilAddress != 0) && target.address != 0 &&
             target.mipCount == 1u && target.mip == 0u && htileRegistry == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     }
 

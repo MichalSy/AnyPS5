@@ -88,6 +88,8 @@ AgcDriver::QueueState reference() {
         queue.context[0x301u + pixel * 4u] = 0u;
     }
     address(queue.context, 0x318u, 0x390u, colorMemory.data());
+    address(queue.context, 0x005u, 0x01eu, stencilMemory.data());
+    queue.context[0x2af] = 0x40000u;
     address(queue.context, 0x012u, 0x01au, depthMemory.data());
     address(queue.context, 0x014u, 0x01cu, depthMemory.data());
     address(queue.context, 0x013u, 0x01bu, stencilMemory.data());
@@ -271,6 +273,7 @@ void RunMsaaStateTests() {
     Require(state.colors.size() == 1u && state.color.samples == VK_SAMPLE_COUNT_8_BIT && state.color.format == VK_FORMAT_B8G8R8A8_SRGB, "actual eight-sample color format changed");
     Require(state.color.address == reinterpret_cast<std::uintptr_t>(colorMemory.data()) && state.color.bytes == 262144u && state.color.extent.width == 37u && state.color.extent.height == 69u, "actual MSAA guest color allocation was multiplied or misaligned");
     Require(state.renderExtent.width == 37u && state.renderExtent.height == 69u, "actual attachment extents disagree");
+    Require(state.depth->htileAddress == reinterpret_cast<std::uintptr_t>(stencilMemory.data()), "MSAA depth lost its HTILE clear address");
     locations(state);
     keyCoverage(queue);
     auto standard8 = queue;

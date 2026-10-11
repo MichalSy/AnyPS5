@@ -643,10 +643,11 @@ void MappingLifetimeTests(const Device& device, SampleProgram& sampler) {
 
 void MultisampleDepthSampling(const Device& device) {
     const auto& context = device.GetContext();
-    GuestBlock memory(Block);
+    GuestBlock memory(2u * Block);
     DepthTarget target{memory.Address(), 0, {32, 32}, VK_FORMAT_D32_SFLOAT, 0.625f, 0};
     target.surfaceExtent = target.extent;
     target.samples = VK_SAMPLE_COUNT_2_BIT;
+    target.htileAddress = memory.Address() + Block;
     SampleProgram sampler(context, true);
     DepthSurfaceView(context, target);
     auto words = Descriptor(target, 0, 1);
@@ -658,6 +659,17 @@ void MultisampleDepthSampling(const Device& device) {
     Require(texture != nullptr && texture->View() != VK_NULL_HANDLE, "MSAA depth did not produce a sampled view");
     for (unsigned sample = 0; sample < 2u; ++sample) {
         Require(std::abs(sampler.Red(*texture, static_cast<float>(sample)) - 0.625f) < 0.00001f, "MSAA depth sample does not contain the depth clear value");
+    }
+    target.clearDepth = 0.0f;
+    DepthSurfaceView(context, target);
+    Require(std::abs(sampler.Red(*texture, 0) - 0.625f) < 0.00001f, "MSAA register update cleared existing depth without a metadata fill");
+    std::vector<std::uint32_t> clearWords(32768u / sizeof(std::uint32_t), 0u);
+    AgcDriver::GuestMemory::Write(target.htileAddress, std::as_bytes(std::span(clearWords)), 4);
+    NoteDepthMetadataFill(context.device, target.htileAddress, 32768u, 0u);
+    DepthSurfaceView(context, target);
+    for (unsigned sample = 0; sample < 2u; ++sample) {
+        Require(std::abs(sampler.Red(*texture, static_cast<float>(sample))) < 0.00001f,
+            "MSAA HTILE clear left the previous frame's depth in a sample");
     }
     const auto identityView = DepthSurfaceTexture(context, words, resource, Identity);
     Require(DepthSurfaceHolds(context, words, Identity, identityView.get()), "MSAA depth view was not recognized for reuse");

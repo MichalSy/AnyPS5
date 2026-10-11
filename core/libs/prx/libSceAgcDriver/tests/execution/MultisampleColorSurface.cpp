@@ -259,6 +259,7 @@ void FormatTests(AgcDriver::VulkanDevice& device, Block& block, VkFormat format,
     Flush(device, block);
     Check(block, expected, name + " distinct eight-sample upload/flush and untouched padding");
     Draw(device, color, Partial, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT);
+    Require(device.AfterRecordedWork([] {}, false), "a native multisample draw must remain recorded without a per-draw submission and wait");
     const auto conflict = Oracle(4, 5, 3) + ByteChannel(format, 0);
     Require(block.data[conflict] == expected[conflict] && block.data[conflict] != std::byte{0xff}, "the real GPU write must remain pending before the CPU conflict");
     ExpectWrite(expected, format, Partial, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT);
