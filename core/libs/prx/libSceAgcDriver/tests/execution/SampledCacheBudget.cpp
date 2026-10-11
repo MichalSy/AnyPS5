@@ -271,6 +271,34 @@ void snapshotTests(const Context& context) {
     Require(oldest.expired(), "the least recently used snapshot was not evicted past the budget");
     Require(TextureCacheUsage().sampledBytes <= Budget, "the sampled texture cache holds more than its budget");
     ClearCachedTextures(context.device);
+    {
+        const auto address = block.Surface(0);
+        const auto keysAddress = block.Surface(1);
+        Require(!AgcDriver::GuestMemory::Watched(address, SurfaceBytes) && AgcDriver::GuestMemory::CollectWrites(address, SurfaceBytes) == 0, "the clear snapshot fixture is unexpectedly watched");
+        auto words = Descriptor(address);
+        words[6] = (1u << 21u) | static_cast<std::uint32_t>(((keysAddress >> 8u) & 0xffu) << 24u);
+        words[7] = static_cast<std::uint32_t>(keysAddress >> 16u);
+        Require(DecodeTextureResource(words).dccAddress == keysAddress, "the clear snapshot descriptor has the wrong key address");
+        auto* keys = reinterpret_cast<void*>(keysAddress);
+        auto* texels = reinterpret_cast<std::byte*>(address);
+        const auto keyBytes = SurfaceBytes / 256u;
+        const auto sampled = [&] { return CachedSampledTexture(context, words); };
+        std::memset(keys, 0x00, keyBytes);
+        const auto zero = sampled();
+        Require(!zero->ViewsStorageImage() && sampled() == zero, "an untracked clear snapshot was not reused");
+        std::memset(texels, 0x22, SurfaceBytes);
+        Require(sampled() == zero, "raw texel writes invalidated an unchanged clear snapshot");
+        std::memset(keys, 0x40, keyBytes);
+        const auto one = sampled();
+        Require(one != zero && sampled() == one, "a changed clear key did not replace and reuse its snapshot");
+        std::memset(keys, 0xff, keyBytes);
+        const auto uncompressed = sampled();
+        Require(uncompressed != one && sampled() == uncompressed, "uncompressed keys did not replace and reuse the CPU snapshot");
+        texels[0] = std::byte{0x33};
+        const auto changed = sampled();
+        Require(changed != uncompressed && sampled() == changed, "an untracked CPU write did not replace and reuse its snapshot");
+    }
+    ClearCachedTextures(context.device);
     constexpr std::uint32_t TinySide = 16;
     const auto tiny = Sampled(context, block.Surface(0), TinySide);
     const auto guestBytes = DescribeSurface(Resource(block.Surface(0), TinySide)).guestBytes;
