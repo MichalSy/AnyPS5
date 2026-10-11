@@ -8,6 +8,9 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "tests/VideoOutTestEnvironment.hpp"
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+#include "tests/DebugBridgeTestPeer.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -453,6 +456,86 @@ void testOverlay() {
     LibcRunShutdown_nid_postfix();
 }
 
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+void testBridge() {
+    BridgeCollector collector;
+    for (const auto* name : {"APS5_DEBUG_BRIDGE", "FRAMERIFT_BRIDGE_HOST", "FRAMERIFT_BRIDGE_PORT",
+        "FRAMERIFT_BRIDGE_SESSION", "FRAMERIFT_GAME_ID"}) UnsetEnvironment(name);
+    SetEnvironment("FRAMERIFT_BRIDGE_HOST", "127.0.0.1");
+    SetEnvironment("FRAMERIFT_BRIDGE_PORT", std::to_string(collector.Port()));
+    SetEnvironment("FRAMERIFT_BRIDGE_SESSION", "framerift-debug-bridge-test");
+    SetEnvironment("FRAMERIFT_GAME_ID", "PPSA90000");
+    const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
+    auto cfg = VideoOutDriver::Get().GetConfig(handle);
+    BridgePacket hello;
+    check(collector.Receive(std::chrono::milliseconds(1000), hello), "VideoOut did not start the bridge");
+    CheckMonitoringState(Member(parseJsonDocument(hello.text), "monitoring", JsonType::Object), false, 0);
+    const auto flip = [](int output, const std::shared_ptr<VideoOutConfig>& config) {
+        std::uint64_t target;
+        {
+            std::lock_guard lock(config->mutex);
+            target = config->flipStatus.count + 1;
+        }
+        check(sceVideoOutSubmitFlip(output, VIDEO_OUT_BUFFER_INDEX_BLACK, 1, 0) == 0, "bridge test flip failed");
+        std::unique_lock lock(config->mutex);
+        check(config->vblankCond.wait_for(lock, std::chrono::seconds(15), [&] { return config->failure || config->flipStatus.count == target; }), "bridge test flip did not complete");
+        if (config->failure) std::rethrow_exception(config->failure);
+        return target;
+    };
+    flip(handle, cfg);
+    NoEvents(collector, std::chrono::milliseconds(120));
+    collector.Send(hello.source, Command(1, "enable", R"({"enabled":true})"));
+    Await(collector, "command_received", "enable");
+    CheckMonitoringState(Member(Await(collector, "command_completed", "enable"), "result", JsonType::Object), true, 1);
+    const auto count = flip(handle, cfg);
+    auto first = Await(collector, "event");
+    auto data = Member(first, "data", JsonType::Object);
+    check(Member(first, "name", JsonType::String).stringValue == "frame_timing" && Unsigned(first, "frame") > 0, "missing genuine FrameTiming correlation");
+    check(Unsigned(data, "output_handle") == static_cast<std::uint64_t>(handle)
+        && Unsigned(data, "output_generation") == cfg->generation && Unsigned(data, "completed_flip_count") == count,
+        "bridge telemetry does not match successful VideoOut status");
+    Member(data, "flip_interval_us", JsonType::Null);
+    const auto firstTimestamp = Unsigned(data, "timestamp_us");
+    flip(handle, cfg);
+    auto next = Await(collector, "event");
+    data = Member(next, "data", JsonType::Object);
+    check(Unsigned(next, "frame") > Unsigned(first, "frame") && Unsigned(data, "completed_flip_count") == count + 1,
+        "completed frame identity did not increase");
+    check(Unsigned(data, "timestamp_us") > firstTimestamp
+        && Unsigned(data, "flip_interval_us") == Unsigned(data, "timestamp_us") - firstTimestamp,
+        "bridge interval is not the successful flip clock difference");
+    const int overlay = sceVideoOutOpen(255, VIDEO_OUT_BUS_TYPE_OVERLAY, 0, nullptr);
+    auto overlayCfg = VideoOutDriver::Get().GetConfig(overlay);
+    flip(overlay, overlayCfg);
+    NoEvents(collector, std::chrono::milliseconds(120));
+    sceVideoOutClose(overlay);
+    sceVideoOutClose(handle);
+    check(sceVideoOutOpen(255, VIDEO_OUT_BUS_TYPE_MAIN, 0, nullptr) == handle, "bridge reopen changed handle");
+    auto reopened = VideoOutDriver::Get().GetConfig(handle);
+    flip(handle, reopened);
+    data = Member(Await(collector, "event"), "data", JsonType::Object);
+    check(Unsigned(data, "output_generation") > cfg->generation && Unsigned(data, "completed_flip_count") == 1, "bridge lost reopened output generation");
+    Member(data, "flip_interval_us", JsonType::Null);
+    auto gate = std::make_shared<Gate>();
+    AgcDriverRegisterVideoOutput_nid_postfix(7, gate);
+    std::array<std::uint32_t, 6> held{0xc004105c, 7, 0xfffffffeu, 1, 0, 0};
+    Packet heldPacket{held.data(), 6, 0, {}};
+    check(sceAgcDriverSubmitDcb(&heldPacket) == 0, "cancelled bridge fixture gate failed");
+    check(sceVideoOutSubmitFlip(handle, VIDEO_OUT_BUFFER_INDEX_BLACK, 1, 0) == 0, "cancelled bridge fixture flip failed");
+    sceVideoOutClose(handle);
+    gate->Release();
+    AgcDriverWaitIdle_nid_postfix();
+    {
+        std::unique_lock lock(reopened->mutex);
+        check(reopened->vblankCond.wait_for(lock, std::chrono::seconds(10), [&] { return reopened->flipStatus.flipPendingNum == 0; }), "cancelled flip remained pending");
+        check(reopened->flipStatus.count == 1, "cancelled bridge fixture flip succeeded");
+    }
+    NoEvents(collector, std::chrono::milliseconds(120));
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, gate);
+    LibcRunShutdown_nid_postfix();
+}
+#endif
+
 void testUnavailable() {
     const auto message = expectFailure([] { sceVideoOutOpen(255, 0, 0, nullptr); });
     check(expectFailure([] { sceVideoOutOpen(255, 0, 0, nullptr); }) == message, "a second open lost the presentation failure");
@@ -674,6 +757,10 @@ void testOneDevice() {
 int main(int argc, char** argv) {
     VideoOutTestEnvironment environment;
     try {
+        #ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+        if (argc == 2 && std::string(argv[1]) == "bridge") testBridge();
+        else
+#endif
         if (argc == 2 && std::string(argv[1]) == "decode") testDecode();
         else if (argc == 2 && std::string(argv[1]) == "controls") testControls();
         else if (argc == 2 && std::string(argv[1]) == "present") testPresentation();

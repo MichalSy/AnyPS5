@@ -20,6 +20,9 @@
 #if APS5_ENABLE_TIMING_LOG
 #include "prx/libSceVideoOut/include/FrameTimingLog.hpp"
 #endif
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+#include "prx/libkernel/System/include/DebugBridge.hpp"
+#endif
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -270,6 +273,9 @@ VideoOutDriver::VideoOutDriver() {
         attached.get();
         vblankThread = std::jthread([this](std::stop_token token) { vblankLoop(token); });
         LibcRegisterShutdown_nid_postfix([] { VideoOutDriver::Get().Shutdown(); });
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+        DebugBridgeStart_nid_no_patch();
+#endif
     } catch (...) {
         if (vblankThread.joinable()) {
             vblankThread.request_stop();
@@ -459,7 +465,7 @@ void VideoOutDriver::vblankEnd() {
     }
 }
 
-void VideoOutDriver::processFlip(FlipRequest& req) {
+std::uint64_t VideoOutDriver::processFlip(FlipRequest& req) {
     AgcDriver::PerformanceContext timingContext(req.timing.get());
     AgcDriver::PerformanceTimer timing("VideoOut.Flip");
     {
@@ -468,7 +474,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {
             req.ReleaseLocked();
-            return;
+            return 0;
         }
         require(req.ready && !req.terminal && req.generation == req.cfg->generation, "stale or incomplete flip request");
         const auto interval = static_cast<uint64_t>(req.flipRate + 1);
@@ -480,7 +486,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {
             req.ReleaseLocked();
-            return;
+            return 0;
         }
         req.cfg->lastFlipVblank = req.cfg->vblankStatus.count;
     }
@@ -521,7 +527,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     req.cfg->CheckAlive();
     if (req.cfg->Closed()) {
         req.ReleaseLocked();
-        return;
+        return 0;
     }
     require(!req.terminal && req.cfg->generation == req.generation, "flip cancelled during presentation");
     require(req.gpuComplete, "flip submitted before GPU completion");
@@ -543,6 +549,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     req.terminal = true;
     req.cfg->vblankCond.notify_all();
     timing.Mark("notify_game");
+    return req.cfg->flipStatus.count;
 }
 
 void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& started) {
@@ -596,8 +603,17 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 require(current->timing != nullptr, "missing presentation timing");
                 const auto dequeued = AgcDriver::FrameTiming::Clock::now();
                 current->timing->Add(current->timing->Get("VideoOut", "queue"), dequeued - current->queuedAt);
-                processFlip(*current);
+                const auto completedFlipCount = processFlip(*current);
                 const auto finished = AgcDriver::FrameTiming::Clock::now();
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+                if (completedFlipCount != 0 && current->cfg->busType == VIDEO_OUT_BUS_TYPE_MAIN) {
+                    DebugBridgePublishFrame_nid_no_patch({current->timing->Id(), static_cast<std::uint32_t>(current->outputHandle),
+                        current->generation, completedFlipCount,
+                        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(finished.time_since_epoch()).count())});
+                }
+#else
+                static_cast<void>(completedFlipCount);
+#endif
                 AgcDriver::FrameTiming::Clock::duration interval{};
                 {
                     std::lock_guard lock(current->cfg->mutex);

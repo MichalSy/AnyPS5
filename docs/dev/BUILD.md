@@ -59,6 +59,7 @@ Project switches accept `ON` or `OFF`:
 | `-DANYPS5_ENABLE_SPIRV_TOOLS=ON` | `OFF`   | Enable SPIR-V validation and optimization.       |
 | `-DANYPS5_USE_SYSTEM_DEPS=ON`    | `OFF`   | Resolve SDL2, freetype, Vulkan-Headers, SPIRV-Headers, glslang and SPIRV-Tools from the system instead of the submodules. |
 | `-DAPS5_ENABLE_TIMING_LOG=ON`    | `OFF`   | Compile frame timing logging.                    |
+| `-DANYPS5_ENABLE_DEBUG_BRIDGE=ON` | `OFF`   | Include the optional FrameRift UDP connection. |
 | `-DAPS5_AGC_CREATE_LOG=OFF`      | `ON`    | Disable successful `sceAgcCreateShader` logging. |
 | `-DAGC_BUILD_VISUAL_TEST=ON`     | `OFF`   | Build the standalone AGC SPIR-V visual test.     |
 
@@ -88,6 +89,28 @@ ctest --test-dir build/write-watch --output-on-failure
 ```
 
 With `CMAKE_OSX_ARCHITECTURES=x86_64` Apple silicon runs the tests through Rosetta, which is how relinked titles run; without it they run natively. The full `BUILD_TESTING` build on macOS also registers them.
+
+## FrameRift connection
+
+Build with `ANYPS5_ENABLE_DEBUG_BRIDGE=ON` to include the connection worker in
+`libkernel.prx` and start it when the video output driver initializes. Rebuild the
+patched runtime libraries with `cmake --build build --target libs --parallel`.
+With the option off, no bridge worker or startup call is compiled.
+
+FrameRift supplies `FRAMERIFT_BRIDGE_HOST=127.0.0.1`, `FRAMERIFT_BRIDGE_PORT`,
+`FRAMERIFT_BRIDGE_SESSION` and `FRAMERIFT_GAME_ID` to its managed game. The port
+must be 1-65535 and both IDs must be nonempty UTF-8 strings of at most 128 bytes.
+Missing or invalid configuration leaves the bridge inactive. Set
+`APS5_DEBUG_BRIDGE=0` to disable a compiled bridge for a run.
+
+One independent worker sends a UDP v1 `hello` and one-second heartbeats from the
+same nonblocking loopback socket, periodically repeating `hello` for reconnection.
+It never waits for FrameRift. Normal runtime shutdown sends a best-effort
+`goodbye`; crashes and forced termination are detected by the receiver's timeout.
+An unavailable receiver does not stop the game or change existing logging.
+
+This version advertises an empty capability list. It only establishes connection
+state; it provides no frame measurements, input commands, screenshots or game pause.
 
 ## Pipeline statistics
 

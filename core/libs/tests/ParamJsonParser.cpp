@@ -90,12 +90,22 @@ static void CheckNumberSyntax(const std::filesystem::path& path) {
     }
 }
 
+static void CheckStringsAndDefaults(const std::filesystem::path& path) {
+    const auto parsed = ParseText(path, R"({"titleId":"PPSA00006","titleId":"ignored","localizedParameters":{"en-US":{"titleName":"Quoted \"title\" \uD83D\uDE80"}},"other":[[[[[[[[[[true]]]]]]]]]]})");
+    Require(parsed.titleId == "PPSA00006" && parsed.title == "Quoted \"title\" \xF0\x9F\x9A\x80", "Shared decoder changed metadata string or duplicate behavior");
+    bool rejected = false;
+    try { ParseText(path, R"({"titleId":"PPSA00006","localizedParameters":{"en-US":{"titleName":"\uD800"}}})"); }
+    catch (const std::exception&) { rejected = true; }
+    Require(rejected, "Metadata decoder accepted an unpaired surrogate");
+}
+
 int main() {
     const auto path = std::filesystem::temp_directory_path() / ("anyps5-param-json-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
     int result = 0;
     try {
         CheckNumberSyntax(path);
+        CheckStringsAndDefaults(path);
         const std::pair<const char*, std::uint64_t> sizes[] = {
             {"", 0}, {"0", 0}, {"-0", 0}, {"0.25", 0}, {"0e3", 0}, {"0E+3", 0}, {"-0e-3", 0}, {"4096", 4096},
             {"9007199254740993", 9007199254740993ull},
