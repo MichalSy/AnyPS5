@@ -31,7 +31,11 @@ using GuestRudpEventHandler = void(APS5_VABI*)(int, int, int, void*);
 std::mutex g_mutex;
 bool g_inited = false;
 int g_next_ctx = 0;
-std::map<int, bool> g_ctx;  // id -> bound
+struct Context {
+    bool bound = false;
+    std::map<int, uint32_t> options;
+};
+std::map<int, Context> g_ctx;
 GuestRudpEventHandler g_handler = nullptr;
 void* g_handler_arg = nullptr;
 
@@ -101,6 +105,30 @@ int APS5_VABI sceRudpEnableInternalIOThread(uint32_t stack_size, uint32_t priori
     return g_inited ? 0 : RUDP_ERROR_NOT_INITIALIZED;
 }
 
+int APS5_VABI sceRudpEnableInternalIOThread2(uint32_t stack_size, uint32_t priority, uint64_t affinity) {
+    (void)affinity;
+    return sceRudpEnableInternalIOThread(stack_size, priority);
+}
+
+int APS5_VABI sceRudpProcessEvents(uint64_t timeout) {
+    (void)timeout;
+    std::lock_guard<std::mutex> lk(g_mutex);
+    // The offline backend has no pending transport events to dispatch.
+    return g_inited ? 0 : RUDP_ERROR_NOT_INITIALIZED;
+}
+
+int APS5_VABI sceRudpNetReceived(int socket, const void* data, uint64_t len, const void* from, uint32_t from_len) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_inited) {
+        return RUDP_ERROR_NOT_INITIALIZED;
+    }
+    if (socket < 0 || data == nullptr || len == 0 || from == nullptr || from_len == 0) {
+        return RUDP_ERROR_INVALID_ARGUMENT;
+    }
+    // Discard incoming datagrams without creating connections or invoking guest callbacks.
+    return 0;
+}
+
 int APS5_VABI sceRudpSetEventHandler(GuestRudpEventHandler handler, void* arg) {
     std::lock_guard<std::mutex> lk(g_mutex);
     g_handler = handler;
@@ -119,7 +147,7 @@ int APS5_VABI sceRudpCreateContext(GuestRudpEventHandler handler, void* arg, int
         return RUDP_ERROR_NOT_INITIALIZED;
     }
     const int id = g_next_ctx++;
-    g_ctx[id] = false;
+    g_ctx.emplace(id, Context{});
     *ctx_id = id;
     return 0;
 }
@@ -135,19 +163,70 @@ int APS5_VABI sceRudpBind(int ctx_id, uint16_t vport, int transport, uint16_t po
     if (!valid_ctx(ctx_id)) {
         return RUDP_ERROR_INVALID_CONTEXT_ID;
     }
-    g_ctx[ctx_id] = true;
+    g_ctx[ctx_id].bound = true;
     return 0;
 }
 
 int APS5_VABI sceRudpSetOption(int ctx_id, int option, const void* value, uint32_t len) {
-    (void)option;
-    (void)value;
-    (void)len;
     std::lock_guard<std::mutex> lk(g_mutex);
     if (!g_inited) {
         return RUDP_ERROR_NOT_INITIALIZED;
     }
-    return valid_ctx(ctx_id) ? 0 : RUDP_ERROR_INVALID_CONTEXT_ID;
+    if (ctx_id < 0) {
+        return RUDP_ERROR_INVALID_ARGUMENT;
+    }
+    if (!valid_ctx(ctx_id)) {
+        return RUDP_ERROR_INVALID_CONTEXT_ID;
+    }
+    if (value == nullptr || len != sizeof(uint32_t) ||
+        (option != 2 && option != 3 && option != 5 && option != 6 && option != 9)) {
+        return RUDP_ERROR_INVALID_ARGUMENT;
+    }
+    uint32_t stored;
+    std::memcpy(&stored, value, sizeof(stored));
+    g_ctx[ctx_id].options[option] = stored;
+    return 0;
+}
+
+int APS5_VABI sceRudpGetOption(int ctx_id, int option, void* value, uint32_t len) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_inited) {
+        return RUDP_ERROR_NOT_INITIALIZED;
+    }
+    if (ctx_id < 0) {
+        return RUDP_ERROR_INVALID_ARGUMENT;
+    }
+    const auto context = g_ctx.find(ctx_id);
+    if (context == g_ctx.end()) {
+        return RUDP_ERROR_INVALID_CONTEXT_ID;
+    }
+    if (value == nullptr || len != sizeof(uint32_t) ||
+        (option != 2 && option != 3 && option != 5 && option != 6 && option != 9)) {
+        return RUDP_ERROR_INVALID_ARGUMENT;
+    }
+    const auto stored = context->second.options.find(option);
+    if (stored == context->second.options.end()) {
+        return RUDP_ERROR_NOT_ACCEPTABLE;
+    }
+    std::memcpy(value, &stored->second, sizeof(stored->second));
+    return 0;
+}
+
+int APS5_VABI sceRudpGetRemoteInfo(int ctx_id, void* address, uint32_t* address_len, uint16_t* vport) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_inited) {
+        return RUDP_ERROR_NOT_INITIALIZED;
+    }
+    if (ctx_id < 0) {
+        return RUDP_ERROR_INVALID_ARGUMENT;
+    }
+    if (!valid_ctx(ctx_id)) {
+        return RUDP_ERROR_INVALID_CONTEXT_ID;
+    }
+    if (address == nullptr || address_len == nullptr || *address_len == 0 || vport == nullptr) {
+        return RUDP_ERROR_INVALID_ARGUMENT;
+    }
+    return RUDP_ERROR_NOT_ACCEPTABLE;
 }
 
 int APS5_VABI sceRudpInitiate(int ctx_id, const void* to, uint32_t tolen, uint16_t vport) {
