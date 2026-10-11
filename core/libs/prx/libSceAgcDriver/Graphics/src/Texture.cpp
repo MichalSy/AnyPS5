@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -12,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -817,7 +819,7 @@ private:
 
 // Storage images whose results have not reached guest memory yet.
 struct PendingWrites {
-    std::mutex mutex;
+    SlimMutex mutex;
     PendingList textures;
     // Images taken out of `textures` by a FlushPending still storing them (see adjacentPendingUnchanged).
     std::vector<StorageTexture*> flushing;
@@ -983,7 +985,24 @@ bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const
 
 // The image being validated by Refresh: its own pending results are what the next dispatch wants,
 // so the comparison with guest memory must not flush them.
-thread_local const StorageTexture* refreshing = nullptr;
+class StorageFlushExemption;
+thread_local const StorageFlushExemption* refreshing = nullptr;
+
+class StorageFlushExemption {
+public:
+    explicit StorageFlushExemption(const StorageTexture* texture) : texture(texture), previous(std::exchange(refreshing, this)) {}
+    ~StorageFlushExemption() { refreshing = previous; }
+    static bool Contains(const StorageTexture* texture) {
+        for (auto* exemption = refreshing; exemption != nullptr; exemption = exemption->previous) {
+            if (exemption->texture == texture) return true;
+        }
+        return false;
+    }
+
+private:
+    const StorageTexture* texture;
+    const StorageFlushExemption* previous;
+};
 
 void FlushHook(std::uint64_t address, std::size_t bytes) {
     StorageTexture::FlushPending(address, bytes);
@@ -1377,6 +1396,22 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+namespace {
+
+bool targetProofMemo() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_TARGET_PROOF_MEMO"); return text == nullptr || std::strcmp(text, "0") != 0; }();
+    return enabled;
+}
+
+std::atomic<std::uint64_t> targetProofHits{0};
+std::atomic<std::uint64_t> targetProofMisses{0};
+
+}
+
+std::pair<std::uint64_t, std::uint64_t> StorageTexture::TargetProofCounts() {
+    return {targetProofHits.load(std::memory_order_relaxed), targetProofMisses.load(std::memory_order_relaxed)};
+}
+
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1387,13 +1422,9 @@ bool StorageTexture::Refresh() {
         return true;
     }
     refreshProof = {};
-    struct Exempt {
-        const StorageTexture* previous;
-        ~Exempt() { refreshing = previous; }
-    } exempt{refreshing};
+    const StorageFlushExemption exempt(this);
     // This image's own pending results stay on the GPU, where the next dispatch wants them (the
     // flush below and the compare through the hook skip it).
-    refreshing = this;
     NoteProved();
     const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
     if (descriptor.dccAddress != 0 && keyCount != 0 && otherPendingOverlaps(descriptor.dccAddress, keyCount)) {
@@ -1671,6 +1702,27 @@ bool StorageTexture::Refresh() {
     return false;
 }
 
+void StorageTexture::ReplaceFromMemory(bool fullyCovered, const std::function<bool()>& publish) {
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "native depth publication requires the GPU lock");
+    Require(!anyLayerPending() || fullyCovered, "native depth publication cannot discard storage results in depth padding");
+    const StorageFlushExemption exempt(this);
+    if (!publish()) {
+        Refresh();
+        return;
+    }
+    layerPending.assign(trackedLayers, false);
+    reconcilePending();
+    invalidateOriginal();
+    refreshProof = {};
+    forgetBorrowed(0, trackedLayers);
+    upload();
+}
+
+bool StorageTexture::PendingWrites() const {
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "storage pending results require the GPU lock");
+    return anyLayerPending();
+}
+
 DccKeys StorageTexture::ProvedKeys() const {
     std::optional<DccKeys> keys;
     if (descriptor.dccAddress != 0 && uploadedKeys == DccKeys::Uncompressed) keys = WaitForKeyWriters(descriptor, guestBytes);
@@ -1704,20 +1756,30 @@ bool StorageTexture::refreshProved() {
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
         if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return false;
-        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
-    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
     const auto serial = PendingSerial();
+    if (targetProofMemo() && epoch != 0 && epoch == refreshProof.epoch && serial == refreshProof.pendingSerial && GuestMemory::UnwatchSerial() == refreshProof.unwatched && GuestAllocations::GuestAllocationsGeneration_nid_postfix() == refreshProof.registryGeneration && GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) {
+        targetProofHits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    if (targetProofMemo()) targetProofMisses.fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < used; ++i) {
+        if (GuestMemory::CollectWrites(queries[i].address, queries[i].bytes) == 0) return false;
+    }
+    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
     if (serial != refreshProof.pendingSerial) {
         if (otherPendingOverlaps()) return false;
         refreshProof.pendingSerial = serial;
     }
+    refreshProof.epoch = epoch;
+    refreshProof.unwatched = GuestMemory::UnwatchSerial();
+    refreshProof.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     return true;
 }
 
@@ -1727,7 +1789,7 @@ void StorageTexture::takeRefreshProof(bool aliased) {
     if (descriptor.dccAddress != 0 && (keyProof.generation == 0 || keyProof.keys != uploadedKeys)) return;
     const auto serial = PendingSerial();
     if (otherPendingOverlaps()) return;
-    refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
+    refreshProof = {generation, serial, keyProof.generation, uploadedKeys, GuestMemory::ThreadCollectEpoch(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {
@@ -1768,8 +1830,14 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 
 }
 
+void StorageTexture::invalidateOriginal() {
+    originalValid = false;
+    std::vector<std::byte>().swap(original);
+}
+
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     comparedGuestBytes = {};
+    original.resize(static_cast<std::size_t>(guestBytes));
     const bool complete = layers == nullptr || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers != nullptr && !(*layers)[layer]) continue;
@@ -1781,11 +1849,7 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
 
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
     if (!originalValid) return false;
-    struct Exempt {
-        const StorageTexture* previous;
-        ~Exempt() { refreshing = previous; }
-    } exempt{refreshing};
-    refreshing = this;
+    const StorageFlushExemption exempt(this);
     Require(address >= descriptor.baseAddress && bytes <= guestBytes && address - descriptor.baseAddress <= guestBytes - bytes, "texture comparison exceeds its snapshot");
     Require(original.size() == guestBytes, "texture comparison has no complete snapshot");
     GuestMemory::FlushGpuWrites(address, bytes);
@@ -1825,7 +1889,6 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
-    original.resize(static_cast<std::size_t>(guestBytes));
     // A layer selection applies to the direct path alone (the others upload everything); it names
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
@@ -1902,7 +1965,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         return;
     }
     if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) originalValid = false;
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+            invalidateOriginal();
+        }
         else captureGuestBytes(layers);
         stampLayers(true);
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
@@ -2024,6 +2089,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
         return;
     }
+    original.resize(static_cast<std::size_t>(guestBytes));
     originalValid = true;
     forgetBorrowed(0, trackedLayers);
     stampLayers(false);
@@ -2785,10 +2851,9 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
-        const auto* exempt = refreshing;
         for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
-            if (texture != except && texture != exempt && texture->overlaps(address, bytes)) {
+            if (texture != except && !StorageFlushExemption::Contains(texture) && texture->overlaps(address, bytes)) {
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     ++it;
@@ -2932,9 +2997,8 @@ std::vector<std::shared_ptr<StorageTexture>> StorageTexture::overlappingPending(
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     if (!pending.textures.MayOverlap(address, bytes)) return overlapping;
-    const auto* exempt = refreshing;
     for (auto* texture : pending.textures) {
-        if (texture == exempt || !texture->overlaps(address, bytes) || !texture->pendingUnitInside(address, bytes)) continue;
+        if (StorageFlushExemption::Contains(texture) || !texture->overlaps(address, bytes) || !texture->pendingUnitInside(address, bytes)) continue;
         if (auto alive = texture->weak_from_this().lock()) overlapping.push_back(std::move(alive));
     }
     return overlapping;
@@ -3059,7 +3123,7 @@ bool StorageTexture::evictStale(std::uint64_t address, std::size_t bytes, std::s
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (selected(layer)) layerPending[layer] = false;
     }
-    originalValid = false;
+    invalidateOriginal();
     if (!anyLayerPending()) {
         ++dropped;
         staleEvicted.fetch_add(1, std::memory_order_relaxed);
@@ -3115,20 +3179,19 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
     std::lock_guard lock(pending.mutex);
     std::size_t discarded = 0;
     const auto end = address + bytes;
-    const auto* exempt = refreshing;
     for (auto it = pending.textures.begin(); it != pending.textures.end();) {
         auto* texture = *it;
         const auto begin = texture->descriptor.baseAddress;
-        if (texture != exempt && begin >= address && begin + texture->guestBytes <= end) {
+        if (!StorageFlushExemption::Contains(texture) && begin >= address && begin + texture->guestBytes <= end) {
             // The content no longer matches guest memory anywhere: the next use re-uploads once the
             // fill stamped the range, never from a matching `original` (the fill may not have
             // touched the bytes a CPU-path upload copied).
             texture->dirty = false;
             texture->layerPending.assign(texture->trackedLayers, false);
-            texture->originalValid = false;
+            texture->invalidateOriginal();
             it = pending.textures.erase(it);
             ++discarded;
-        } else if (texture != exempt && texture->blockUnits && texture->overlaps(address, bytes)) {
+        } else if (!StorageFlushExemption::Contains(texture) && texture->blockUnits && texture->overlaps(address, bytes)) {
             // Its units wholly inside the range are dead too (re-uploaded from the range's bytes at
             // the next use, never from a matching `original`: the dropped units hold results the
             // bytes never received); the others stay pending.
@@ -3141,7 +3204,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
                 dropped = true;
             }
             if (dropped) {
-                texture->originalValid = false;
+                texture->invalidateOriginal();
                 ++discarded;
             }
             if (dropped && !texture->anyLayerPending()) {
@@ -3341,7 +3404,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
     recorder->EndGpuTiming(timing, guestBytes);
-    originalValid = false;
+    invalidateOriginal();
     uploadedKeys = keys;
     filledKeys = DccKeys::Uncompressed;
     keyProof = {};
@@ -3438,7 +3501,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
         std::lock_guard lock(live.mutex);
         for (auto* texture : live.textures) {
             if (texture == this || texture->released || !texture->overlaps(begin, bytes)) continue;
-            texture->originalValid = false;
+            texture->invalidateOriginal();
             if (texture->descriptor.dccAddress != 0) aliasedKeys = true;
         }
     }
@@ -3487,7 +3550,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     // memo hit of this submission's epoch would not consume pages the game dirtied since that
     // walk, the write-back's own walk would stamp them above this generation and keep their
     // blocks, and the fill's pattern would be lost in them.
-    originalValid = false;
+    invalidateOriginal();
     uploadedKeys = DccKeys::Uncompressed;
     if (layer != WholeImage && trackedLayers > 1) {
         // The cleared layer's units alone: their stamps above lie below this generation, the other
@@ -3509,8 +3572,39 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
 }
 
 void StorageTexture::WriteBack() {
+    const StorageFlushExemption exempt(this);
     const auto previous = std::exchange(flushReason, "explicit");
     writeBack(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    flushReason = previous;
+}
+
+bool StorageTexture::CanWriteBackLayer(std::uint32_t layer) const {
+    if (layer >= geometry.imageLayers || geometry.imageDepth != 1u || geometry.thick || descriptor.mipCount != 1u ||
+        (descriptor.dimension != TextureDimension::k2D && descriptor.dimension != TextureDimension::k2DArray)) return false;
+    if (geometry.imageLayers == 1u) return true;
+    const auto offset = geometry.GuestLayerOffset(layer);
+    if (descriptor.dccAddress != 0 || descriptor.baseAddress % 65536u != 0u || geometry.layerBytes % 65536u != 0u ||
+        trackedLayerBytes == 0u || offset % trackedLayerBytes != 0u || geometry.layerBytes % trackedLayerBytes != 0u) return false;
+    const auto first = offset / trackedLayerBytes;
+    const auto count = geometry.layerBytes / trackedLayerBytes;
+    return first < trackedLayers && count <= trackedLayers - first;
+}
+
+void StorageTexture::WriteBackLayer(std::uint32_t layer) {
+    Require(CanWriteBackLayer(layer), "storage layer write-back requires a single-mip 2D image or independently tracked aligned array without DCC");
+    const StorageFlushExemption exempt(this);
+    if (geometry.imageLayers == 1u) {
+        WriteBack();
+        return;
+    }
+    const auto offset = geometry.GuestLayerOffset(layer);
+    const auto first = offset / trackedLayerBytes;
+    const auto count = geometry.layerBytes / trackedLayerBytes;
+    std::vector<bool> layers(trackedLayers, false);
+    for (auto unit = first; unit < first + count; ++unit) layers[unit] = layerPending[unit];
+    if (std::none_of(layers.begin(), layers.end(), [](bool pending) { return pending; })) return;
+    const auto previous = std::exchange(flushReason, "depth layer");
+    writeBackLayers(layers);
     flushReason = previous;
 }
 
@@ -3565,7 +3659,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         for (auto* texture : live.textures) {
-            if (texture != this && !texture->released && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) texture->originalValid = false;
+            if (texture != this && !texture->released && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) texture->invalidateOriginal();
         }
     }
     GuestMemory::MarkWritten(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -3616,7 +3710,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     // As after a clear: the image holds the surface, guest memory follows at the write-back (which
     // keeps the 64 KiB blocks the CPU writes from now on; the collect is uncached for the reason
     // given in FillClear).
-    originalValid = false;
+    invalidateOriginal();
     uploadedKeys = DccKeys::Uncompressed;
     layerGeneration.assign(trackedLayers, GuestMemory::CollectWritesUncached(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
     refreshGeneration();
@@ -3962,7 +4056,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // store, the keys stay as they are, and the image is stale there (re-uploaded at its next
         // use, never from a matching `original`).
         emptyWriteBacks.fetch_add(1, std::memory_order_relaxed);
-        originalValid = false;
+        invalidateOriginal();
         settle(true);
         return;
     }
@@ -3973,7 +4067,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             const auto storedBytes = writeBackWindows(*import, keep, firstStored, lastStored, shadowed, imported);
             countStorageWriteBack(storedBytes, true);
             if (profile) Profile().storageGpu += timer.lap();
-            originalValid = false;
+            invalidateOriginal();
             traceKeyStore("block write-back", descriptor, guestBytes);
             if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
             uploadedKeys = DccKeys::Uncompressed;
@@ -4078,7 +4172,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         countStorageWriteBack(storedBytes, true);
         if (profile) Profile().storageGpu += timer.lap();
         // The guest bytes now differ from `original`; other caches of the range see the write.
-        originalValid = false;
+        invalidateOriginal();
         // The keys go the same way as the texels: a fill recorded behind the retile when the
         // metadata is host-imported (no CPU wait for the title's key-writing kernels), else a CPU
         // store (APS5_CPU_DCC_KEYS=1 keeps the CPU store; see DccMetadata.hpp).
@@ -4102,7 +4196,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx: memory no longer registered; %zu pending ranges dropped\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), keep.size());
         unregisteredDropped.fetch_add(1, std::memory_order_relaxed);
-        originalValid = false;
+        invalidateOriginal();
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (layers[layer]) layerPending[layer] = false;
         }
@@ -4113,6 +4207,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
     // the content again only where it did before, or once every unit is stored.
     const bool wasValid = originalValid;
+    original.resize(static_cast<std::size_t>(guestBytes));
     if (!wasValid) GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     DeviceBuffer linear(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -4198,6 +4293,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // The store above is the only write to these pages, so `original` is current at a fresh
     // generation, unless blocks were kept for the CPU: then the image is stale there.
     originalValid = !skippedAny && (wasValid || std::all_of(layers.begin(), layers.end(), [](bool selected) { return selected; }));
+    if (!originalValid) invalidateOriginal();
     // As in the GPU-direct path, but the store's memcpy dirtied this surface's pages in the write
     // watch: a memoized collect would leave them for the next walk to stamp newer than this value
     // (the shared edge block included, undoing the advance), so the walk is made here and

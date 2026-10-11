@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MultisampleColorTransfer_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/MultisampleColorTransferWide_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <algorithm>
@@ -40,21 +41,22 @@ bool overlaps(std::uint64_t address, std::size_t bytes, const ColorTarget& targe
 }
 
 bool supportedFormat(VkFormat format) {
-    return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+    return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB || format == VK_FORMAT_R16G16B16A16_SFLOAT;
 }
 
 void validateTarget(const ColorTarget& target) {
-    Require(target.samples == VK_SAMPLE_COUNT_8_BIT && target.elementBytes == 4 && target.tileMode == ColorTileMode::RenderTarget, "unsupported multisample color geometry");
+    Require((target.samples == VK_SAMPLE_COUNT_2_BIT || target.samples == VK_SAMPLE_COUNT_4_BIT || target.samples == VK_SAMPLE_COUNT_8_BIT) && target.tileMode == ColorTileMode::RenderTarget, "unsupported multisample color geometry");
+    Require(target.elementBytes == (target.format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8u : 4u), "multisample color format and element size disagree");
     Require(target.depth == 1 && target.depthSlice == 0 && target.mipCount == 1 && target.mip == 0 && !target.mipTail, "multisample color arrays, volumes and mipmaps are unsupported");
     Require(target.dccAddress == 0 && target.cmaskAddress == 0, "multisample color metadata is unsupported");
     Require(supportedFormat(target.format), "multisample color format is unsupported");
-    const MultisampleColorLayout geometry(target.extent.width, target.extent.height, target.elementBytes, static_cast<std::uint32_t>(target.samples));
+    const MultisampleColorLayout geometry(target.extent.width, target.extent.height, target.elementBytes, static_cast<std::uint32_t>(target.samples), target.pipeBankXor);
     Require(target.bytes == geometry.Bytes(), "multisample color byte range disagrees with its layout");
 }
 
 bool sameTarget(const ColorTarget& first, const ColorTarget& second) {
     return first.address == second.address && first.extent.width == second.extent.width && first.extent.height == second.extent.height && first.bytes == second.bytes &&
-        first.samples == second.samples && first.elementBytes == second.elementBytes && first.tileMode == second.tileMode && first.depth == second.depth &&
+        first.samples == second.samples && first.pipeBankXor == second.pipeBankXor && first.elementBytes == second.elementBytes && first.tileMode == second.tileMode && first.depth == second.depth &&
         first.depthSlice == second.depthSlice && first.mipCount == second.mipCount && first.mip == second.mip && first.mipTail == second.mipTail &&
         first.dccAddress == second.dccAddress && first.cmaskAddress == second.cmaskAddress;
 }
@@ -62,7 +64,7 @@ bool sameTarget(const ColorTarget& first, const ColorTarget& second) {
 }
 
 MultisampleColorSurface::MultisampleColorSurface(const Context& context, const ColorTarget& target)
-    : context(context), target(target), geometry(target.extent.width, target.extent.height, target.elementBytes, static_cast<std::uint32_t>(target.samples)) {
+    : context(context), target(target), geometry(target.extent.width, target.extent.height, target.elementBytes, static_cast<std::uint32_t>(target.samples), target.pipeBankXor) {
     this->context.bufferPool.reset();
     Require(context.shaderStorageImageMultisample, "multisample color transfers require shaderStorageImageMultisample");
     validateTarget(target);
@@ -71,17 +73,22 @@ MultisampleColorSurface::MultisampleColorSurface(const Context& context, const C
     Require((target.extent.width + 7) / 8 <= context.limits.maxComputeWorkGroupCount[0] && (target.extent.height + 7) / 8 <= context.limits.maxComputeWorkGroupCount[1] && static_cast<std::uint32_t>(target.samples) <= context.limits.maxComputeWorkGroupCount[2], "multisample color transfer exceeds compute limits");
     acquireBacking();
     GuestMemory::CheckRange(reinterpret_cast<const void*>(target.address), target.bytes, geometry.Alignment(), true);
+    nativeFormat = target.elementBytes == 8u ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    const auto storageFormat = target.elementBytes == 8u ? VK_FORMAT_R16G16B16A16_UINT : VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormatProperties storageProperties{};
+    context.formatProperties(context.physical, storageFormat, &storageProperties);
+    Require((storageProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0, "multisample color transfer format cannot be a storage image");
     constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     constexpr VkImageCreateFlags flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     VkImageFormatProperties supported{};
-    Check(context.imageFormatProperties(context.physical, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, flags, &supported), "vkGetPhysicalDeviceImageFormatProperties multisample color");
+    Check(context.imageFormatProperties(context.physical, nativeFormat, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, flags, &supported), "vkGetPhysicalDeviceImageFormatProperties multisample color");
     Require((supported.sampleCounts & target.samples) != 0 && target.extent.width <= supported.maxExtent.width && target.extent.height <= supported.maxExtent.height, "device does not support this multisample color image");
     VkShaderModule module = VK_NULL_HANDLE;
     try {
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.flags = flags;
         info.imageType = VK_IMAGE_TYPE_2D;
-        info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        info.format = nativeFormat;
         info.extent = {target.extent.width, target.extent.height, 1};
         info.mipLevels = 1;
         info.arrayLayers = 1;
@@ -101,7 +108,7 @@ MultisampleColorSurface::MultisampleColorSurface(const Context& context, const C
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        viewInfo.format = storageFormat;
         viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkImageViewUsageCreateInfo viewUsage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr, VK_IMAGE_USAGE_STORAGE_BIT};
         viewInfo.pNext = &viewUsage;
@@ -124,8 +131,8 @@ MultisampleColorSurface::MultisampleColorSurface(const Context& context, const C
         layoutInfo.pPushConstantRanges = &push;
         Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &pipelineLayout), "vkCreatePipelineLayout multisample color");
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        moduleInfo.codeSize = sizeof(MULTISAMPLE_COLOR_TRANSFER_SPV);
-        moduleInfo.pCode = MULTISAMPLE_COLOR_TRANSFER_SPV;
+        moduleInfo.codeSize = target.elementBytes == 8u ? sizeof(MULTISAMPLE_COLOR_TRANSFER_WIDE_SPV) : sizeof(MULTISAMPLE_COLOR_TRANSFER_SPV);
+        moduleInfo.pCode = target.elementBytes == 8u ? MULTISAMPLE_COLOR_TRANSFER_WIDE_SPV : MULTISAMPLE_COLOR_TRANSFER_SPV;
         Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule multisample color");
         VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -206,7 +213,7 @@ void MultisampleColorSurface::acquireBacking() {
 
 VkImageView MultisampleColorSurface::AttachmentView(VkFormat format) {
     GuestMemory::AssertGpuLockHeld("MultisampleColorSurface::AttachmentView");
-    Require(supportedFormat(format), "multisample color attachment format is unsupported");
+    Require(supportedFormat(format) && ((format == VK_FORMAT_R16G16B16A16_SFLOAT) == (target.elementBytes == 8u)), "multisample color attachment format is unsupported");
     if (const auto found = attachmentViews.find(format); found != attachmentViews.end()) return found->second;
     VkFormatProperties properties{};
     context.formatProperties(context.physical, format, &properties);
@@ -258,8 +265,8 @@ void MultisampleColorSurface::upload() {
     for (std::uint32_t y = 0; y < target.extent.height; ++y) {
         for (std::uint32_t x = 0; x < target.extent.width; ++x) {
             for (std::uint32_t sample = 0; sample < samples; ++sample) {
-                const auto offset = ((static_cast<std::size_t>(y) * target.extent.width + x) * samples + sample) * 4;
-                std::memcpy(bytes.data() + offset, snapshot.data() + geometry.Offset(x, y, sample), 4);
+                const auto offset = ((static_cast<std::size_t>(y) * target.extent.width + x) * samples + sample) * target.elementBytes;
+                std::memcpy(bytes.data() + offset, snapshot.data() + geometry.Offset(x, y, sample), target.elementBytes);
             }
         }
     }
@@ -303,8 +310,8 @@ bool MultisampleColorSurface::Flush() {
         for (std::uint32_t x = 0; x < target.extent.width; ++x) {
             for (std::uint32_t sample = 0; sample < samples; ++sample) {
                 const auto tiled = geometry.Offset(x, y, sample);
-                const auto offset = ((static_cast<std::size_t>(y) * target.extent.width + x) * samples + sample) * 4;
-                for (std::size_t channel = 0; channel < 4; ++channel) {
+                const auto offset = ((static_cast<std::size_t>(y) * target.extent.width + x) * samples + sample) * target.elementBytes;
+                for (std::size_t channel = 0; channel < target.elementBytes; ++channel) {
                     if (current[tiled + channel] == snapshot[tiled + channel]) result[tiled + channel] = bytes[offset + channel];
                     else needsUpload = true;
                 }

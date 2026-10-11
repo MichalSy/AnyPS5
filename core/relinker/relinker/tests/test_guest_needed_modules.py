@@ -130,6 +130,18 @@ def main():
             if not windows:
                 assert needed_libraries(output.read_bytes()) == ["$ORIGIN/app0/Media/Modules/needed.prx.guest.prx"]
 
+            case = work / f"{windows}-recursive-overlay"
+            overlay = case / "fakelib"
+            overlay.mkdir(parents=True)
+            original = sony_module(guest_fixture(PLAIN_SITE))
+            replacement = overlay / "libSystem.prx"
+            replacement.write_bytes(original)
+            result, output = convert(case, windows, b"libSystem.prx", options=("--recursive-module-search",))
+            assert result.returncode == 0 and not (case / "app0").exists(), (result.stdout, result.stderr)
+            if not windows:
+                assert needed_libraries(output.read_bytes()) == ["libSystem.prx"]
+            assert replacement.read_bytes() == original
+
             case = work / f"{windows}-recursive-debug"
             nested = case / "Media/Modules"
             nested.mkdir(parents=True)

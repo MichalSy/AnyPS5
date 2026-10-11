@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <span>
@@ -144,6 +145,8 @@ public:
     void RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
     void RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
     void WriteBack();
+    bool CanWriteBackLayer(std::uint32_t layer) const;
+    void WriteBackLayer(std::uint32_t layer);
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
     void Flush();
@@ -169,6 +172,7 @@ public:
     // as it was, and one that finds it unchanged since an earlier read knows the registry is what
     // it was then.
     static std::uint64_t PendingSerial();
+    static std::pair<std::uint64_t, std::uint64_t> TargetProofCounts();
     // One registry scan for several ranges (the fast Revalidate): each query's `overlaps` receives
     // whether an image other than `except` has results pending, or is being stored right now, over
     // [begin, end), and `found` the image FindPending would return for the range (null: none);
@@ -278,6 +282,7 @@ public:
     // False, naming why, when the copy must be a transfer.
     bool CopyFrom(StorageTexture& source, const char*& refusal);
     VkImage Image() const { return image; }
+    VkFormat StorageFormat() const { return storageFormat; }
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
     std::uint32_t ImageDepth() const { return geometry.imageDepth; }
@@ -299,6 +304,11 @@ public:
     // was still current (nothing uploaded).
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
     bool Refresh();
+    // Under GpuMutex, publish current pixels to guest memory without flushing this image.
+    // On success force an upload; pending writes may be replaced only when fully covered.
+    // A false result preserves pending writes and uses Refresh's normal merge.
+    void ReplaceFromMemory(bool fullyCovered, const std::function<bool()>& publish);
+    bool PendingWrites() const;
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
     std::uint64_t GuestBytes() const;
@@ -310,6 +320,7 @@ private:
     // Uploads the surface, or only the tracked layers `layers` selects (the direct path; the others
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
+    void invalidateOriginal();
     void captureGuestBytes(const std::vector<bool>* layers);
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
@@ -470,6 +481,9 @@ private:
         std::uint64_t pendingSerial = 0;
         std::uint64_t keyGeneration = 0;
         DccKeys keys = DccKeys::Uncompressed;
+        std::uint64_t epoch = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t registryGeneration = 0;
     };
     RefreshProof refreshProof;
     struct ForeignKeyProof {

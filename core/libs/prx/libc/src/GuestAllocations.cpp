@@ -47,6 +47,8 @@ std::atomic<std::uint64_t> generation{1};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> invalidator{nullptr};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> mappingInvalidator{nullptr};
 std::atomic<bool (*)(std::uintptr_t, std::size_t)> pinWaiter{nullptr};
+std::atomic<void (*)(const Mapped&, std::uint64_t)> gpuMapObserver{nullptr};
+std::atomic<std::uint32_t> gpuMapObserverCalls{0};
 
 std::chrono::milliseconds pinWait() {
     static const std::chrono::milliseconds value{[] {
@@ -67,6 +69,7 @@ struct MutationState {
     std::unique_lock<std::mutex> lock;
     std::vector<std::pair<std::uintptr_t, std::size_t>> changed;
     std::vector<std::pair<std::uintptr_t, std::size_t>> remapped;
+    std::vector<std::pair<std::uintptr_t, std::size_t>> gpuMapped;
 };
 
 void recordChange(void* mutation, const void* pointer, std::size_t bytes) {
@@ -112,19 +115,50 @@ bool backWritableImageAnonymously() {
 }
 
 void* GuestAllocationsBegin_nid_postfix() {
-    return new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}, {}};
+    return new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}, {}, {}};
 }
 
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     auto* state = static_cast<MutationState*>(mutation);
-    generation.fetch_add(1, std::memory_order_release);
+    const auto ended = generation.fetch_add(1, std::memory_order_release) + 1;
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
     }
     if (const auto callback = mappingInvalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->remapped) callback(address, bytes);
     }
+    const bool noted = !state->gpuMapped.empty();
+    if (noted) gpuMapObserverCalls.fetch_add(1);
+    const auto observer = noted ? gpuMapObserver.load() : nullptr;
+    Mapped weak;
+    try {
+        if (observer != nullptr) {
+            Lease mapped;
+            const auto& ranges = registry().ranges;
+            for (const auto& [address, bytes] : state->gpuMapped) {
+                auto it = ranges.upper_bound(address);
+                if (it != ranges.begin()) --it;
+                for (; it != ranges.end() && it->first < address + bytes; ++it) {
+                    const auto& range = it->second;
+                    if (range->gpu && range->readable && range->bytes != 0 && range->address + range->bytes > address) mapped.push_back(range);
+                }
+            }
+            std::sort(mapped.begin(), mapped.end(), [](const auto& left, const auto& right) { return left->address < right->address; });
+            mapped.erase(std::unique(mapped.begin(), mapped.end()), mapped.end());
+            weak = Mapped(mapped.begin(), mapped.end());
+        }
+    } catch (...) {
+        std::fprintf(stderr, "[gpu] GPU map notification could not be collected; imports remain on first use\n");
+    }
     delete state;
+    if (!weak.empty()) {
+        try {
+            observer(weak, ended);
+        } catch (...) {
+            std::fprintf(stderr, "[gpu] GPU map observer failed\n");
+        }
+    }
+    if (noted) gpuMapObserverCalls.fetch_sub(1);
 }
 
 std::uint64_t GuestAllocationsGeneration_nid_postfix() {
@@ -147,6 +181,20 @@ void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t 
 
 void GuestAllocationsSetPinWaiter_nid_postfix(bool (*callback)(std::uintptr_t, std::size_t)) {
     pinWaiter.store(callback, std::memory_order_release);
+}
+
+void GuestAllocationsSetGpuMapObserver_nid_postfix(void (*callback)(const Mapped& ranges, std::uint64_t generation)) {
+    gpuMapObserver.store(callback);
+    if (callback == nullptr) while (gpuMapObserverCalls.load() != 0) std::this_thread::yield();
+}
+
+void GuestAllocationsNoteGpuMapping_nid_postfix(void* mutation, const void* pointer, std::size_t bytes) {
+    if (mutation == nullptr || bytes == 0) return;
+    try {
+        static_cast<MutationState*>(mutation)->gpuMapped.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    } catch (...) {
+        std::fprintf(stderr, "[gpu] GPU map notification could not be recorded; imports remain on first use\n");
+    }
 }
 
 #ifdef _WIN32

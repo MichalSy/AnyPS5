@@ -1,9 +1,11 @@
 #include "VulkanTestDevice.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "ShaderDiskCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include <spirv/unified1/spirv.hpp>
@@ -358,6 +360,63 @@ void RegistrationWithoutSpecials() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
+void LazyPartialRegistration() {
+    alignas(256) const std::array<std::uint32_t, 4> code{0x34020082u, 0xe0701000u, 0x80000001u, 0xbf810000u};
+    alignas(256) std::array<std::uint32_t, 4> output{};
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 11> registers{};
+        ShaderSpecialRegs specials{};
+    } header;
+    const auto address = reinterpret_cast<std::uintptr_t>(code.data());
+    const auto outputAddress = reinterpret_cast<std::uintptr_t>(output.data());
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18;
+    header.shader.header_size = sizeof(header);
+    header.shader.shader_size = sizeof(code);
+    header.shader.code = code.data();
+    header.shader.sh_registers = header.registers.data();
+    header.shader.num_sh_registers = header.registers.size();
+    header.shader.specials = &header.specials;
+    header.specials.dispatch_modifier = 0x8000u;
+    header.registers = {{{0x20c, static_cast<std::uint32_t>(address >> 8u)}, {0x20d, static_cast<std::uint32_t>(address >> 40u)},
+        {0x207, 4}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 8},
+        {0x240, static_cast<std::uint32_t>(outputAddress)}, {0x241, static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu)},
+        {0x242, sizeof(output)}, {0x243, 0x31016facu}}};
+    const auto loads = [] {
+        const auto totals = ShaderRecompiler::ShaderDiskCache::Totals();
+        return totals.hits + totals.misses;
+    };
+    const bool cached = ShaderRecompiler::ShaderDiskCache::Enabled();
+    const auto before = loads();
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+    Require(!cached || loads() == before, "registration eagerly loaded an unused compute artifact");
+    AgcDriverResolveShaderAbi_nid_postfix(&header.shader, {}, {});
+    Require(!cached || loads() == before, "ABI resolution eagerly loaded an unused compute artifact");
+    std::vector<std::uint32_t> commands;
+    for (const auto reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
+    const auto dispatchOffset = commands.size();
+    commands.insert(commands.end(), {0xc0031500u, 1, 1, 1, 0x8041u});
+    for (const std::uint32_t threads : {4u, 3u, 1u}) {
+        output.fill(0xdeadbeefu);
+        AgcDriver::GuestMemory::MarkWritten(outputAddress, sizeof(output));
+        commands[dispatchOffset + 1] = threads == 4 ? 1 : threads;
+        commands[dispatchOffset + 4] = threads == 4 ? 0x8041u : 0x8061u;
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        sceAgcDriverSubmitAcb(0x20, &packet);
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::FlushGpuWrites(outputAddress, sizeof(output));
+        for (std::uint32_t lane = 0; lane < output.size(); ++lane) {
+            const auto expected = lane < threads ? lane : 0xdeadbeefu;
+            if (output[lane] != expected) {
+                throw std::runtime_error("partial compute dispatch: threads " + std::to_string(threads) + ", lane " + std::to_string(lane) +
+                    ", actual " + std::to_string(output[lane]) + ", expected " + std::to_string(expected));
+            }
+        }
+        Require(!cached || loads() == before + (threads == 4 ? 1 : 2), "partial compute artifact was not loaded exactly once on demand");
+    }
+}
+
 void Registration(bool indirect) {
     UnsupportedTypeRegistration();
     alignas(256) std::array<std::uint32_t, 1> code{0xbf810000u};
@@ -522,6 +581,7 @@ int main(int argc, char** argv) {
         PrepareMultisampledStorage(*device);
         device.reset();
         RegistrationWithoutSpecials();
+        LazyPartialRegistration();
         Registration(argc == 2);
         std::cout << "prepared shader and transactional registration tests passed\n";
         return 0;

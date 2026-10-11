@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "SceShaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "CacheKey.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -89,6 +90,18 @@ void expectFailure(TAction action, std::string_view reason) {
         return;
     }
     throw std::runtime_error("expected graphics rejection: " + std::string(reason));
+}
+
+void hostImportBudgetTests() {
+    VkPhysicalDeviceMemoryProperties memory{};
+    memory.memoryHeapCount = 2;
+    memory.memoryHeaps[0] = {24ull << 30u, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryHeaps[1] = {47ull << 30u, 0};
+    Require(AgcDriver::Graphics::DefaultHostImportBudget(memory) == (45ull << 30u), "the host import budget is not the system memory heap less 2 GiB");
+    memory.memoryHeaps[1].size = 8ull << 30u;
+    Require(AgcDriver::Graphics::DefaultHostImportBudget(memory) == (6ull << 30u), "a small system memory heap lowered the host import budget below 6 GiB");
+    memory.memoryHeapCount = 1;
+    Require(AgcDriver::Graphics::DefaultHostImportBudget(memory) == (6ull << 30u), "a device without a system memory heap has no 6 GiB host import budget");
 }
 
 void stateTests() {
@@ -1109,14 +1122,29 @@ void stencilClearTests() {
         Require(std::memcmp(&face, &state.stencilBack, sizeof(face)) == 0, "stencil clear front/back faces differ");
     }
     const auto valid = queue;
-    const auto reject = [&](std::uint32_t offset, std::uint32_t value) {
+    const auto reject = [&](std::uint32_t offset, std::uint32_t value, std::string_view expected = "DB_RENDER_CONTROL") {
         auto unsupported = valid;
         unsupported.context[offset] = value;
         const auto reason = AgcDriver::Graphics::DepthMaintenanceRejection(unsupported);
-        Require(reason.find("DB_RENDER_CONTROL") != std::string::npos, "unsupported stencil clear passed precheck");
+        Require(reason.find(expected) != std::string::npos, "unsupported stencil clear passed precheck: " + reason);
         Require(AgcDriver::Graphics::DrawRejection(unsupported, false) == reason, "stencil clear precheck and draw rejection differ");
         expectFailure([&] { AgcDriver::Graphics::DecodeState(unsupported); }, reason);
     };
+    for (const auto samplesLog2 : {1u, 2u}) {
+        auto multisampled = valid;
+        multisampled.context[0x010] = 3u | (samplesLog2 << 2u);
+        multisampled.context[0x201] = 0x100000u | samplesLog2 | (samplesLog2 << 4u) | (samplesLog2 << 12u);
+        multisampled.context[0x292] = 3u;
+        multisampled.context[0x2f8] = (samplesLog2 << 20u) | (4u << 13u) | samplesLog2;
+        multisampled.context[0x8e] = multisampled.context[0x8f] = 0u;
+        for (std::uint32_t pixel = 0; pixel < 4u; ++pixel) {
+            multisampled.context[0x2feu + pixel * 4u] = samplesLog2 == 1u ? 0xcc44u : 0x444cc4ccu;
+            for (std::uint32_t group = 1u; group < 4u; ++group) multisampled.context[0x2feu + pixel * 4u + group] = 0u;
+        }
+        Require(AgcDriver::Graphics::DepthMaintenanceRejection(multisampled).empty() && AgcDriver::Graphics::DrawRejection(multisampled, false).empty(), "matching two or four-sample stencil clear was rejected");
+        const auto state = AgcDriver::Graphics::DecodeState(multisampled);
+        Require(state.depth && state.depth->samples == static_cast<VkSampleCountFlagBits>(1u << samplesLog2) && state.stencilTest && !state.depthTest && !state.depthWrite && state.stencilFront.reference == 0x27, "multisampled stencil clear changed sample counts or depth/stencil behavior");
+    }
     for (const auto control : {1u, 3u, 0x23u}) {
         auto supported = valid;
         supported.context[0x000] = control;
@@ -1139,7 +1167,7 @@ void stencilClearTests() {
     const auto overriddenClear = AgcDriver::Graphics::DecodeState(overriddenMasks);
     Require(overriddenClear.stencilFront.writeMask == 0xff && overriddenClear.stencilBack.writeMask == 0xff, "stencil clear used overridden write masks");
     reject(0x010, 2);
-    reject(0x010, 3u | (1u << 2u));
+    reject(0x010, 3u | (1u << 2u), "depth and rasterization sample counts differ");
     reject(0x010, 3u | (1u << 16u));
     reject(0x011, 0);
     reject(0x011, 0x1001);
@@ -2112,8 +2140,10 @@ void descriptorSnapshotTests() {
                     Require(descriptor.buffer == original[index].buffer && descriptor.offset == original[index].offset && descriptor.range == original[index].range, "snapshot update changed an untouched buffer descriptor");
                 } else {
                     const auto& item = snapshots->snapshots[snapshot];
-                    Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == 0 && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
-                    Require(sameBytes(bufferBytes(descriptor.buffer), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
+                    Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == item.offset && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
+                    const auto memory = bufferBytes(descriptor.buffer);
+                    Require(descriptor.offset <= memory.size() && descriptor.range <= memory.size() - descriptor.offset, "snapshot descriptor exceeds its buffer");
+                    Require(sameBytes(memory.subspan(static_cast<std::size_t>(descriptor.offset), static_cast<std::size_t>(descriptor.range)), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
                     ++snapshot;
                 }
             }
@@ -2368,6 +2398,9 @@ void descriptorCacheTests() {
         Require(cache.Counters().pools == 0 && cache.Counters().sets == 1, "an oversized set was counted in the chain pools");
         cache.Free(dedicated);
         Require(mock.live == live && mock.freedSets == 0, "freeing an oversized set did not destroy its pool");
+        const auto rewritten = cache.AllocateRewritten(large, oversized);
+        cache.Recycle(large, rewritten);
+        Require(mock.live == live && mock.freedSets == 0, "recycling an oversized set freed a set from a dedicated pool instead of destroying the pool");
         const std::array<VkDescriptorPoolSize, 1> fitting{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}}};
         const auto chained = cache.Allocate(layout(4096), fitting);
         Require(chained.set != VK_NULL_HANDLE && mock.poolMaxSets == 1024 && mock.poolFlags == VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT && cache.Counters().pools == 1, "a set the chain pool holds left the chain");
@@ -4182,6 +4215,7 @@ int main() {
             AgcDriver::Graphics::ValidateDepthBounds(unrestricted, bounded);
         }
         RunGuestLeaseWaitTests();
+        hostImportBudgetTests();
         stateTests();
         RunMsaaStateTests();
         RunColorResolveStateTests();

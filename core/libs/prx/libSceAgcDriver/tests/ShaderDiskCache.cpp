@@ -202,6 +202,7 @@ CompiledVariant sampleVariant() {
     image.depthBitsCompatible = false;
     image.flatVolumeCompatible = false;
     image.flatLineCompatible = false;
+    image.flatLineRequiresSingleLevel = true;
     image.byElements = 4;
     image.byComponents = 1;
     image.indirectRoot = 0;

@@ -93,6 +93,7 @@ TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words,
 struct CachedTexture {
     TextureKey key;
     std::uint64_t address;
+    std::uint64_t guestBytes;
     std::vector<std::byte> bytes;
     std::shared_ptr<Texture> texture;
     // A fast-cleared surface is cached as its clear texels; it stays valid while the keys are unchanged.
@@ -516,14 +517,18 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         return depth;
     }
+    std::shared_ptr<StorageTexture> depthStorage;
+    if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+    if (!depthCompare && DepthSurfaceAt(resource, false)) depthStorage = cachedStorageTexture(context, words, resource, 0, guestBytes);
     const auto depthBitsWidth = words.size() >= 4 ? ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) : 0u;
-    if (depthBitsWidth == 32u) {
+    const bool storageDepthBits = depthStorage != nullptr;
+    if (depthBitsWidth == 32u && !storageDepthBits) {
         char text[160];
         std::snprintf(text, sizeof(text), "AGC graphics: 32-bit integer read of the depth-layout texture 0x%llx, which is no depth surface drawn with, is not implemented", static_cast<unsigned long long>(resource.baseAddress));
         throw std::runtime_error(text);
     }
     constexpr auto unorm16 = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format16UNorm);
-    if (depthBitsWidth == 16u && resource.format != unorm16) {
+    if (depthBitsWidth == 16u && !storageDepthBits && resource.format != unorm16) {
         auto normalized = resource;
         normalized.format = unorm16;
         return cachedTexture(context, words, normalized, components, guestBytes, depthCompare);
@@ -537,14 +542,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (profile && resource.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, scanStart);
         return keys;
     };
-    if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
     auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
     // A storage image whose results for this surface (or for a mip chain containing it) are still on
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
-    auto source = StorageTexture::FindPending(address, guestBytes);
+    auto source = depthStorage != nullptr ? std::move(depthStorage) : StorageTexture::FindPending(address, guestBytes);
     if (source != nullptr && (depthCompare || !Texture::CanCopyFrom(*source, resource) || MetadataMoved(*source, resource))) source.reset();
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
@@ -632,7 +636,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
-        } else if (source == nullptr && it->bytes.size() == guestBytes && it->keys == *keys) {
+        } else if (source == nullptr && it->guestBytes == guestBytes && it->keys == *keys) {
             // Unwritten pages need no comparison; partially resident textures compare only committed
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
@@ -641,7 +645,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
-            if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
+            const bool current = *keys != DccKeys::Uncompressed || (it->bytes.empty()
+                ? generation != 0 && GuestMemory::Watched(address, bytes) && GuestMemory::UnchangedSince(address, bytes, it->generation)
+                : GuestMemory::UnchangedSince(address, bytes, it->generation) || equalsCommitted());
+            if (current) {
                 it->generation = generation;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
@@ -653,7 +660,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
+    CachedTexture entry{key, address, guestBytes, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
@@ -671,6 +678,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
         }
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
+        // Clear snapshots are validated by their keys; watched snapshots by stamps. The upload
+        // owns its staging bytes. Only untracked, uncompressed memory needs a CPU comparison copy.
+        if (*keys != DccKeys::Uncompressed || (generation != 0 && GuestMemory::Watched(address, bytes))) std::vector<std::byte>().swap(entry.bytes);
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
@@ -813,12 +823,15 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
+std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes);
+
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
-    if (DepthSurfaceAt(viewed.baseAddress)) {
-        char text[112];
-        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth/stencil surface 0x%llx is not implemented", static_cast<unsigned long long>(viewed.baseAddress));
-        throw std::runtime_error(text);
-    }
+    auto texture = lookupStorageTexture(context, words, viewed, mip, guestBytes);
+    if (DepthSurfaceAt(texture->Descriptor(), false)) SeedStorageFromDepth(context, texture);
+    return texture;
+}
+
+std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled) return std::make_shared<StorageTexture>(context, *context.detiler, viewed, mip);
     static_cast<void>(words);
@@ -1512,12 +1525,21 @@ std::atomic<std::uint64_t> resourceCacheTouches{0};
 
 }
 
+namespace {
+
+bool LoopGuardEnabled() {
+    static const bool enabled = std::getenv("APS5_LOOP_GUARD") != nullptr;
+    return enabled;
+}
+
+}
+
 void ShaderResources::noteReusable() {
     // Taken whether or not the object turns out reusable: the lookups' records are this build's.
     captureValidation();
     reusable = false;
     directRegions.clear();
-    if (NeedsCompletion() || HoldsLease()) return;
+    if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled())) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
     const auto regions = guestMemory.DirectRegions();
     if (!regions.has_value()) return;
@@ -1535,8 +1557,9 @@ void ShaderResources::noteReusable() {
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
-    return std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) {
-        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer; });
+    const bool loopGuard = LoopGuardEnabled();
+    return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {
+        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
     });
 }
 
@@ -1733,6 +1756,14 @@ bool SameKeySurface(const StorageTexture* source, const GuestTextureResource& re
     return own.dccAddress == resource.dccAddress && source->GuestBytes() == guestBytes && own.format == resource.format && own.dccAlphaOnMsb == resource.dccAlphaOnMsb;
 }
 
+
+std::atomic<std::uint64_t> lookupMemoHits{0};
+std::atomic<std::uint64_t> lookupMemoMisses{0};
+
+void countLookupMemo(bool hit) {
+    (hit ? lookupMemoHits : lookupMemoMisses).fetch_add(1, std::memory_order_relaxed);
+}
+
 void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point start) {
     auto& profile = Revalidations();
     const auto now = std::chrono::steady_clock::now();
@@ -1754,7 +1785,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto reasons = byReason(profile.fastFails, FastFailNames);
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    AgcDriver::ProfilePrint_nid_no_patch( "[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup memo (APS5_LOOKUP_MEMO, cumulative): %llu hits, %llu misses\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()), static_cast<unsigned long long>(lookupMemoHits.load()), static_cast<unsigned long long>(lookupMemoMisses.load()));
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -1763,6 +1794,12 @@ bool EpochRevalidate() {
     static const bool enabled = std::getenv("APS5_NO_EPOCH_REVALIDATE") == nullptr;
     return enabled;
 }
+
+bool LookupMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_LOOKUP_MEMO") != nullptr && EpochRevalidate();
+    return enabled;
+}
+
 
 }
 
@@ -1827,6 +1864,17 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     owners.clear();
     images.clear();
     scannedKeys.assign(textures.size(), DccKeys::Uncompressed);
+    const bool memo = LookupMemoEnabled();
+    lookupMemo.epoch = 0;
+    lookupMemo.stamps.clear();
+    lookupMemo.keysKept = keyProofs;
+    const auto noteKeys = [&](const GuestTextureResource& resource, std::uint64_t surfaceBytes, const DccKeyProof& proof) {
+        if (!memo || resource.dccAddress == 0) return;
+        const auto keyBytes = static_cast<std::size_t>(surfaceBytes / 256);
+        if (keyBytes == 0) return;
+        if (proof.generation == 0) lookupMemo.keysKept = false;
+        lookupMemo.stamps.push_back({resource.dccAddress, keyBytes, proof.generation});
+    };
     const auto query = [&](std::uint64_t begin, std::uint64_t end, const StorageTexture* except, const StorageTexture* identity, PendingOverlap owner) {
         pending.push_back({begin, end, except, identity, false});
         owners.push_back(owner);
@@ -1836,6 +1884,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (!surface.valid) return fail(FastFail::NoRecord);
         if (surface.depth) {
             if (!DepthSurfaceHolds(context, surface.depthWords, surface.depthComponents, textures[i].get())) return fail(FastFail::Depth);
+            lookupMemo.keysKept = false;
             continue;
         }
         const auto address = surface.resource.baseAddress;
@@ -1857,8 +1906,11 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // proof when they are the image's, else from the texture's.
             const auto& own = source->Descriptor();
             const auto sourceKeys = source->ProvedKeys();
+            noteKeys(own, source->GuestBytes(), source->KeyProof());
             if (sourceKeys != source->UploadedKeys()) return fail(FastFail::Keys);
-            const auto keys = surface.resource.dccAddress == 0 ? DccKeys::Uncompressed : SameKeySurface(source, surface.resource, surface.bytes) ? sourceKeys : ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof());
+            const bool sameKeys = SameKeySurface(source, surface.resource, surface.bytes);
+            const auto keys = surface.resource.dccAddress == 0 ? DccKeys::Uncompressed : sameKeys ? sourceKeys : ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof());
+            if (!sameKeys) noteKeys(surface.resource, surface.bytes, textures[i]->KeyProof());
             if (surface.resource.dccAddress != 0 && surface.resource.dccAddress != own.dccAddress && (keys != DccKeys::Uncompressed || !StorageImageServesKeys(*source, surface.resource.dccAddress))) return fail(FastFail::Keys);
             scannedKeys[i] = keys;
             // A view of a fast-cleared surface stays one only while its image still has results
@@ -1872,6 +1924,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         } else {
             // A snapshot holds its clear texels or the guest bytes: the keys must be what it was made under.
             const auto keys = surface.resource.dccAddress != 0 ? ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof()) : DccKeys::Uncompressed;
+            noteKeys(surface.resource, surface.bytes, textures[i]->KeyProof());
             if (keys != surface.keys) return fail(FastFail::Keys);
             scannedKeys[i] = keys;
             if (!unchanged) query(address, address + bytes, nullptr, nullptr, {i, false, false});
@@ -1899,6 +1952,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // uploaded under, through the image's proof; the memory query below), minus its
             // byte-compare fallback; the image's generation is left where it is.
             if (!keyProofs || image->ProvedKeys() != image->UploadedKeys()) return fail(FastFail::StorageKeys);
+            noteKeys(own, bytes, image->KeyProof());
             countKeysProven(true);
         }
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
@@ -1948,6 +2002,43 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (surface.source == nullptr) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
     }
+    if (memo && lookupMemo.keysKept && !accepted && refreshed.empty() && GuestMemory::ThreadCollectEpoch() != 0) {
+        for (const auto& entry : queries) lookupMemo.stamps.push_back({entry.address, entry.bytes, entry.generation});
+        for (std::size_t i = 0, k = 0; i < validatedTextures.size(); ++i, ++k) {
+            const auto& surface = validatedTextures[i];
+            if (surface.source == nullptr) lookupMemo.stamps[lookupMemo.stamps.size() - queries.size() + k].generation = surface.generation;
+        }
+        lookupMemo.images = images;
+        lookupMemo.epoch = GuestMemory::ThreadCollectEpoch();
+        lookupMemo.unwatched = GuestMemory::UnwatchSerial();
+        lookupMemo.pendingSerial = serialBefore;
+        lookupMemo.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    }
+    return true;
+}
+
+LookupMemoCounts LookupMemoCounters() {
+    return {lookupMemoHits.load(std::memory_order_relaxed), lookupMemoMisses.load(std::memory_order_relaxed)};
+}
+
+bool ShaderResources::lookupMemoHolds(std::uint64_t serialBefore) {
+    if (!LookupMemoEnabled() || lookupMemo.epoch == 0) return false;
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    if (epoch == 0 || epoch != lookupMemo.epoch || GuestMemory::UnwatchSerial() != lookupMemo.unwatched || serialBefore != lookupMemo.pendingSerial || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != lookupMemo.registryGeneration) return false;
+    if (validatedTextures.size() != textures.size()) return false;
+    for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        if (storageTextures[i] == nullptr || i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i])) return false;
+    }
+    thread_local std::vector<GuestMemory::UnchangedQuery>* stampsSlot = nullptr;
+    auto& stamps = ShaderRecompiler::ThreadOwned(stampsSlot);
+    stamps.clear();
+    for (const auto& entry : lookupMemo.stamps) stamps.push_back({entry.address, entry.bytes, entry.generation});
+    if (!GuestMemory::UnchangedSinceAll(stamps)) return false;
+    for (const auto* image : lookupMemo.images) {
+        if (!image->Cached()) return false;
+    }
+    if (!StorageImagesCached(context, lookupMemo.images)) return false;
+    for (const auto* image : lookupMemo.images) image->NoteProved();
     return true;
 }
 
@@ -2091,6 +2182,11 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& image) {
+            return image != nullptr && DepthSurfaceAt(image->Descriptor().baseAddress, image->GuestBytes());
+        }) || std::any_of(validatedTextures.begin(), validatedTextures.end(), [](const auto& image) {
+            return !image.depth && DepthSurfaceAt(image.resource.baseAddress, image.bytes);
+        })) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
@@ -2131,7 +2227,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
                         if (storageIndex >= storageTextures.size()) return false;
                         const auto resource = DecodeTextureResource(words);
-                        if (storageWritten[storageIndex] && !DepthSurfaceAt(resource.baseAddress)) RetireDepthSurfaces(context.device, resource.baseAddress, storageTextures[storageIndex]->GuestBytes());
+                        if (storageWritten[storageIndex] && !DepthSurfaceAt(resource)) RetireDepthSurfaces(context.device, resource.baseAddress, storageTextures[storageIndex]->GuestBytes());
                         std::shared_ptr<StorageTexture> expected;
                         if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
                         else expected = cachedStorageTexture(context, words, resource, storageMips[storageIndex]);
@@ -2155,7 +2251,22 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    const bool memoHit = !noFast && lookupMemoHolds(serialBefore);
+    if (memoHit) countLookupMemo(true);
+    else if (LookupMemoEnabled()) countLookupMemo(false);
+    if (memoHit && VerifyProofs()) {
+        thread_local std::vector<PendingOverlap>* checkSlot = nullptr;
+        auto& check = ShaderRecompiler::ThreadOwned(checkSlot);
+        FastFail checkReason = FastFail::Count;
+        bool checkAccepted = false;
+        if (!fastRevalidate(serialBefore, refreshed, checkReason, check, checkAccepted)) {
+            std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the lookup memo (APS5_LOOKUP_MEMO) proved a template its fast proof refuses (reason %d)\n", static_cast<int>(checkReason));
+            std::fflush(stderr);
+            std::abort();
+        }
+        if (BuildProfiled()) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool fast = memoHit || (!noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted));
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -2264,6 +2375,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
     }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
+    if (StorageTexture::PendingSerial() != serialBefore) lookupMemo.epoch = 0;
     return finish(fast, true);
 }
 
@@ -2595,9 +2707,43 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
     return {set, pool};
 }
 
+DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind) {
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = recycled.find(layout); found != recycled.end() && !found->second.empty()) {
+            const auto allocation = found->second.back();
+            found->second.pop_back();
+            return allocation;
+        }
+    }
+    return Allocate(layout, sizes, updateAfterBind);
+}
+
+void DescriptorCache::Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation) noexcept {
+    if (allocation.set == VK_NULL_HANDLE || allocation.pool == VK_NULL_HANDLE) return;
+    std::lock_guard lock(mutex);
+    if (std::find(dedicated.begin(), dedicated.end(), allocation.pool) != dedicated.end()) {
+        freeLocked(allocation);
+        return;
+    }
+    try {
+        auto& list = recycled[layout];
+        if (list.size() < 4096) {
+            list.push_back(allocation);
+            return;
+        }
+    } catch (...) {
+    }
+    freeLocked(allocation);
+}
+
 void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
     if (allocation.set == VK_NULL_HANDLE || allocation.pool == VK_NULL_HANDLE) return;
     std::lock_guard lock(mutex);
+    freeLocked(allocation);
+}
+
+void DescriptorCache::freeLocked(const SetAllocation& allocation) noexcept {
     if (const auto found = std::find(dedicated.begin(), dedicated.end(), allocation.pool); found != dedicated.end()) {
         dedicated.erase(found);
         destroyPool(context.device, allocation.pool, nullptr);
@@ -2967,7 +3113,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     // between the stages marks them uncompressed).
     const auto address = record.resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(record.guestBytes);
-    if (DepthSurfaceAt(address)) return nullptr;
+    if (DepthSurfaceAt(address, bytes)) return nullptr;
     if (GuestMemory::CollectWrites(address, bytes) == 0) return nullptr;
     if (PendingStorageOverlaps(address, bytes, record.source.get())) return nullptr;
     auto keys = record.keys;
@@ -3101,7 +3247,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
         const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
-        if (written && !DepthSurfaceAt(resource.baseAddress)) RetireDepthSurfaces(context.device, resource.baseAddress, guestBytes);
+        if (written && !DepthSurfaceAt(resource)) RetireDepthSurfaces(context.device, resource.baseAddress, guestBytes);
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes));
@@ -3187,7 +3333,9 @@ VkDescriptorSetLayout ShaderResources::Layout() const {
 }
 
 ShaderResources::DrawBindings::~DrawBindings() {
-    if (cache != nullptr && allocation.set != VK_NULL_HANDLE) cache->Free(allocation);
+    if (cache == nullptr || allocation.set == VK_NULL_HANDLE) return;
+    if (layout != VK_NULL_HANDLE) cache->Recycle(layout, allocation);
+    else cache->Free(allocation);
 }
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
@@ -3238,22 +3386,31 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     return moved;
 }
 
+constexpr std::size_t FreshCopyLimit = 4096;
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
     auto result = std::make_shared<DrawBindings>();
-    std::vector<std::size_t> selected;
+    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
+    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    selected.clear();
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
+            Recorder::SnapshotSlice slice{};
+            static const bool movedRing = std::getenv("APS5_MOVED_RING") == nullptr || std::strcmp(std::getenv("APS5_MOVED_RING"), "0") != 0;
+            if (movedRing && Recorder::SnapshotRingEnabled()) slice = recorder.AllocateDrawSnapshot(override->size);
+            auto buffer = slice.buffer != nullptr ? std::move(slice.buffer) : std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            const VkDeviceSize offset = buffer != nullptr && slice.offset != 0 ? slice.offset : 0;
+            auto* bytes = buffer->Bytes().data() + offset;
+            std::memcpy(bytes, override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                if (patch.allocation == index && patch.byte < override->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            result->snapshots.push_back({0, std::move(buffer)});
+            result->snapshots.push_back({0, std::move(buffer), offset, override->size});
             continue;
         }
         std::uint64_t address = item.address;
@@ -3268,24 +3425,47 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+        static const bool freshCopy = [] { const char* text = std::getenv("APS5_SNAPSHOT_FRESH_COPY"); return text == nullptr || std::strcmp(text, "0") != 0; }();
+        if (freshCopy && bytes <= FreshCopyLimit && Recorder::SnapshotRingEnabled()) {
+            auto slice = recorder.AllocateDrawSnapshot(bytes);
+            if (slice.buffer != nullptr) {
+                std::memcpy(slice.buffer->Bytes().data() + slice.offset, reinterpret_cast<const void*>(begin), bytes);
+                selected.push_back(index);
+                result->snapshots.push_back({begin, std::move(slice.buffer), slice.offset, bytes});
+                CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+                continue;
+            }
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
-        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+        VkDeviceSize offset = 0;
+        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
         if (buffer == nullptr) {
-            buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-            recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+            if (bytes <= FreshCopyLimit && Recorder::SnapshotRingEnabled()) {
+                auto slice = recorder.AllocateDrawSnapshot(bytes);
+                buffer = std::move(slice.buffer);
+                offset = slice.offset;
+            }
+            if (buffer == nullptr) {
+                buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                offset = 0;
+            }
+            std::memcpy(buffer->Bytes().data() + offset, reinterpret_cast<const void*>(begin), bytes);
+            recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer, Recorder::SnapshotUse::Storage, 0, offset);
         }
         selected.push_back(index);
-        result->snapshots.push_back({begin, std::move(buffer)});
+        result->snapshots.push_back({begin, std::move(buffer), offset, bytes});
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     result->cache = context.descriptorCache;
-    result->allocation = result->cache->Allocate(_layout, bindingPlan->descriptorSizes, updateAfterBind);
+    result->allocation = ownsLayout ? result->cache->Allocate(_layout, bindingPlan->descriptorSizes, updateAfterBind) : result->cache->AllocateRewritten(_layout, bindingPlan->descriptorSizes, updateAfterBind);
+    result->layout = ownsLayout ? VK_NULL_HANDLE : _layout;
     Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
-    std::vector<VkCopyDescriptorSet> copies;
+    thread_local std::vector<VkCopyDescriptorSet>* copiesSlot = nullptr;
+    auto& copies = ShaderRecompiler::ThreadOwned(copiesSlot);
+    copies.clear();
     for (const auto& binding : bindings) {
         VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
         copy.srcSet = _set;
@@ -3301,9 +3481,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
     std::size_t infoCount = 0;
     for (const auto& binding : bindings) infoCount += binding.allocations.size();
-    std::vector<VkDescriptorBufferInfo> infos;
+    thread_local std::vector<VkDescriptorBufferInfo>* infosSlot = nullptr;
+    auto& infos = ShaderRecompiler::ThreadOwned(infosSlot);
+    infos.clear();
     infos.reserve(infoCount);
-    std::vector<VkWriteDescriptorSet> writes;
+    thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
+    auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
+    writes.clear();
     for (const auto& binding : bindings) {
         if (std::none_of(binding.allocations.begin(), binding.allocations.end(),
                 [&](std::size_t index) { return snapshotIndices[index] != selected.size(); })) continue;
@@ -3313,7 +3497,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (snapshotIndex == selected.size()) infos.push_back(allocationDescriptors[index]);
             else {
                 const auto& snapshot = result->snapshots[snapshotIndex];
-                infos.push_back({snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()});
+                infos.push_back({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
             }
         }
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -3380,6 +3564,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     const auto elements = counters.elements.load();
     const auto readOnly = counters.readOnly.load();
     AgcDriver::ProfilePrint_nid_no_patch("[buffers] descriptor elements bound: %llu total, %llu written, %llu read-only; %llu pending-write notes skipped\n", static_cast<unsigned long long>(elements), static_cast<unsigned long long>(elements - readOnly), static_cast<unsigned long long>(readOnly), static_cast<unsigned long long>(counters.notesSkipped.load()));
+}
+
+void ShaderResources::CheckFaults() const {
+    if (bda) bda->CheckFault();
 }
 
 void ShaderResources::WriteBackBuffers() {

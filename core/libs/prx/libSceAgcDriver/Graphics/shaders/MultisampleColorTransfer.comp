@@ -1,7 +1,11 @@
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#if WIDE_TEXEL
+layout(rgba16ui, set = 0, binding = 0) uniform uimage2DMS surface;
+#else
 layout(rgba8, set = 0, binding = 0) uniform image2DMS surface;
+#endif
 layout(std430, set = 0, binding = 1) buffer Pixels {
     uint data[];
 } pixels;
@@ -17,9 +21,21 @@ void main() {
     if (position.x >= parameters.width || position.y >= parameters.height || position.z >= parameters.samples) return;
     uint index = (position.y * parameters.width + position.x) * parameters.samples + position.z;
     ivec2 coordinate = ivec2(position.xy);
+#if WIDE_TEXEL
+    index *= 2u;
+    if (parameters.store != 0) {
+        uvec4 value = imageLoad(surface, coordinate, int(position.z));
+        pixels.data[index] = value.x | (value.y << 16u);
+        pixels.data[index + 1u] = value.z | (value.w << 16u);
+    } else {
+        uvec2 value = uvec2(pixels.data[index], pixels.data[index + 1u]);
+        imageStore(surface, coordinate, int(position.z), uvec4(value.x & 0xffffu, value.x >> 16u, value.y & 0xffffu, value.y >> 16u));
+    }
+#else
     if (parameters.store != 0) {
         pixels.data[index] = packUnorm4x8(imageLoad(surface, coordinate, int(position.z)));
     } else {
         imageStore(surface, coordinate, int(position.z), unpackUnorm4x8(pixels.data[index]));
     }
+#endif
 }

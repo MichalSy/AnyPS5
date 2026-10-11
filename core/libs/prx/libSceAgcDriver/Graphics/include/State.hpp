@@ -75,6 +75,9 @@ struct DepthTarget {
     std::uint32_t mip = 0;
     std::uint64_t htileAddress = 0;
     bool htileStencil = false;
+    std::uint32_t zInfo = 0;
+    std::uint64_t encodedSurfaceAddress = 0;
+    std::uint32_t depthSlice = 0;
 };
 
 struct State {

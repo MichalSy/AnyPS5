@@ -144,6 +144,7 @@ struct HostImports {
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
     std::map<std::uint64_t, HostImport> imports;
+    std::uint64_t liveBytes = 0;
     std::set<std::uint64_t> failed;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
@@ -201,6 +202,7 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, it->second);
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
     ++state.epoch;
+    state.liveBytes -= it->second.bytes;
     state.imports.erase(it);
 }
 
@@ -524,6 +526,20 @@ bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
     return current != nullptr && !entry.range.owner_before(current) && !current.owner_before(entry.range);
 }
 
+}
+
+std::uint64_t DefaultHostImportBudget(const VkPhysicalDeviceMemoryProperties& memory) {
+    VkDeviceSize systemHeap = 0;
+    for (std::uint32_t index = 0; index < memory.memoryHeapCount && index < VK_MAX_MEMORY_HEAPS; ++index) {
+        if ((memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) systemHeap = std::max(systemHeap, memory.memoryHeaps[index].size);
+    }
+    constexpr std::uint64_t reserve = 2048ull << 20u;
+    constexpr std::uint64_t floor = 6144ull << 20u;
+    return systemHeap > floor + reserve ? systemHeap - reserve : floor;
+}
+
+namespace {
+
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t base, std::uint64_t bytes, const GuestAllocations::Lease& lease) {
     if (const auto found = state.imports.find(base); found != state.imports.end()) {
         if (found->second.bytes == bytes && sameRange(found->second, lease)) return &found->second;
@@ -532,14 +548,13 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
     // Pinned imports count against the driver's system memory budget; past it ordinary host
-    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
-    // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
-    static const std::uint64_t budget = [] {
-        const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
-        return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
+    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default DefaultHostImportBudget;
+    // past it address-based shaders copy gigabytes per dispatch).
+    static const std::uint64_t budget = [&context]() -> std::uint64_t {
+        if (const char* value = std::getenv("APS5_HOST_IMPORT_MIB")) return std::strtoull(value, nullptr, 10) << 20u;
+        return DefaultHostImportBudget(context.memory);
     }();
-    std::uint64_t live = 0;
-    for (const auto& [address, existing] : state.imports) live += existing.bytes;
+    const auto live = state.liveBytes;
     if (live + bytes > budget) {
         // A refused import turns every later use of the range into CPU copies, so say so.
         static std::uint64_t refused = 0, refusedBytes = 0;
@@ -594,6 +609,9 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     decideImportWatch(context, state);
     VkResult result = VK_SUCCESS;
     const char* step = nullptr;
+#ifndef _WIN32
+    const bool wasWatched = GuestMemory::Watched(base, bytes);
+#endif
     GuestMemory::ImportWatched(base, bytes, [&] {
         step = createImport(context, entry, result);
         return step == nullptr;
@@ -602,7 +620,6 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #ifdef _WIN32
     if (entry.alias != nullptr) entry.unwatched = false;
 #endif
-    if (entry.unwatched) GuestMemory::Unwatch(base, bytes);
     if (step != nullptr) {
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
@@ -633,13 +650,33 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #endif
         return nullptr;
     }
+    const HostImport* imported = nullptr;
+    try {
+        imported = &state.imports.emplace(base, entry).first->second;
+    } catch (...) {
+        try {
+            destroyImport(context, entry);
+        } catch (...) {
+            std::fprintf(stderr, "[gpu] cleanup of an unpublished host import failed\n");
+        }
+#ifndef _WIN32
+        if (wasWatched) {
+            try {
+                if (!GuestMemory::Watched(base, bytes)) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes));
+            } catch (...) {
+                std::fprintf(stderr, "[gpu] write watch restoration after an unpublished host import failed\n");
+            }
+        }
+#endif
+        throw;
+    }
+    state.liveBytes += bytes;
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
+    if (entry.unwatched) GuestMemory::Unwatch(base, bytes);
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
-    std::uint64_t liveBytes = bytes;
-    for (const auto& [address, existing] : state.imports) liveBytes += existing.bytes;
-    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, liveBytes / 1048576.0, importedBytes / 1048576.0);
-    return &state.imports.emplace(base, entry).first->second;
+    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size(), state.liveBytes / 1048576.0, importedBytes / 1048576.0);
+    return imported;
 }
 
 // The lease is in address order (it is built from the registry map), so a range is found by binary search.
@@ -670,6 +707,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
 #endif
         }
         state.imports.clear();
+        state.liveBytes = 0;
         state.failed.clear();
         state.device = context.device;
         state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
@@ -1498,6 +1536,7 @@ void ClearHostImports(VkDevice device) {
 #endif
     }
     state.imports.clear();
+    state.liveBytes = 0;
     state.failed.clear();
     state.device = VK_NULL_HANDLE;
     state.refreshedGeneration = 0;
@@ -1688,10 +1727,61 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     return nullptr;
 }
 
+bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
+    if (context.hostImportAlignment == 0) return true;
+    ensurePinWaiter();
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (!adoptDevice && (state.device != context.device || state.watchDevice != context.device)) return false;
+    const bool adopting = state.device != context.device;
+    GuestAllocations::Lease current;
+    if (adopting) {
+        current = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        refreshImports(context, state, current);
+    } else if (state.refreshedGeneration > generation) {
+        return true;
+    }
+    for (const auto& mapped : ranges) {
+        const auto range = mapped.lock();
+        if (range == nullptr || !range->gpu || !range->readable || (adopting && leasedRangeOwner(current, range->address) != range)) continue;
+        try {
+            if (importAllocation(context, state, range->address, range->bytes, GuestAllocations::Lease{range}) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(range->address);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[gpu] import of GPU memory mapped at 0x%llx+0x%zx failed: %s\n", static_cast<unsigned long long>(range->address), range->bytes, error.what());
+        }
+    }
+    return true;
+}
+
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    return containingRange(lease, address, address + bytes) != nullptr;
+    static const bool memo = std::getenv("APS5_NO_REGISTERED_COVER_MEMO") == nullptr;
+    if (!memo) {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        return containingRange(lease, address, address + bytes) != nullptr;
+    }
+    struct ReadableRanges {
+        std::uint64_t generation = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    };
+    thread_local ReadableRanges readable;
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if (readable.generation != generation) {
+        readable.ranges.clear();
+        {
+            const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+            readable.ranges.reserve(lease.size());
+            for (const auto& range : lease) {
+                if (range->readable) readable.ranges.emplace_back(range->address, range->address + range->bytes);
+            }
+        }
+        readable.generation = generation;
+    }
+    const auto end = address + bytes;
+    const auto found = std::upper_bound(readable.ranges.begin(), readable.ranges.end(), address, [](std::uint64_t value, const auto& range) { return value < range.first; });
+    if (found == readable.ranges.begin()) return false;
+    const auto& range = *std::prev(found);
+    return address >= range.first && end <= range.second;
 }
 
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes) {
