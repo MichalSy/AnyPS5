@@ -446,7 +446,14 @@ void BasicTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Block& dest
     Draw(device, destinationTarget, Whole, 0);
     Flush(device, destinationBlock);
     Check(destinationBlock, expected, name + " destination seed and padding");
+    std::uint64_t submissionsBefore = 0, submissionsAfter = 0, unsignaled = 0;
+    device.FlipBatches(submissionsBefore, unsignaled);
     Resolve(device, sourceTarget, destinationTarget, Whole);
+    if (std::getenv("APS5_SYNC_COLOR_RESOLVES") == nullptr) {
+        device.FlipBatches(submissionsAfter, unsignaled);
+        Require(submissionsBefore == submissionsAfter, "a native color resolve submitted the draw batch prematurely");
+        Require(device.AfterRecordedWork([] {}, false), "a native color resolve must remain recorded without a submission and wait");
+    }
     ExpectResolve(expected, source, Whole);
     Flush(device, destinationBlock);
     Check(destinationBlock, expected, name + " exact eight-sample average over the full region");
@@ -487,6 +494,32 @@ void PendingTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Block& de
     Flush(device, sourceBlock);
     Check(destinationBlock, expected, name + " resolve sees the pending source draw and preserves the pending destination draw");
     Check(sourceBlock, source, name + " selected source samples retain their own values");
+}
+
+void PendingBackingTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Block& destinationBlock) {
+    const auto sourceTarget = Target(sourceBlock, VK_FORMAT_R8G8B8A8_UNORM);
+    const auto destinationTarget = Target(destinationBlock, sourceTarget.format, VK_SAMPLE_COUNT_1_BIT);
+    for (const bool writeSource : {true, false}) {
+        auto source = SeedSamples(sourceBlock);
+        auto expected = SeedDestination(destinationBlock);
+        Draw(device, sourceTarget, Whole, 0);
+        Draw(device, destinationTarget, Whole, 0);
+        Flush(device, sourceBlock);
+        Flush(device, destinationBlock);
+        auto& backing = writeSource ? source : expected;
+        std::fill(backing.begin(), backing.end(), std::byte{0x80});
+        const auto address = writeSource ? sourceBlock.Address() : destinationBlock.Address();
+        auto* recorder = AgcDriver::Graphics::Recorder::Active();
+        Require(recorder != nullptr, "the deferred backing write requires an active recorder");
+        recorder->Commands();
+        recorder->NotePendingWrite(address, backing.size());
+        recorder->OnComplete([address, bytes = backing] { AgcDriver::GuestMemory::Write(address, bytes, 4); });
+        Resolve(device, sourceTarget, destinationTarget, Partial);
+        ExpectResolve(expected, source, Partial);
+        Flush(device, destinationBlock);
+        Check(destinationBlock, expected, writeSource ? "resolve observes an earlier deferred source backing write" :
+            "partial resolve preserves an earlier deferred destination backing write outside its region");
+    }
 }
 
 void ConflictTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Block& destinationBlock, VkFormat format, const std::string& name) {
@@ -772,8 +805,14 @@ void LifetimeTests(AgcDriver::VulkanDevice& device, std::unique_lock<AgcDriver::
 
     const auto unmap = [&](std::size_t offset, std::size_t bytes) {
         GuestAllocations::Mutation mutation;
+        bool checked = false;
         mutation.Unmap(block.data + offset, bytes, [&](const void* piece, std::size_t count, const void*, bool) {
-            Check(block, expected, "pending multisample samples are published before host unmap");
+            // A fragmented allocation invokes this callback once per piece. Verify the full
+            // surface before the first piece is unmapped; later pieces cannot read it anymore.
+            if (!checked) {
+                Check(block, expected, "pending multisample samples are published before host unmap");
+                checked = true;
+            }
             Require(!AgcDriver::Graphics::AnyPendingMultisampleColors(block.Address(), StorageBytes), "host unmap must not retain pending multisample results for the old backing");
 #ifdef _WIN32
             GuestArena::GuestArenaReset_nid_postfix(const_cast<void*>(piece), count);
@@ -851,6 +890,7 @@ int main() {
             SharedFormatTests(*device, source, destination, format, name);
             GeometryAliasTests(*device, source, format, name);
         }
+        PendingBackingTests(*device, source, destination);
         SmallSampleTests(*device, source, destination);
         PackedFloatTests(*device, source, destination);
         Flush(*device, source);

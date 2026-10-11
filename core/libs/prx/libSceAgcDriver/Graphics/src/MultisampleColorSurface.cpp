@@ -289,8 +289,17 @@ void MultisampleColorSurface::upload() {
 
 void MultisampleColorSurface::Refresh() {
     acquireBacking();
-    GuestMemory::CollectWrites(target.address, target.bytes);
-    if (!needsUpload && ((generation != 0 && GuestMemory::UnchangedSinceCollected(target.address, target.bytes, generation)) || GuestMemory::EqualsCommittedUnsynced(target.address, snapshot))) return;
+    // Buffer stores can change the backing independently of this image, just like CPU writes.
+    if (!needsUpload) {
+        if (generation != 0 && GuestMemory::UnchangedSinceCollected(target.address, target.bytes, generation) &&
+            !GuestMemory::StoredOver(target.address, target.bytes, generation)) return;
+        const auto collected = GuestMemory::TrackerGeneration();
+        if (GuestMemory::EqualsCommittedUnsynced(target.address, snapshot)) {
+            // Unrelated stores in a shared tracking block must not repeat the full comparison.
+            generation = collected;
+            return;
+        }
+    }
     Flush();
     Require(GuestMemory::CopyMapped(target.address, snapshot) == GuestMemory::Compare::Equal, "multisample color became unmapped during refresh");
     upload();

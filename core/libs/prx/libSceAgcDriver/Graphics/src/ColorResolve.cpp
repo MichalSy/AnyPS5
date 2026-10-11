@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <array>
+#include <cstdlib>
 #include <limits>
 
 namespace AgcDriver::Graphics {
@@ -136,38 +137,78 @@ void ResolveColor(const Context& context, const ColorResolvePass& pass) {
     const auto required = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
         (attachmentResolve ? 0u : VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
     Require((properties.optimalTilingFeatures & required) == required, "color resolve format lacks required transfer or attachment features");
-    if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->Sync();
+    auto* recorder = Recorder::Active();
+    // Transfer and dynamic attachment resolves follow their draws in the same batch. Legacy
+    // attachment resolves retain their temporary render pass and framebuffer until completion.
+    static const bool syncResolves = std::getenv("APS5_SYNC_COLOR_RESOLVES") != nullptr;
+    const bool recorded = recorder != nullptr && (!attachmentResolve || context.graphicsPipelineLibrary) && !syncResolves;
+    const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
+        return (begin < pass.source.address + pass.source.bytes && pass.source.address < end) ||
+            (begin < pass.destination.address + pass.destination.bytes && pass.destination.address < end);
+    };
+    // Refresh may read guest backing on the CPU. Complete overlapping buffer/label stores first;
+    // image-only draws stay on the GPU and are ordered by the resolve's image barriers.
+    if (recorder != nullptr && (!recorded || Recorder::SnapshotWriteOverlaps(pass.source.address, pass.source.bytes) ||
+        Recorder::SnapshotWriteOverlaps(pass.destination.address, pass.destination.bytes) ||
+        recorder->PendingLabelIn(pass.source.address, pass.source.bytes) || recorder->PendingLabelIn(pass.destination.address, pass.destination.bytes) ||
+        (recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) ||
+        (recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)))) recorder->Sync();
     const auto source = CachedMultisampleColorSurface(context, pass.source);
     const auto destination = CachedStorageSurface(context, DestinationSurface(pass.destination));
     Require(destination->Attachable() && destination->GuestBytes() == pass.destination.bytes, "color resolve destination storage image is incompatible");
     Require(source->Image() != destination->Image(), "color resolve native images alias");
 
-    if (attachmentResolve) {
+    if (attachmentResolve && !recorded) {
         ResolveAttachment(context, pass, *source, *destination);
         destination->MarkDirty();
         return;
     }
-    Require(destination->StorageFormat() == source->NativeFormat(), "color resolve native image formats differ");
-    CommandBatch batch(context);
-    const auto commands = batch.Handle();
+    if (!attachmentResolve) Require(destination->StorageFormat() == source->NativeFormat(), "color resolve native image formats differ");
+    std::unique_ptr<CommandBatch> batch;
+    if (!recorded) batch = std::make_unique<CommandBatch>(context);
+    const auto commands = recorded ? recorder->Commands() : batch->Handle();
+    const VkPipelineStageFlags stage = attachmentResolve ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
+    const VkAccessFlags sourceAccess = attachmentResolve ? VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+    const VkAccessFlags destinationAccess = attachmentResolve ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
     const VkImageMemoryBarrier before[]{
-        Barrier(source->Image(), VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT),
-        Barrier(destination->Image(), VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)
+        Barrier(source->Image(), VK_ACCESS_MEMORY_WRITE_BIT, sourceAccess),
+        Barrier(destination->Image(), VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, destinationAccess)
     };
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, before);
-    VkImageResolve region{};
-    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
-    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
-    region.srcOffset = {pass.region.offset.x, pass.region.offset.y, 0};
-    region.dstOffset = region.srcOffset;
-    region.extent = {pass.region.extent.width, pass.region.extent.height, 1u};
-    context.Function<PFN_vkCmdResolveImage>("vkCmdResolveImage")(commands, source->Image(), VK_IMAGE_LAYOUT_GENERAL, destination->Image(), VK_IMAGE_LAYOUT_GENERAL, 1u, &region);
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stage, 0u, 0u, nullptr, 0u, nullptr, 2u, before);
+    if (attachmentResolve) {
+        VkRenderingAttachmentInfoKHR color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+        color.imageView = source->AttachmentView(pass.source.format);
+        color.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        color.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+        color.resolveImageView = destination->AttachmentView(pass.destination.format);
+        color.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+        rendering.renderArea = pass.region;
+        rendering.layerCount = 1u;
+        rendering.colorAttachmentCount = 1u;
+        rendering.pColorAttachments = &color;
+        context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
+        context.Resolved(&DeviceFunctions::cmdEndRendering, "vkCmdEndRenderingKHR")(commands);
+    } else {
+        VkImageResolve region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+        region.srcOffset = {pass.region.offset.x, pass.region.offset.y, 0};
+        region.dstOffset = region.srcOffset;
+        region.extent = {pass.region.extent.width, pass.region.extent.height, 1u};
+        context.Function<PFN_vkCmdResolveImage>("vkCmdResolveImage")(commands, source->Image(), VK_IMAGE_LAYOUT_GENERAL, destination->Image(), VK_IMAGE_LAYOUT_GENERAL, 1u, &region);
+    }
     const VkImageMemoryBarrier after[]{
-        Barrier(source->Image(), VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT),
-        Barrier(destination->Image(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT)
+        Barrier(source->Image(), sourceAccess, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT),
+        Barrier(destination->Image(), destinationAccess, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT)
     };
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, after);
-    batch.SubmitAndWait();
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, stage, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, after);
+    if (recorded) {
+        recorder->Keep(source);
+        recorder->Keep(destination);
+    } else batch->SubmitAndWait();
     destination->MarkDirty();
 }
 
