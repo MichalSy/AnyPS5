@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -40,7 +41,7 @@ Recorder* recorderFor(const Context& context) {
     return recorder != nullptr && recorder->Device() == context.device ? recorder : nullptr;
 }
 
-class DepthSurface {
+class DepthSurface : public std::enable_shared_from_this<DepthSurface> {
 public:
     DepthSurface(const Context& context, const DepthTarget& target) : context(context), target(target) {
         this->context.bufferPool.reset();
@@ -211,6 +212,48 @@ public:
             (descriptor.dimension == TextureDimension::k2D && descriptor.depthOrLastArray != 0u) || storage.ImageDepth() != 1u);
     }
 
+    std::optional<GuestTextureResource> CanonicalResource() const {
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM;
+        const bool d32 = target.format == VK_FORMAT_D32_SFLOAT;
+        const auto extent = surfaceExtent(target);
+        if ((!d16 && !d32) || target.stencilAddress != 0 || target.samples != VK_SAMPLE_COUNT_1_BIT || target.mipCount != 1u || target.mip != 0u ||
+            ((target.zInfo >> 4u) & 0x1fu) != 24u || (target.zInfo & 3u) != (d16 ? 1u : 3u) || (target.zInfo & 0x000f100cu) != 0u ||
+            target.encodedSurfaceAddress == 0 || (target.encodedSurfaceAddress & 0xffu) != 0u || target.encodedSurfaceAddress >= (1ull << 48u) || target.depthSlice > 0x1fffu ||
+            extent.width == 0u || extent.height == 0u || extent.width > 16384u || extent.height > 16384u) return std::nullopt;
+        const auto elementBytes = d16 ? 2u : 4u;
+        const auto bytes = DepthSliceBytes(extent, elementBytes);
+        const auto base = target.encodedSurfaceAddress & ~0xffffull;
+        const auto offset = static_cast<std::uint64_t>(target.depthSlice) * bytes;
+        if (base == 0 || offset > std::numeric_limits<std::uint64_t>::max() - base || target.address != base + offset ||
+            bytes > std::numeric_limits<std::uint64_t>::max() - target.address) return std::nullopt;
+        const auto* equation = FindTextureSwizzleEquation(24u, elementBytes);
+        if (equation == nullptr) return std::nullopt;
+        auto xorBytes = static_cast<std::uint32_t>(target.encodedSurfaceAddress & 0xffffu);
+        for (std::uint32_t bit = 0; bit < equation->bits.size(); ++bit) {
+            xorBytes ^= (std::popcount((target.depthSlice << 24u) & equation->bits[bit]) & 1u) << bit;
+        }
+        const auto encoded = target.address | xorBytes;
+        const std::array<std::uint32_t, 8> words{
+            static_cast<std::uint32_t>(encoded >> 8u), static_cast<std::uint32_t>((encoded >> 40u) & 0xffu) |
+                ((d16 ? 7u : 22u) << 20u) | (((extent.width - 1u) & 3u) << 30u),
+            ((extent.width - 1u) >> 2u) | ((extent.height - 1u) << 14u), 0xfacu | (24u << 20u) | (9u << 28u), 0, 0, 0, 0
+        };
+        auto resource = DecodeTextureResource(words);
+        const auto geometry = DescribeSurface(resource);
+        if (resource.baseAddress != target.address || geometry.imageLayers != 1u || geometry.imageDepth != 1u || geometry.layerBytes != bytes) return std::nullopt;
+        return resource;
+    }
+
+    bool CoversStorage(const GuestTextureResource& canonical, const StorageTexture& storage) const {
+        const auto& descriptor = storage.Descriptor();
+        if (descriptor.baseAddress < canonical.baseAddress || storage.GuestBytes() > std::numeric_limits<std::uint64_t>::max() - descriptor.baseAddress) return false;
+        const auto first = descriptor.baseAddress - canonical.baseAddress;
+        const auto last = first + storage.GuestBytes();
+        const auto geometry = DescribeSurface(canonical);
+        const auto ranges = CoveredMipBytes(canonical.tileMode, BytesPerElement(canonical.format), geometry.mips.front());
+        return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return first >= range.first && last <= range.second; });
+    }
+
     void Transfer(StorageTexture& storage, bool intoStorage, std::uint32_t layer) {
         if (!StorageAccepts(storage, layer)) refuseStorage(storage, OverwrittenInMemory());
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
@@ -222,6 +265,7 @@ public:
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
         if (recorder != nullptr) {
             if (auto self = storage.weak_from_this().lock()) recorder->Keep(std::move(self));
+            recorder->Keep(shared_from_this());
         }
         constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
             VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
@@ -249,6 +293,12 @@ public:
 
     std::uint32_t WriterLayer() const { return writerLayer; }
     bool HasWriter(const std::shared_ptr<StorageTexture>& storage) const { return writer == storage; }
+    bool HasPendingWriter() const { return writer != nullptr && writer->PendingWrites(); }
+
+    void RequireCanonicalPublication(const StorageTexture& storage) const {
+        if (storage.Descriptor().dccAddress != 0 || depthWritten == 0 || !GuestMemory::Watched(target.address, depthBytes()) ||
+            !GuestMemory::UnchangedSince(target.address, depthBytes(), depthWritten)) refuseStorage(storage, OverwrittenInMemory());
+    }
 
     bool StorageOwnsSample(const GuestTextureResource& resource) const {
         if (writer == nullptr || !Texture::CanCopyFrom(*writer, resource)) return false;
@@ -370,6 +420,7 @@ public:
     VkDeviceMemory memory = VK_NULL_HANDLE;
     bool retired = false;
     bool mappingInvalidated = false;
+    bool guestPublished = false;
     bool pendingClear = false;
     std::uint64_t htileAddress = 0;
     bool htileStencil = false;
@@ -390,12 +441,14 @@ private:
     [[noreturn]] void refuseStorage(const StorageTexture& storage, bool newerGuestWrites) const {
         const auto& descriptor = storage.Descriptor();
         const auto extent = surfaceExtent(target);
-        char text[384];
-        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d, %u samples, %u mips) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented; newer guest writes=%u",
+        char text[640];
+        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d, %u samples, %u mips) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented; newer guest writes=%u; DB_Z_INFO=0x%08x encodedBase=0x%llx originalSlice=%u generation=%llu watched=%u aliasDcc=0x%llx",
             static_cast<unsigned long long>(target.address), extent.width, extent.height, static_cast<int>(target.format),
             static_cast<unsigned>(target.samples), target.mipCount, descriptor.width, descriptor.height,
             static_cast<int>(storage.StorageFormat()), static_cast<int>(descriptor.dimension), descriptor.mipCount,
-            static_cast<unsigned>(newerGuestWrites));
+            static_cast<unsigned>(newerGuestWrites), target.zInfo, static_cast<unsigned long long>(target.encodedSurfaceAddress), target.depthSlice,
+            static_cast<unsigned long long>(depthWritten), static_cast<unsigned>(GuestMemory::Watched(target.address, depthBytes())),
+            static_cast<unsigned long long>(descriptor.dccAddress));
         throw std::runtime_error(text);
     }
 
@@ -424,7 +477,8 @@ private:
 bool sameSurface(const DepthTarget& a, const DepthTarget& b) {
     const auto aExtent = surfaceExtent(a);
     const auto bExtent = surfaceExtent(b);
-    return a.address == b.address && a.stencilAddress == b.stencilAddress && aExtent.width == bExtent.width && aExtent.height == bExtent.height && a.mipCount == b.mipCount && a.format == b.format && a.samples == b.samples;
+    return a.address == b.address && a.stencilAddress == b.stencilAddress && aExtent.width == bExtent.width && aExtent.height == bExtent.height && a.mipCount == b.mipCount && a.format == b.format && a.samples == b.samples &&
+        (a.zInfo & 0x1f0u) == (b.zInfo & 0x1f0u) && a.encodedSurfaceAddress == b.encodedSurfaceAddress && a.depthSlice == b.depthSlice;
 }
 
 std::mutex& surfacesMutex() {
@@ -432,9 +486,37 @@ std::mutex& surfacesMutex() {
     return mutex;
 }
 
-std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
-    static auto* list = new std::vector<std::unique_ptr<DepthSurface>>();
+std::vector<std::shared_ptr<DepthSurface>>& surfaces() {
+    static auto* list = new std::vector<std::shared_ptr<DepthSurface>>();
     return *list;
+}
+
+bool registeredSurface(const std::shared_ptr<DepthSurface>& surface) {
+    return !surface->mappingInvalidated && std::find(surfaces().begin(), surfaces().end(), surface) != surfaces().end();
+}
+
+std::shared_ptr<StorageTexture> canonicalStorage(const Context& context, const GuestTextureResource& resource, const StorageTexture* except = nullptr) {
+    Require(context.detiler != nullptr, "native depth publication requires a texture detiler");
+    const auto bytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+    const auto ranges = GuestMemory::CommittedRanges(resource.baseAddress, bytes, true);
+    Require(ranges.size() == 1u && ranges.front().first == resource.baseAddress && ranges.front().second - resource.baseAddress == bytes,
+        "native depth publication requires a fully committed canonical plane");
+    StorageTexture::FlushPending(resource.baseAddress, bytes, except, "native depth layout", PublishScope::None);
+    auto storage = std::make_shared<StorageTexture>(context, *context.detiler, resource, 0);
+    if (auto* recorder = recorderFor(context); recorder != nullptr) recorder->Keep(storage);
+    return storage;
+}
+
+void reloadPublishedDepth(std::unique_lock<std::mutex>& lock, const std::shared_ptr<DepthSurface>& surface) {
+    if (!surface->retired || !surface->guestPublished) return;
+    const auto resource = surface->CanonicalResource();
+    Require(resource.has_value(), "retired depth surface lost its canonical guest layout");
+    lock.unlock();
+    auto storage = canonicalStorage(surface->context, *resource);
+    lock.lock();
+    Require(registeredSurface(surface), "depth mapping changed during canonical reload");
+    surface->Transfer(*storage, false, 0);
+    surface->guestPublished = false;
 }
 
 void finishStorageWrites(std::unique_lock<std::mutex>& lock, DepthSurface* surface, const std::shared_ptr<StorageTexture>& consumed, std::uint32_t consumedLayer) {
@@ -484,31 +566,32 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     GuestAllocations::GuestAllocationsSetMappingInvalidator_nid_postfix(&invalidateDepthMappings);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
-    DepthSurface* bound = nullptr;
+    std::shared_ptr<DepthSurface> bound;
     for (const auto& surface : surfaces()) {
         if (!surface->mappingInvalidated && surface->context.device == context.device && sameSurface(surface->target, target)) {
             Require(surface->target.sampleLocationsGrid.width == target.sampleLocationsGrid.width && surface->target.sampleLocationsGrid.height == target.sampleLocationsGrid.height &&
                 surface->target.sampleLocations.size() == target.sampleLocations.size() && std::equal(surface->target.sampleLocations.begin(), surface->target.sampleLocations.end(), target.sampleLocations.begin(),
                     [](const auto& a, const auto& b) { return a.x == b.x && a.y == b.y; }), "changing sample locations for an existing depth/stencil surface is unsupported");
-            bound = surface.get();
+            bound = surface;
             break;
         }
     }
     if (bound == nullptr) {
-        surfaces().push_back(std::make_unique<DepthSurface>(context, target));
-        bound = surfaces().back().get();
+        surfaces().push_back(std::make_shared<DepthSurface>(context, target));
+        bound = surfaces().back();
     }
+    reloadPublishedDepth(lock, bound);
     bound->Bind(target);
     bound->retired = false;
     for (const auto& surface : surfaces()) {
-        if (surface.get() != bound && surface->context.device == context.device && surface->Overlaps(*bound)) surface->Retire();
+        if (surface != bound && surface->context.device == context.device && surface->Overlaps(*bound)) surface->Retire();
     }
     const auto consumedLayer = bound->WriterLayer();
     auto consumed = bound->TakeWrites();
     bound->ApplyFastClear();
     bound->NoteWritten();
     const auto view = bound->View(target.mip);
-    finishStorageWrites(lock, bound, consumed, consumedLayer);
+    finishStorageWrites(lock, bound.get(), consumed, consumedLayer);
     return view;
 }
 
@@ -649,10 +732,67 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
             return !surface->retired && !surface->mappingInvalidated && surface->context.device == context.device && surface->target.address == address;
         });
         if (found == list.rend()) continue;
-        auto* surface = found->get();
+        auto surface = *found;
+        if (!surface->StorageAccepts(*storage, layer)) {
+            const auto bytes = static_cast<std::size_t>(DepthMipChainBytes(surfaceExtent(surface->target),
+                surface->target.format == VK_FORMAT_D16_UNORM || surface->target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u, surface->target.mipCount));
+            GuestMemory::CollectWritesUncached(surface->target.address, bytes);
+            if (surface->OverwrittenInMemory()) {
+                surface->Retire();
+                lock.unlock();
+                storage->Refresh();
+                lock.lock();
+                continue;
+            }
+            const auto resource = surface->CanonicalResource();
+            if (!resource.has_value()) {
+                surface->SeedStorage(storage, layer);
+                lock.unlock();
+                storage->Refresh();
+                lock.lock();
+                continue;
+            }
+            surface->RequireCanonicalPublication(*storage);
+            const bool covered = surface->CoversStorage(*resource, *storage);
+            lock.unlock();
+            storage->ReplaceFromMemory(covered, [&] {
+                auto canonical = canonicalStorage(context, *resource, storage.get());
+                try {
+                    lock.lock();
+                    Require(registeredSurface(surface) && !surface->retired, "depth mapping changed during canonical publication");
+                    GuestMemory::CollectWritesUncached(surface->target.address, bytes);
+                    if (surface->OverwrittenInMemory()) {
+                        surface->Retire();
+                        lock.unlock();
+                        return false;
+                    }
+                    surface->RequireCanonicalPublication(*storage);
+                    Require(!surface->HasPendingWriter(), "native depth publication encountered an unpublished storage writer");
+                    const auto consumedLayer = surface->WriterLayer();
+                    auto consumed = surface->TakeWrites();
+                    surface->ApplyFastClear();
+                    surface->Transfer(*canonical, true, 0);
+                    lock.unlock();
+                    if (consumed != nullptr) consumed->WriteBackLayer(consumedLayer);
+                    canonical->MarkDirty();
+                    canonical->WriteBackLayer(0);
+                    lock.lock();
+                    Require(registeredSurface(surface) && !surface->retired, "depth mapping changed while publishing canonical pixels");
+                    surface->guestPublished = true;
+                    surface->Retire();
+                    lock.unlock();
+                    return true;
+                } catch (...) {
+                    if (lock.owns_lock()) lock.unlock();
+                    throw;
+                }
+            });
+            lock.lock();
+            continue;
+        }
         const auto consumedLayer = surface->WriterLayer();
         auto consumed = surface->SeedStorage(storage, layer);
-        finishStorageWrites(lock, surface, consumed, consumedLayer);
+        finishStorageWrites(lock, surface.get(), consumed, consumedLayer);
     }
 }
 

@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <span>
@@ -302,6 +303,11 @@ public:
     // was still current (nothing uploaded).
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
     bool Refresh();
+    // Under GpuMutex, publish current pixels to guest memory without flushing this image.
+    // On success force an upload; pending writes may be replaced only when fully covered.
+    // A false result preserves pending writes and uses Refresh's normal merge.
+    void ReplaceFromMemory(bool fullyCovered, const std::function<bool()>& publish);
+    bool PendingWrites() const;
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
     std::uint64_t GuestBytes() const;

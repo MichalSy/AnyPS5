@@ -332,14 +332,18 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     depth.sampleLocations = result.sampleLocations;
     depth.sampleLocationsGrid = result.sampleLocationsGrid;
     depth.address = zFormat != 0 ? base(0x012, 0x01a) : 0;
+    depth.zInfo = zInfo;
+    depth.encodedSurfaceAddress = depth.address;
     depth.stencilAddress = stencil ? base(0x013, 0x01b) : 0;
     Require(zFormat == 0 || depthReadOnly || base(0x014, 0x01c) == depth.address, "depth read and written at different addresses is unsupported");
     Require(!stencil || stencilReadOnly || base(0x015, 0x01d) == depth.stencilAddress, "stencil read and written at different addresses is unsupported");
+    if (((zInfo >> 4u) & 0x1fu) == 24u && mipCount == 1u && mip == 0u && samples == VK_SAMPLE_COUNT_1_BIT && !stencil) depth.address &= ~0xffffull;
     const auto size = read(cx, 0x007);
     depth.surfaceExtent = {(size & 0x3fffu) + 1u, ((size >> 16u) & 0x3fffu) + 1u};
     requireMip(mipCount <= std::bit_width(std::max(depth.surfaceExtent.width, depth.surfaceExtent.height)), "depth mip chain exceeds its surface dimensions");
     depth.extent = {std::max(depth.surfaceExtent.width >> mip, 1u), std::max(depth.surfaceExtent.height >> mip, 1u)};
     const auto slice = view & 0x1fffu;
+    depth.depthSlice = slice;
     const auto lastSlice = ((view >> 13u) & 0x7ffu) | ((view >> 30u) << 11u);
     Require(slice == lastSlice, "depth views of several array slices are unsupported");
     if (slice != 0) {

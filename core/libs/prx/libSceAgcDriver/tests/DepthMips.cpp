@@ -85,6 +85,21 @@ void RegisterTests() {
         Require(state.depth->address == Base + static_cast<std::uint64_t>(slice) * ChainBytes,
             "a depth array slice used a selected-mip stride or lost its high slice bits");
     }
+    for (const bool singleMip : {true, false}) {
+        constexpr std::uint64_t encoded = 0x0000053400100900ull;
+        constexpr std::uint32_t slice = 3;
+        auto queue = Queue(singleMip ? 0u : 1u, slice);
+        if (singleMip) queue.context[0x010] = 3u | (24u << 4u);
+        queue.context[0x012] = queue.context[0x014] = static_cast<std::uint32_t>(encoded >> 8u);
+        queue.context[0x01a] = queue.context[0x01c] = static_cast<std::uint32_t>(encoded >> 40u);
+        const auto depth = *DecodeState(queue).depth;
+        const auto base = singleMip ? encoded & ~0xffffull : encoded;
+        const auto stride = singleMip ? DepthSliceBytes(Extent, 4u) : ChainBytes;
+        Require(depth.zInfo == queue.context[0x010] && depth.encodedSurfaceAddress == encoded && depth.depthSlice == slice,
+            "depth decoding lost the original layout, encoded address or selected array slice");
+        Require(depth.address == base + slice * stride,
+            "depth decoding confused an encoded pipe/bank XOR with a physical address or changed an unsupported mip layout");
+    }
     auto queue = Queue(1);
     queue.context[0x002] |= 0x01000000u;
     const auto readOnly = DecodeState(queue);

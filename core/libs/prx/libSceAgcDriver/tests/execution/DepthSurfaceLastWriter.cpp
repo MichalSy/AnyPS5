@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -545,6 +546,137 @@ void ReadStorageImage(const Context& context, const StorageTexture& storage, Buf
     batch.SubmitAndWait();
 }
 
+void WriteStorageImage(const Context& context, StorageTexture& storage, Buffer& pixels, std::uint32_t layer = 0) {
+    CommandBatch batch(context);
+    const auto commands = batch.Handle();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+    copy.imageExtent = {storage.Descriptor().width, storage.Descriptor().height, 1};
+    context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, pixels.Handle(), storage.Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    batch.SubmitAndWait();
+    storage.MarkDirty();
+}
+
+void CanonicalDepthAliasTest(const Context& context, bool d16, bool pendingAlias) {
+    const VkExtent2D extent{d16 ? 272u : 144u, 144u};
+    const auto elementBytes = d16 ? 2u : 4u;
+    const auto sliceBytes = static_cast<std::size_t>(DepthSliceBytes(extent, elementBytes));
+    constexpr std::uint32_t slice = 3u;
+    constexpr std::uint32_t xorBytes = 0x900u;
+    const auto totalBytes = (slice + 1u) * sliceBytes;
+    GuestBlock memory(totalBytes);
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearCachedTextures(device); ClearDepthSurfaces(device); }
+    } cleanup{context.device};
+    std::vector<std::byte> expected(totalBytes, std::byte{0xcd});
+    Buffer pixels(context, extent.width * extent.height * elementBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    const auto* equation = FindTextureSwizzleEquation(24u, elementBytes);
+    Require(equation != nullptr, "the canonical depth oracle has no swizzle equation");
+    const auto blockWidth = d16 ? 256u : 128u;
+    const auto blocksPerRow = (extent.width + blockWidth - 1u) / blockWidth;
+    const auto guestOffset = [&](std::uint32_t x, std::uint32_t y) {
+        std::uint32_t offset = 0;
+        for (std::uint32_t bit = 0; bit < equation->bits.size(); ++bit) {
+            const auto mask = equation->bits[bit];
+            const auto coordinates = (x & mask & 0xfffu) ^ ((y << 12u) & mask & 0xfff000u) ^ ((slice << 24u) & mask & 0xff000000u);
+            offset |= (std::popcount(coordinates) & 1u) << bit;
+        }
+        const auto block = (y / 128u) * blocksPerRow + x / blockWidth;
+        return slice * sliceBytes + block * Block + (offset ^ xorBytes);
+    };
+    for (std::uint32_t y = 0; y < extent.height; ++y) {
+        for (std::uint32_t x = 0; x < extent.width; ++x) {
+            const auto pixel = static_cast<std::size_t>(y) * extent.width + x;
+            const auto value = d16 ? pendingAlias ? 0xffffu : (0x2000u + (x * 17u + y * 31u) % 0x5000u) :
+                std::bit_cast<std::uint32_t>(pendingAlias ? 1.0f : 0.25f + static_cast<float>((x * 17u + y * 31u) % 128u) / 512.0f);
+            std::memcpy(expected.data() + guestOffset(x, y), &value, elementBytes);
+            std::memcpy(pixels.Bytes().data() + pixel * elementBytes, &value, elementBytes);
+        }
+    }
+    std::memcpy(memory.data, expected.data(), expected.size());
+    AgcDriver::GuestMemory::MarkWritten(memory.Address(), totalBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    auto target = Depth(memory.Address() + slice * sliceBytes, extent);
+    target.format = d16 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
+    target.clearDepth = pendingAlias ? 1.0f : 0.5f;
+    target.zInfo = (24u << 4u) | (d16 ? 1u : 3u);
+    target.encodedSurfaceAddress = memory.Address() | xorBytes;
+    target.depthSlice = slice;
+    auto aliasResource = View(16, 16, target.address);
+    aliasResource.format = d16 ? 20u : 29u;
+    const auto aliasPitch = DescribeSurface(aliasResource).mips.front().pitchBytes;
+    const auto aliasRowBytes = aliasResource.width * 4u;
+    auto alias = CachedStorageSurface(context, aliasResource);
+    if (pendingAlias) {
+        Buffer oldPixels(context, alias->GuestBytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::fill(oldPixels.Bytes().begin(), oldPixels.Bytes().end(), std::byte{0});
+        WriteStorageImage(context, *alias, oldPixels);
+    }
+    DepthSurfaceView(context, target);
+    auto original = View(extent.width, extent.height, memory.Address());
+    original.format = d16 ? 7u : 22u;
+    original.tileMode = TextureTileMode::kZ64KBX;
+    original.pipeBankXor = xorBytes;
+    original.dimension = TextureDimension::k2DArray;
+    original.depthOrLastArray = slice;
+    if (!pendingAlias) {
+        auto writer = CachedStorageSurface(context, original);
+        WriteStorageImage(context, *writer, pixels, slice);
+        DepthSurfaceView(context, target);
+    }
+    alias = CachedStorageSurface(context, aliasResource);
+    Require(!DepthSurfaceAt(target.address), "the incompatible alias did not retire its published native depth surface");
+    AgcDriver::GuestMemory::FlushGpuWrites(memory.Address(), totalBytes);
+    Require(std::equal(expected.begin(), expected.end(), memory.data), "canonical depth publication changed pixel bits, another slice or tile padding");
+    Buffer aliasReadback(context, aliasResource.width * aliasResource.height * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    ReadStorageImage(context, *alias, aliasReadback);
+    for (std::uint32_t y = 0; y < aliasResource.height; ++y) {
+        Require(std::memcmp(aliasReadback.Bytes().data() + y * aliasRowBytes, expected.data() + slice * sliceBytes + y * aliasPitch, aliasRowBytes) == 0,
+            "the incompatible alias kept older GPU pixels after canonical depth publication");
+    }
+    Buffer changed(context, aliasReadback.Bytes().size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    std::fill(changed.Bytes().begin(), changed.Bytes().end(), std::byte{0});
+    WriteStorageImage(context, *alias, changed);
+    for (std::uint32_t y = 0; y < aliasResource.height; ++y) {
+        std::fill_n(expected.data() + slice * sliceBytes + y * aliasPitch, aliasRowBytes, std::byte{0});
+    }
+    DepthSurfaceView(context, target);
+    auto restored = CachedStorageSurface(context, original);
+    Buffer restoredReadback(context, (slice + 1u) * pixels.Bytes().size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    ReadStorageImage(context, *restored, restoredReadback);
+    for (std::uint32_t y = 0; y < extent.height; ++y) {
+        for (std::uint32_t x = 0; x < extent.width; ++x) {
+            const auto pixel = (static_cast<std::size_t>(slice) * extent.height + y) * extent.width + x;
+            Require(std::memcmp(restoredReadback.Bytes().data() + pixel * elementBytes, expected.data() + guestOffset(x, y), elementBytes) == 0,
+                "rebinding published depth restored incorrect GPU pixel bits");
+        }
+    }
+    AgcDriver::GuestMemory::FlushGpuWrites(memory.Address(), totalBytes);
+    Require(std::equal(expected.begin(), expected.end(), memory.data), "rebinding published depth resurrected pixels from before the alias write");
+    std::fill_n(memory.data + slice * sliceBytes, sliceBytes, std::byte{0x5a});
+    AgcDriver::GuestMemory::MarkWritten(target.address, sliceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    alias = CachedStorageSurface(context, aliasResource);
+    ReadStorageImage(context, *alias, aliasReadback);
+    Require(std::all_of(aliasReadback.Bytes().begin(), aliasReadback.Bytes().end(), [](auto value) { return value == std::byte{0x5a}; }),
+        "canonical publication replaced newer guest pixels with native depth pixels");
+    DepthSurfaceView(context, target);
+    AgcDriver::GuestMemory::Unwatch(target.address, sliceBytes);
+    std::fill_n(memory.data + slice * sliceBytes, sliceBytes, std::byte{0x6b});
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    bool refused = false;
+    try { CachedStorageSurface(context, aliasResource); }
+    catch (const std::runtime_error& error) { refused = std::string_view(error.what()).find("not implemented") != std::string_view::npos; }
+    Require(refused && DepthSurfaceAt(target.address), "unwatched depth pixels were published without an unchanged-memory proof");
+    Require(std::all_of(memory.data + slice * sliceBytes, memory.data + totalBytes, [](auto value) { return value == std::byte{0x6b}; }),
+        "canonical publication overwrote untracked guest pixels");
+}
+
 void StorageRoundTripTest(const Context& context, bool keepCached, bool clearPendingWriter = false, bool skipClearBind = false) {
     GuestBlock memory(2 * Block);
     struct Cleanup {
@@ -892,6 +1024,10 @@ int main() {
         StorageRoundTripTest(device->GetContext(), true);
         StorageRoundTripTest(device->GetContext(), true, true);
         StorageRoundTripTest(device->GetContext(), true, true, true);
+        CanonicalDepthAliasTest(device->GetContext(), false, false);
+        CanonicalDepthAliasTest(device->GetContext(), true, false);
+        CanonicalDepthAliasTest(device->GetContext(), false, true);
+        CanonicalDepthAliasTest(device->GetContext(), true, true);
         StorageArrayRoundTripTest(device->GetContext(), true);
         StorageArrayRoundTripTest(device->GetContext(), false);
         StorageArrayRoundTripTest(device->GetContext(), true, true);

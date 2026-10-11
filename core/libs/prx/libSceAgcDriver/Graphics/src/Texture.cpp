@@ -983,15 +983,23 @@ bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const
 
 // The image being validated by Refresh: its own pending results are what the next dispatch wants,
 // so the comparison with guest memory must not flush them.
-thread_local const StorageTexture* refreshing = nullptr;
+class StorageFlushExemption;
+thread_local const StorageFlushExemption* refreshing = nullptr;
 
 class StorageFlushExemption {
 public:
-    explicit StorageFlushExemption(const StorageTexture* texture) : previous(std::exchange(refreshing, texture)) {}
+    explicit StorageFlushExemption(const StorageTexture* texture) : texture(texture), previous(std::exchange(refreshing, this)) {}
     ~StorageFlushExemption() { refreshing = previous; }
+    static bool Contains(const StorageTexture* texture) {
+        for (auto* exemption = refreshing; exemption != nullptr; exemption = exemption->previous) {
+            if (exemption->texture == texture) return true;
+        }
+        return false;
+    }
 
 private:
-    const StorageTexture* previous;
+    const StorageTexture* texture;
+    const StorageFlushExemption* previous;
 };
 
 void FlushHook(std::uint64_t address, std::size_t bytes) {
@@ -1674,6 +1682,27 @@ bool StorageTexture::Refresh() {
         uploadedKeys = keys;
     }
     return false;
+}
+
+void StorageTexture::ReplaceFromMemory(bool fullyCovered, const std::function<bool()>& publish) {
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "native depth publication requires the GPU lock");
+    Require(!anyLayerPending() || fullyCovered, "native depth publication cannot discard storage results in depth padding");
+    const StorageFlushExemption exempt(this);
+    if (!publish()) {
+        Refresh();
+        return;
+    }
+    layerPending.assign(trackedLayers, false);
+    reconcilePending();
+    originalValid = false;
+    refreshProof = {};
+    forgetBorrowed(0, trackedLayers);
+    upload();
+}
+
+bool StorageTexture::PendingWrites() const {
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "storage pending results require the GPU lock");
+    return anyLayerPending();
 }
 
 DccKeys StorageTexture::ProvedKeys() const {
@@ -2790,10 +2819,9 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
-        const auto* exempt = refreshing;
         for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
-            if (texture != except && texture != exempt && texture->overlaps(address, bytes)) {
+            if (texture != except && !StorageFlushExemption::Contains(texture) && texture->overlaps(address, bytes)) {
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     ++it;
@@ -2937,9 +2965,8 @@ std::vector<std::shared_ptr<StorageTexture>> StorageTexture::overlappingPending(
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     if (!pending.textures.MayOverlap(address, bytes)) return overlapping;
-    const auto* exempt = refreshing;
     for (auto* texture : pending.textures) {
-        if (texture == exempt || !texture->overlaps(address, bytes) || !texture->pendingUnitInside(address, bytes)) continue;
+        if (StorageFlushExemption::Contains(texture) || !texture->overlaps(address, bytes) || !texture->pendingUnitInside(address, bytes)) continue;
         if (auto alive = texture->weak_from_this().lock()) overlapping.push_back(std::move(alive));
     }
     return overlapping;
@@ -3120,11 +3147,10 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
     std::lock_guard lock(pending.mutex);
     std::size_t discarded = 0;
     const auto end = address + bytes;
-    const auto* exempt = refreshing;
     for (auto it = pending.textures.begin(); it != pending.textures.end();) {
         auto* texture = *it;
         const auto begin = texture->descriptor.baseAddress;
-        if (texture != exempt && begin >= address && begin + texture->guestBytes <= end) {
+        if (!StorageFlushExemption::Contains(texture) && begin >= address && begin + texture->guestBytes <= end) {
             // The content no longer matches guest memory anywhere: the next use re-uploads once the
             // fill stamped the range, never from a matching `original` (the fill may not have
             // touched the bytes a CPU-path upload copied).
@@ -3133,7 +3159,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             texture->originalValid = false;
             it = pending.textures.erase(it);
             ++discarded;
-        } else if (texture != exempt && texture->blockUnits && texture->overlaps(address, bytes)) {
+        } else if (!StorageFlushExemption::Contains(texture) && texture->blockUnits && texture->overlaps(address, bytes)) {
             // Its units wholly inside the range are dead too (re-uploaded from the range's bytes at
             // the next use, never from a matching `original`: the dropped units hold results the
             // bytes never received); the others stay pending.
@@ -3514,6 +3540,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
 }
 
 void StorageTexture::WriteBack() {
+    const StorageFlushExemption exempt(this);
     const auto previous = std::exchange(flushReason, "explicit");
     writeBack(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     flushReason = previous;
