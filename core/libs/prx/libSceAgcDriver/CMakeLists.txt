@@ -746,6 +746,18 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcSampleMsaaShaderSpv ${agcTestShaderGeneratedRoot}/SampleMsaa.spv)
+set(agcSampleMsaaShaderHeader ${agcTestShaderGeneratedRoot}/SampleMsaa_spv.h)
+add_custom_command(
+        OUTPUT "${agcSampleMsaaShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -DMULTISAMPLED=1 -o "${agcSampleMsaaShaderSpv}" "${agcSampleLodShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcSampleMsaaShaderSpv} -DOUTPUT=${agcSampleMsaaShaderHeader}
+        -DSYMBOL=SAMPLE_MSAA_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcSampleLodShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcSampleArrayShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/SampleArray.comp)
 set(agcSampleArrayShaderSpv ${agcTestShaderGeneratedRoot}/SampleArray.spv)
 set(agcSampleArrayShaderHeader ${agcTestShaderGeneratedRoot}/SampleArray_spv.h)
@@ -1091,7 +1103,9 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
 
-target_sources(agc_driver_depth_mips_tests PRIVATE ${agcSampleLodShaderHeader})
+target_link_libraries(agc_driver_dword_pattern_fill_tests PRIVATE libkernel)
+
+target_sources(agc_driver_depth_mips_tests PRIVATE ${agcSampleLodShaderHeader} ${agcSampleMsaaShaderHeader})
 target_include_directories(agc_driver_depth_mips_tests PRIVATE ${agcTestShaderGeneratedRoot})
 target_sources(agc_driver_depth_surface_last_writer_tests PRIVATE ${agcSampleLodShaderHeader})
 target_include_directories(agc_driver_depth_surface_last_writer_tests PRIVATE ${agcTestShaderGeneratedRoot})

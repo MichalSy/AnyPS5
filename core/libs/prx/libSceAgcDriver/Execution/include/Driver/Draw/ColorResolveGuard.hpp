@@ -95,8 +95,18 @@ inline void RequireFixedColorResolvePrograms(const QueueState& queue, const Shad
     Graphics::Require(Read(queue.shader, 0x8au, Graphics::RegisterBank::Shader) == 0x622c0042u &&
         Read(queue.shader, 0xau, Graphics::RegisterBank::Shader) == 0x022c0000u,
         "fixed color resolve has unsupported shader register or floating-point configuration");
-    Graphics::Require(context(0x203u) == 0x10u && context(0x204u) == 0x00080000u && context(0x205u) == 0x240u && context(0x207u) == 0u,
-        "fixed color resolve has unsupported depth, shader coverage, clip or raster state");
+    const auto shaderControl = context(0x203u);
+    const auto clipControl = context(0x204u);
+    const auto rasterControl = context(0x205u);
+    const auto vertexOutput = context(0x207u);
+    // The verified rectangle exports Z=0, inside both the [-1, 1] and [0, 1] clip ranges.
+    if (shaderControl != 0x10u || (clipControl & ~0x00080000u) != 0u || rasterControl != 0x240u || vertexOutput != 0u) {
+        std::ostringstream message;
+        message << "fixed color resolve has unsupported depth, shader coverage, clip or raster state" << std::hex
+            << " (DB_SHADER_CONTROL=0x" << shaderControl << " PA_CL_CLIP_CNTL=0x" << clipControl
+            << " PA_SU_SC_MODE_CNTL=0x" << rasterControl << " PA_CL_VS_OUT_CNTL=0x" << vertexOutput << ')';
+        Graphics::Require(false, message.str());
+    }
     Graphics::Require(context(0x1c2u) == 1u && context(0x1c3u) == 4u && context(0x1c4u) == 0u && context(0x1c5u) == 4u,
         "fixed color resolve has unsupported position, depth, coverage or color export format");
     Graphics::Require(context(0x83u) == 0xffffu && context(0x8cu) == 0xaa99aaaau && context(0x8du) == 0u && context(0x2f9u) == 0x2du,

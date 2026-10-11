@@ -343,7 +343,7 @@ public:
         const auto format = ResolveTextureFormat(resource.format);
         const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
         const auto extent = surfaceExtent(target);
-        return (format == expected || depthBits) && resource.dimension == TextureDimension::k2D && resource.width == extent.width && resource.height == extent.height &&
+        return resource.samples == static_cast<std::uint32_t>(target.samples) && (format == expected || depthBits) && resource.dimension == TextureDimension::k2D && resource.width == extent.width && resource.height == extent.height &&
             resource.baseLevel <= resource.lastLevel && resource.lastLevel < target.mipCount && resource.baseArray == 0 && (target.mipCount == 1u || resource.tileMode == TextureTileMode::kZ64KBX);
     }
 
@@ -354,14 +354,6 @@ public:
         key[9] = components.g;
         key[10] = components.b;
         key[11] = components.a;
-        if (target.samples != VK_SAMPLE_COUNT_1_BIT) {
-            char text[768];
-            std::snprintf(text, sizeof(text), "AGC graphics: sampling a multisampled depth/stencil surface requires multisampled texture materialization: cached depth=0x%llx stencil=0x%llx %ux%u samples=%u vk=%d; texture=0x%llx %ux%u guest format=%u tile=%u dimension=%u levels=%u-%u slice=%u (T# %08x %08x %08x %08x %08x %08x %08x %08x)",
-                static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.stencilAddress), target.extent.width, target.extent.height, static_cast<unsigned>(target.samples), static_cast<int>(target.format),
-                static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned>(resource.tileMode), static_cast<unsigned>(resource.dimension), resource.baseLevel, resource.lastLevel, resource.baseArray,
-                key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
-            throw std::runtime_error(text);
-        }
         if (const auto found = textures.find(key); found != textures.end()) return found->second;
         const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
         if (!SampledAccepts(words, resource)) {
@@ -377,7 +369,7 @@ public:
     }
 
     bool Holds(std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, const Texture* texture) const {
-        if (target.samples != VK_SAMPLE_COUNT_1_BIT || StorageOwnsSample(resource) || !SampledAccepts(words, resource)) return false;
+        if (StorageOwnsSample(resource) || !SampledAccepts(words, resource)) return false;
         std::array<std::uint32_t, 12> key{};
         std::copy(words.begin(), words.end(), key.begin());
         key[8] = components.r;
@@ -723,7 +715,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
 }
 
 bool DepthSurfaceHolds(const Context& context, std::span<const std::uint32_t> words, VkComponentMapping components, const Texture* texture) {
-    if (texture == nullptr || words.size() != 8u || (words[3] >> 28u) != 9u) return false;
+    if (texture == nullptr || words.size() != 8u || ((words[3] >> 28u) != 9u && (words[3] >> 28u) != 14u)) return false;
     const auto resource = DecodeTextureResource(words);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());

@@ -1,10 +1,18 @@
 #version 450
 
 layout(local_size_x = 1) in;
+#ifdef MULTISAMPLED
+layout(set = 0, binding = 0) uniform sampler2DMS source;
+#else
 layout(set = 0, binding = 0) uniform sampler2D source;
+#endif
 layout(set = 0, binding = 1, std430) buffer Result { vec4 texel; };
 layout(push_constant) uniform Parameters { float lod; } parameters;
 
 void main() {
+#ifdef MULTISAMPLED
+    texel = texelFetch(source, ivec2(0), int(parameters.lod));
+#else
     texel = textureLod(source, vec2(0.5), parameters.lod);
+#endif
 }

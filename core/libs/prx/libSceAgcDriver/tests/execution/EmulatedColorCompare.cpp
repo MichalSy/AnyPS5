@@ -31,6 +31,7 @@ constexpr std::uint32_t Format8888Srgb = 130;
 constexpr std::uint32_t Format8888UInt = 60;
 constexpr std::uint32_t Format32Float = 22;
 constexpr std::uint32_t Type2D = 9;
+constexpr std::uint32_t Type1D = 8;
 constexpr std::uint32_t TypeCube = 11;
 constexpr std::uint32_t LessEqual = 3;
 constexpr std::uint32_t ClampWrap = 0;
@@ -98,13 +99,13 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
-std::array<std::uint32_t, 8> TextureDescriptor(std::uint32_t format, bool cube = false) {
+std::array<std::uint32_t, 8> TextureDescriptor(std::uint32_t format, bool cube = false, bool line = false) {
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Texels.data()));
     return {
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format << 20u) | (((Side - 1u) & 3u) << 30u),
-        ((Side - 1u) >> 2u) | ((Side - 1u) << 14u),
-        Swizzle | ((cube ? TypeCube : Type2D) << 28u),
+        ((Side - 1u) >> 2u) | (line ? 0u : ((Side - 1u) << 14u)),
+        Swizzle | ((cube ? TypeCube : line ? Type1D : Type2D) << 28u),
         cube ? 5u : 0u, 0u, 0u, 0u,
     };
 }
@@ -211,11 +212,11 @@ float Expected(std::uint32_t tid, const Sampler& sampler, bool offsets) {
     return top * (1.0f - b) + bottom * b;
 }
 
-ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, std::uint32_t format, const Sampler& sampler, std::span<const std::uint32_t> code = Code, bool useCache = false, bool nativeSampleOffsets = true, bool cube = false) {
+ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, std::uint32_t format, const Sampler& sampler, std::span<const std::uint32_t> code = Code, bool useCache = false, bool nativeSampleOffsets = true, bool cube = false, bool line = false) {
     std::vector<std::uint32_t> userData(24, 0u);
     const auto input = cube ? BufferDescriptor(CubeInput.data(), static_cast<std::uint32_t>(sizeof(CubeInput))) : BufferDescriptor(Input.data(), static_cast<std::uint32_t>(sizeof(Input)));
     const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(sizeof(Output)));
-    const auto texture = TextureDescriptor(format, cube);
+    const auto texture = TextureDescriptor(format, cube, line);
     const auto samplerWords = SamplerDescriptor(sampler);
     std::copy(input.begin(), input.end(), userData.begin());
     std::copy(output.begin(), output.end(), userData.begin() + 4);
@@ -250,6 +251,37 @@ void Run(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char* na
         const float expected = Expected(tid, sampler, offsets);
         const float tolerance = sampler.filter == FilterPoint ? 0.0f : 1e-4f;
         Require(std::fabs(Output[tid] - expected) <= tolerance, std::string(name) + ": thread " + std::to_string(tid) + " compared to " + std::to_string(Output[tid]) + ", expected " + std::to_string(expected));
+    }
+}
+
+void RunLine(AgcDriver::VulkanDevice& device, const Sampler& sampler, bool offsets, bool useCache) {
+    const auto descriptor = TextureDescriptor(Format8888UNorm, false, true);
+    const auto surface = AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(descriptor));
+    Texels.fill(0);
+    for (std::uint32_t x = 0; x < Side; ++x) {
+        auto* texel = &Texels[surface.mips.at(0).tiledOffset + x * 4u];
+        texel[0] = Red[x];
+        texel[3] = 255u;
+    }
+    Output.fill(-1.0f);
+    const std::span<const std::uint32_t> code = offsets ? std::span<const std::uint32_t>(OffsetCode) : std::span<const std::uint32_t>(Code);
+    const auto result = Compile(device, Format8888UNorm, sampler, code, useCache, true, false, true);
+    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+    device.WaitIdle();
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        const auto compare = [&](int x) { return ReferenceTexel(x, 0, std::clamp(Input[tid * 3u], 0.0f, 1.0f), sampler); };
+        const float u = Input[tid * 3u + 1u] * Side;
+        const int offset = offsets ? OffsetComponent(tid, 0u) : 0;
+        float expected;
+        if (sampler.filter == FilterPoint) expected = compare(static_cast<int>(std::floor(u)) + offset);
+        else {
+            const float centre = u - 0.5f;
+            const int x = static_cast<int>(std::floor(centre)) + offset;
+            const float weight = centre - std::floor(centre);
+            expected = compare(x) * (1.0f - weight) + compare(x + 1) * weight;
+        }
+        Require(std::fabs(Output[tid] - expected) <= 1e-4f, "2D comparison on a 1D color texture: lane " + std::to_string(tid) +
+            " is " + std::to_string(Output[tid]) + ", expected " + std::to_string(expected));
     }
 }
 
@@ -398,6 +430,13 @@ int main() {
         Reject(*device, Format8888UNorm, {ClampHalfBorder, FilterPoint}, "wrap, clamp-to-edge or clamp-to-border");
         Reject(*device, Format8888UNorm, {ClampBorder, FilterPoint, BorderTable}, "border color table");
         Reject(*device, Format8888UNorm, {ClampEdge, FilterBilinear, BorderBlack, ReductionMin}, "min or max reduction");
+        for (const auto clamp : {ClampEdge, ClampWrap, ClampBorder}) {
+            for (const auto filter : {FilterPoint, FilterBilinear}) {
+                for (const bool offsets : {false, true}) {
+                    for (const bool cache : {false, true}) RunLine(*device, {clamp, filter, BorderWhite}, offsets, cache);
+                }
+            }
+        }
         std::puts("emulated color compare tests passed");
         return 0;
     } catch (const std::exception& error) {

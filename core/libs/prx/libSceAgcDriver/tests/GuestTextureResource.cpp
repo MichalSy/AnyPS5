@@ -150,6 +150,15 @@ void RunGuestTextureResourceTests() {
     tileModes.tileModeRaw = 0x03;
     rejectFields(tileModes, "unsupported tile mode");
 
+    Fields multisampled = base;
+    multisampled.typeRaw = 14;
+    multisampled.lastLevel = multisampled.maxMip = 1;
+    multisampled.msaaDepth = true;
+    const auto msaa = DecodeTextureResource(pack(multisampled));
+    Require(msaa.samples == 2u && msaa.mipCount == 1u && msaa.allocatedMipCount == 1u && msaa.lastLevel == 0u, "MSAA sample count became a mip count");
+    multisampled.maxMip = 2;
+    rejectFields(multisampled, "sample or LOD");
+
     Fields oneD = base;
     oneD.typeRaw = 8;
     oneD.height = 1;

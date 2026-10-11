@@ -3,6 +3,14 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
+#include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libkernel/Equeue/Equeue.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include <future>
+#include <chrono>
+#include <thread>
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -10,6 +18,9 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+extern "C" int APS5_VABI sceKernelCreateEqueue(KernelEqueue*, const char*);
+extern "C" int APS5_VABI sceKernelDeleteEqueue(KernelEqueue);
 
 namespace {
 
@@ -121,6 +132,52 @@ void ExecuteTests() {
     }
 }
 
+void DeferredCompletionWake() {
+    using namespace AgcDriver::DriverDetail;
+    if (std::getenv("APS5_NO_FILL_HLE") != nullptr || DrawPipeline::Depth() < 4u) return;
+    AgcDriverWaitIdle_nid_postfix();
+    KernelEqueue eq = 0;
+    Require(sceKernelCreateEqueue(&eq, "deferred EOP wake") == 0, "cannot create the deferred EOP queue");
+    auto owner = EqueuePin_nid_postfix(eq);
+    Require(sceAgcDriverAddEqEvent(eq, 0, nullptr) == 0, "cannot register the deferred EOP interrupt");
+    alignas(65536) static std::array<std::uint32_t, 16384> memory{};
+    GuestAllocations::Mutation().Add(memory.data(), sizeof(memory), true, true, true);
+    auto release = std::make_shared<std::promise<void>>();
+    auto gate = release->get_future().share();
+    std::promise<void> entered;
+    auto entering = entered.get_future();
+    DrawPipeline::Queue0().Enqueue([gate, &entered] { entered.set_value(); gate.wait(); }, {});
+    entering.wait();
+    bool released = false;
+    try {
+        auto words = Commands(UserData(memory.data(), 1024, 256, 4), 4, false, 0);
+        words.insert(words.end(), {0xc0064900u, 0u, 1u << 24u, 0u, 0u, 0u, 0u, 0u});
+        Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+        AgcDriver::Submit(&packet, 0);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!DrawPipeline::Queue0().Overlaps(reinterpret_cast<std::uintptr_t>(memory.data()), sizeof(memory)) || !queue0Dormant.load()) {
+            Require(std::chrono::steady_clock::now() < deadline, "queue worker did not sleep behind the blocked committer");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        release->set_value();
+        released = true;
+        KernelEvent event{};
+        while (owner->GetTriggeredEvents(&event, 1) == 0) {
+            Require(std::chrono::steady_clock::now() < deadline, "deferred EOP did not wake the idle queue worker without another submission or WaitIdle");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        AgcDriverWaitIdle_nid_postfix();
+    } catch (...) {
+        if (!released) release->set_value();
+        AgcDriverWaitIdle_nid_postfix();
+        throw;
+    }
+    GuestAllocations::Mutation().Remove(memory.data());
+    Require(sceAgcDriverDeleteEqEvent(eq, 0) == 0, "cannot delete the deferred EOP interrupt");
+    owner.reset();
+    Require(sceKernelDeleteEqueue(eq) == 0, "cannot delete the deferred EOP queue");
+}
+
 }
 
 int main() {
@@ -131,6 +188,7 @@ int main() {
             if (!device) return VulkanTestSkipped;
         }
         ExecuteTests();
+        DeferredCompletionWake();
         AgcDriverShutdown_nid_postfix();
         std::puts("dword pattern fill tests passed");
         return 0;

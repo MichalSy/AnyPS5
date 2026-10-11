@@ -533,7 +533,7 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
     if ((image.emulatedCompare & EmulatedCompare::RequiresSingleLevel) != 0u && ((descriptor.dwords[3] >> 12u) & 0xfu) != ((descriptor.dwords[3] >> 16u) & 0xfu)) throw std::runtime_error("color comparison requires a single mip level");
     const auto reference = colorCompareReference(format);
     const auto type = rawImageType(descriptor);
-    if (type != ImageType::Color2D && type != ImageType::Color2DArray && type != ImageType::Cube) throw std::runtime_error("comparison sampling of a color texture is implemented only for 2D, 2D array and cube views");
+    if (type != ImageType::Color1D && type != ImageType::Color2D && type != ImageType::Color2DArray && type != ImageType::Cube) throw std::runtime_error("comparison sampling of a color texture is implemented only for 1D, 2D, 2D array and cube views");
     bool redChannel = false;
     bool compareChannel = false;
     for (std::uint32_t channel = 0u; channel < 4u; ++channel) {
@@ -565,7 +565,7 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
             throw std::runtime_error("comparison sampling of a color texture is implemented only with wrap, clamp-to-edge or clamp-to-border addressing");
         };
         const auto addressX = addressMode(clampX);
-        const auto addressY = addressMode(clampY);
+        const auto addressY = type == ImageType::Color1D ? EmulatedCompare::AddressEdge : addressMode(clampY);
         const auto borderType = (words[3] >> 30u) & 0x3u;
         const bool border = addressX == EmulatedCompare::AddressBorder || addressY == EmulatedCompare::AddressBorder;
         if (border && borderType == 3u) throw std::runtime_error("comparison sampling of a color texture with a border color table is not implemented");
@@ -731,6 +731,11 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
         mode.packedFormat = IrBufferFormat::Invalid;
         mode.shaderSwizzle = ShaderImageIdentitySwizzle;
         modes.push_back(mode);
+        if (image.dimension == RdnaImageDimension::Dim2D && image.flatLineCompatible) {
+            auto line = mode;
+            line.dimension = RdnaImageDimension::Dim1D;
+            modes.push_back(line);
+        }
         if (image.dimension == RdnaImageDimension::Dim2DArray) {
             auto plain = mode;
             plain.dimension = RdnaImageDimension::Dim2D;
@@ -824,6 +829,8 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
         return "{class " + std::to_string(static_cast<int>(numeric)) + ", dim " + std::to_string(static_cast<int>(dimension)) + ", conversion " + std::to_string(static_cast<int>(conversion)) + ", packed " + std::to_string(static_cast<int>(packed)) + ", cube " + std::to_string(cube) + ", depthBits " + std::to_string(depthBits) + ", unorm16 " + std::to_string(depthUnorm16) + ", srgb " + std::to_string(srgb) + "}";
     };
     std::string message = "image descriptor is incompatible with the static runtime image interface: descriptor format " + std::to_string(static_cast<int>(format)) + " decodes to " + describe(decoded.numericClass, decoded.dimension, decoded.conversionFormat, decoded.packedFormat, decoded.cube, decoded.depthBits, decoded.depthUnorm16, decoded.srgbDecode) + (emulated ? " (emulated compare)" : "") + "; modes:";
+    message += " (pc " + std::to_string(image.firstUsePc) + ", compare " + std::to_string(image.depthCompare) +
+        ", flatLine " + std::to_string(image.flatLineCompatible) + ", singleLevel " + std::to_string(image.flatLineRequiresSingleLevel) + ')';
     for (const auto& mode : modes) message += " " + describe(mode.numericClass, mode.dimension, mode.conversionFormat, mode.packedFormat, mode.cube, mode.depthBits, mode.depthUnorm16, mode.srgbDecode);
     char words[96];
     std::snprintf(words, sizeof(words), "; T# %08x %08x %08x %08x %08x %08x %08x %08x", descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]);

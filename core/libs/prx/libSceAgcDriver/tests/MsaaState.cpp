@@ -159,7 +159,7 @@ void sharedRejections() {
     rejects(queue, "maximum sample distance does not match");
     queue = reference();
     queue.context[0x292] &= ~1u;
-    rejects(queue, "multisample coverage requires MSAA scan conversion");
+    rejects(queue, "depth and rasterization sample counts differ");
     queue = reference();
     queue.context[0x2f8] = 0u;
     rejects(queue, "MSAA scan conversion without a multisample coverage count");
@@ -334,4 +334,11 @@ void RunMsaaStateTests() {
     const auto one = DecodeState(single);
     Require(DrawRejection(single,false).empty() && one.rasterizationSamples == VK_SAMPLE_COUNT_1_BIT && one.depth->samples == VK_SAMPLE_COUNT_1_BIT && one.color.samples == VK_SAMPLE_COUNT_1_BIT, "single-sample state regressed beside MSAA");
     Require(one.sampleLocations.empty() && one.depth->sampleLocations.empty() && one.color.bytes == 65536u, "single-sample state inherited multisample layout or locations");
+    single.context[0x201] = queue.context.at(0x201);
+    single.context[0x2f8] = queue.context.at(0x2f8);
+    for (std::uint32_t offset = 0x2feu; offset <= 0x30du; ++offset) single.context[offset] = queue.context.at(offset);
+    const auto retained = DecodeState(single);
+    Require(DrawRejection(single, false).empty() && retained.rasterizationSamples == VK_SAMPLE_COUNT_1_BIT &&
+        retained.sampleLocations.empty() && retained.depth->samples == VK_SAMPLE_COUNT_1_BIT && retained.color.samples == VK_SAMPLE_COUNT_1_BIT,
+        "disabled MSAA scan conversion consumed retained coverage counts or sample locations");
 }

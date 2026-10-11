@@ -117,6 +117,14 @@ void DrawAndRouting() {
     for (const auto offset : {0x203u, 0x204u, 0x205u, 0x207u}) {
         Case example; example.queue.context[offset] ^= 1u; Reject([&] { example.Check(); }, "clip or raster");
     }
+    for (const auto clipControl : {0u, 0x80000u}) {
+        Case example; example.queue.context[0x204u] = clipControl; example.Check();
+        for (std::uint32_t bit = 0; bit < 32u; ++bit) {
+            if (bit == 19u) continue;
+            example.queue.context[0x204u] = clipControl | (1u << bit);
+            Reject([&] { example.Check(); }, "PA_CL_CLIP_CNTL");
+        }
+    }
     for (const auto offset : {0x8au, 0xau}) {
         Case example; example.queue.shader[offset] ^= 1u; Reject([&] { example.Check(); }, "floating-point configuration");
     }

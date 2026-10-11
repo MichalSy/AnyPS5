@@ -297,7 +297,7 @@ const ImageMemoEntry& decodedImage(VkDevice device, std::span<const std::uint32_
     if (slot.device == device && std::equal(words.begin(), words.end(), slot.words.begin())) return slot;
     slot.device = VK_NULL_HANDLE;
     slot.resource = DecodeTextureResource(words);
-    slot.guestBytes = DescribeSurface(slot.resource).guestBytes;
+    slot.guestBytes = slot.resource.samples == 1u ? DescribeSurface(slot.resource).guestBytes : 0u;
     slot.components = ViewComponents(slot.resource);
     std::copy(words.begin(), words.end(), slot.words.begin());
     slot.hasEntry = false;
@@ -551,6 +551,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         return depth;
     }
+    Require(resource.samples == 1u, "guest multisampled texture has no matching depth/stencil surface");
     std::shared_ptr<StorageTexture> depthStorage;
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
     if (!depthCompare && DepthSurfaceAt(resource, false)) depthStorage = cachedStorageTexture(context, words, resource, 0, guestBytes);
@@ -3179,8 +3180,8 @@ bool ShaderResources::precollectImages() {
             if (words[0] != 0u || (words[1] & 0xffu) != 0u) {
                 const auto* memo = words.size() == 8 ? &decodedImage(context.device, words) : nullptr;
                 record.resource = memo != nullptr ? memo->resource : DecodeTextureResource(words);
-                record.guestBytes = memo != nullptr ? memo->guestBytes : DescribeSurface(record.resource).guestBytes;
-                record.generation = GuestMemory::CollectWrites(record.resource.baseAddress, static_cast<std::size_t>(record.guestBytes));
+                record.guestBytes = memo != nullptr ? memo->guestBytes : record.resource.samples == 1u ? DescribeSurface(record.resource).guestBytes : 0u;
+                if (record.guestBytes != 0u) record.generation = GuestMemory::CollectWrites(record.resource.baseAddress, static_cast<std::size_t>(record.guestBytes));
                 record.decoded = true;
                 if (record.sampled && !noRecords && words.size() == 8 && (binding.imageDepthCompare.empty() || !binding.imageDepthCompare.at(element))) {
                     std::copy(words.begin(), words.end(), record.words.begin());
@@ -3291,12 +3292,14 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 continue;
             }
             const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
+            const bool multisampled = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DMsaa || binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DMsaaArray;
+            Require(multisampled == (resource.samples != 1u), "guest texture sample count disagrees with the shader's image shape");
             RequireDegammaFormat(resource.format, binding.imageSamplers[element], shaderSamplers);
             RequireNonSeamlessCube(resource.dimension == TextureDimension::kCube, binding.imageSamplers[element], shaderSamplers);
             const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
             if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
             const VkComponentMapping components = ViewComponents(resource);
-            const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
+            const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : resource.samples == 1u ? DescribeSurface(resource).guestBytes : 0u;
             std::shared_ptr<Texture> texture;
             const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
             if (previousSampled.texture != nullptr && previousSampled.depthCompare == depthCompare && words.size() == 8 && std::equal(words.begin(), words.end(), previousSampled.words.begin())) texture = previousSampled.texture;
@@ -3356,6 +3359,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             continue;
         }
         const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
+        Require(resource.samples == 1u, "multisampled storage textures are not implemented");
         const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
         if (binding.imageShape.has_value() && !firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest storage texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
         const auto mip = std::min(resource.baseLevel + mipOffset, resource.mipCount - 1u);
@@ -3386,6 +3390,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
     // sampled texture of one views that image (SampledFromStorageEligible), so neither waits for
     // the producer.
     const auto consider = [&](std::uint32_t format, std::uint64_t address, std::uint64_t guestBytes, bool sampled) {
+        if (guestBytes == 0u) return;
         const bool gpuDirect = sampled ? SampledFromStorageEligible(context, format, address, guestBytes) : HostImportCovers(context, address, static_cast<std::size_t>(guestBytes));
         if (!gpuDirect) surfaces.emplace_back(address, guestBytes);
     };
@@ -3423,6 +3428,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
     forEachImageElement(*deferredCompute.program, [&](const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t, std::span<const std::uint32_t> words) {
         if (words[0] == 0u && (words[1] & 0xffu) == 0u) return;
         const auto resource = DecodeTextureResource(words);
+        if (resource.samples != 1u) return;
         consider(resource.format, resource.baseAddress, DescribeSurface(resource).guestBytes, binding.kind == ShaderRecompiler::DescriptorKind::SampledImage);
     });
     return surfaces;

@@ -9,6 +9,9 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "VulkanTestDevice.hpp"
 #include "SampleLod_spv.h"
+#include "SampleMsaa_spv.h"
+#include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include <SDL_loadso.h>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -230,7 +233,7 @@ constexpr VkComponentMapping Identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONEN
 
 class SampleProgram {
 public:
-    explicit SampleProgram(const Context& context) : context(context), result(context, sizeof(float) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
+    explicit SampleProgram(const Context& context, bool multisampled = false) : context(context), result(context, sizeof(float) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
         try {
             const VkDescriptorSetLayoutBinding bindings[]{
                 {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -248,8 +251,9 @@ public:
             pipelineLayoutInfo.pPushConstantRanges = &push;
             Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &pipelineLayoutInfo, nullptr, &pipelineLayout), "vkCreatePipelineLayout");
             VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            moduleInfo.codeSize = sizeof(SAMPLE_LOD_SPV);
-            moduleInfo.pCode = SAMPLE_LOD_SPV;
+            const auto code = multisampled ? std::span<const std::uint32_t>(SAMPLE_MSAA_SPV) : std::span<const std::uint32_t>(SAMPLE_LOD_SPV);
+            moduleInfo.codeSize = code.size_bytes();
+            moduleInfo.pCode = code.data();
             Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
             VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
             pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
@@ -637,6 +641,55 @@ void MappingLifetimeTests(const Device& device, SampleProgram& sampler) {
     }
 }
 
+void MultisampleDepthSampling(const Device& device) {
+    const auto& context = device.GetContext();
+    GuestBlock memory(Block);
+    DepthTarget target{memory.Address(), 0, {32, 32}, VK_FORMAT_D32_SFLOAT, 0.625f, 0};
+    target.surfaceExtent = target.extent;
+    target.samples = VK_SAMPLE_COUNT_2_BIT;
+    SampleProgram sampler(context, true);
+    DepthSurfaceView(context, target);
+    auto words = Descriptor(target, 0, 1);
+    words[3] = (words[3] & 0x0fffffffu) | (14u << 28u);
+    words[5] = 1u << 4u;
+    const auto resource = DecodeTextureResource(words);
+    Require(resource.samples == 2u && resource.mipCount == 1u && resource.lastLevel == 0u, "MSAA fragments were decoded as mip levels");
+    const auto texture = CachedSampledTexture(context, words);
+    Require(texture != nullptr && texture->View() != VK_NULL_HANDLE, "MSAA depth did not produce a sampled view");
+    for (unsigned sample = 0; sample < 2u; ++sample) {
+        Require(std::abs(sampler.Red(*texture, static_cast<float>(sample)) - 0.625f) < 0.00001f, "MSAA depth sample does not contain the depth clear value");
+    }
+    const auto identityView = DepthSurfaceTexture(context, words, resource, Identity);
+    Require(DepthSurfaceHolds(context, words, Identity, identityView.get()), "MSAA depth view was not recognized for reuse");
+    alignas(256) const std::array<std::uint32_t, 10> code{0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e060280u, 0xf0001130u, 0x00010400u, 0xbf8c3f70u, 0xe0701000u, 0x80000403u, 0xbf810000u};
+    alignas(256) std::array<float, 32> output{};
+    const auto address = reinterpret_cast<std::uintptr_t>(output.data());
+    std::vector<std::uint32_t> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), sizeof(output), 0x31016facu};
+    userData.insert(userData.end(), words.begin(), words.end());
+    const std::array<ShaderRecompiler::MemoryRegion, 1> codeMemory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))}}};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {32, 0, userData, ShaderRecompiler::ShaderComputeStageInfo{{32, 1, 1}, 0, {false, false, false}, false, 1}, {}, {}, codeMemory},
+        device.Target(), {0, 0, 0, 128}
+    };
+    request.useCache = false;
+    const auto shader = ShaderRecompiler::Recompile(request);
+    Require(std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const auto& binding) { return binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DMsaa; }), "MSAA load did not declare a multisampled image binding");
+    auto bindingContext = context;
+    TextureCache cache(bindingContext);
+    bindingContext.textureCache = &cache;
+    PlaceholderImages placeholders(bindingContext);
+    bindingContext.placeholderImages = &placeholders;
+    ShaderResources resources(bindingContext, CompiledShader{ShaderRecompiler::ShaderStage::Compute, &shader, 0});
+    Require(resources.PresyncSurfaces().empty(), "MSAA depth view requested an unsupported guest-memory readback");
+    words[3] = (words[3] & ~(0xfu << 16u)) | (2u << 16u);
+    words[5] = 2u << 4u;
+    bool refused = false;
+    try { CachedSampledTexture(context, words); }
+    catch (const std::runtime_error& error) { refused = std::string(error.what()).find("sampling") != std::string::npos; }
+    Require(refused, "MSAA depth accepted a descriptor with a different sample count");
+}
+
 void MultisampleMipRefusal(const Context& context) {
     GuestBlock memory(0xb0000);
     auto target = Target(memory.Address(), {512, 256}, 1);
@@ -678,6 +731,7 @@ int main(int argc, char** argv) {
         RenderAndSample(*device, sampler, {512, 256}, 0xb0000, "macro mip chain");
         RenderAndSample(*device, sampler, {64, 64}, 0x10000, "shared mip tail");
         FootprintTests(device->GetContext());
+        MultisampleDepthSampling(*device);
         MultisampleMipRefusal(device->GetContext());
         std::puts("depth mip rendering, sampling views, tail preservation and whole-chain tracking tests passed");
         return 0;

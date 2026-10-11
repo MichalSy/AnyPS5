@@ -89,7 +89,7 @@ void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, st
                 driver.forgetUnfinishedWrites(driver.workers.at(0), labelWrites);
                 const auto found = std::find(driver.queue0Uncommitted.begin(), driver.queue0Uncommitted.end(), received);
                 if (found != driver.queue0Uncommitted.end()) driver.queue0Uncommitted.erase(found);
-                notify = driver.idleWaiters != 0 || driver.orderHolders.load(std::memory_order_acquire) != 0;
+                notify = driver.idleWaiters != 0 || driver.orderHolders.load(std::memory_order_acquire) != 0 || queue0Dormant.load(std::memory_order_relaxed);
             }
             if (notify) driver.changed.notify_all();
         }
@@ -153,12 +153,13 @@ void Driver::run(std::uint32_t id) noexcept {
 #endif
                 };
 
+                const auto completionWork = [&] { return completionsPending() && (id == 0 || Graphics::Recorder::PendingCompletionLabels() != 0); };
                 while (!ready()) {
-                    if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
+                    if (!completionWork()) {
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
-                        changed.wait(lock, ready);
+                        changed.wait(lock, [&] { return ready() || completionWork(); });
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
-                        break;
+                        continue;
                     }
                     if (poll(ready)) break;
                     lock.unlock();

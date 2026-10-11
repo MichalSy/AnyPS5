@@ -43,6 +43,8 @@ TextureDimension resolveDimension(std::uint32_t raw) {
         case 11: return TextureDimension::kCube;
         case 12: return TextureDimension::k1DArray;
         case 13: return TextureDimension::k2DArray;
+        case 14: return TextureDimension::k2D;
+        case 15: return TextureDimension::k2DArray;
         default: throw std::runtime_error("AGC graphics: guest texture descriptor uses an unsupported image type " + std::to_string(raw));
     }
 }
@@ -110,7 +112,9 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     Require(!cornerSample, "guest texture descriptor uses corner sampling which is not implemented");
     Require(!prtDefColor, "guest texture descriptor uses a partially resident default color which is not implemented");
     Require(arrayPitch == 0, "guest texture descriptor uses a nonzero array pitch which is not implemented");
-    Require(!msaaDepth, "guest texture descriptor uses MSAA which is not implemented");
+    const bool multisampled = typeRaw == 14u || typeRaw == 15u;
+    Require(!msaaDepth || multisampled, "guest texture descriptor has MSAA depth on a single-sample image");
+    Require(!multisampled || (baseLevel == 0u && lastLevel >= 1u && lastLevel <= 3u && maxMip == lastLevel && minLod == 0u), "guest multisampled texture descriptor has unsupported sample or LOD fields");
     static_cast<void>(maxUncompBlkSize);
     static_cast<void>(maxCompBlkSize);
     // Surfaces are always written uncompressed here (render targets and storage images bypass DCC), so
@@ -200,6 +204,11 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     result.dccAlphaOnMsb = dccAlphaPos;
     result.dccPipeAligned = metaPipeAligned;
     result.minLod = minLod;
+    if (multisampled) {
+        result.samples = 1u << lastLevel;
+        result.mipCount = result.allocatedMipCount = 1u;
+        result.lastLevel = 0u;
+    }
     if (baseLevel > maxMip) {
         Require(LevelsFitAllocation(result, lastLevel + 1u), "guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe());
         result.mipCount = lastLevel + 1u;
@@ -224,6 +233,8 @@ bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, Texture
         case ShaderRecompiler::DescriptorImageShape::ImageCube: return dimension == TextureDimension::kCube;
         case ShaderRecompiler::DescriptorImageShape::Image3D: return dimension == TextureDimension::k3D;
         case ShaderRecompiler::DescriptorImageShape::Image1DArray: return dimension == TextureDimension::k1DArray;
+        case ShaderRecompiler::DescriptorImageShape::Image2DMsaa: return dimension == TextureDimension::k2D;
+        case ShaderRecompiler::DescriptorImageShape::Image2DMsaaArray: return dimension == TextureDimension::k2DArray;
     }
     throw std::runtime_error("AGC graphics: MatchesGuestDimension encountered an unknown descriptor image shape");
 }

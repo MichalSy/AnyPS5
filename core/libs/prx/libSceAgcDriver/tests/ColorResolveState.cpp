@@ -151,6 +151,16 @@ void RunColorResolveStateTests() {
         smaller.context[0x2f8] = captured.context.at(0x2f8);
         rejects(smaller, "matching source coverage");
     }
+    for (const auto sampleLog : {1u, 2u, 3u}) {
+        auto disabled = queue;
+        disabled.context[0x201] = 0u;
+        disabled.context[0x31d] = (sampleLog << 12u) | (sampleLog << 15u);
+        const auto pass = DecodeColorResolvePass(disabled);
+        Require(pass && pass->source.samples == static_cast<VkSampleCountFlagBits>(1u << sampleLog),
+            "resolve with disabled rasterizer AA/EQAA lost the source sample count");
+        disabled.context[0x2f8] = sampleLog | (sampleLog << 20u);
+        rejects(disabled, "EQAA");
+    }
     auto packed = queue;
     packed.context[0x31c] = packed.context[0x32b] = 0x40718u;
     packed.context[0x31d] = 0x9000u;

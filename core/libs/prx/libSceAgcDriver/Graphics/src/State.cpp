@@ -156,15 +156,13 @@ std::string multisampleRejection(const Registers& cx, State* output = nullptr, b
         }
         return {};
     };
-    if (*aa == 0) {
-        if ((*mode & 1u) != 0) return "MSAA scan conversion without a multisample coverage count is unsupported";
-        return attachmentRejection(VK_SAMPLE_COUNT_1_BIT);
-    }
+    // AA counts and locations can remain programmed after MSAA scan conversion is disabled.
+    if ((*mode & 1u) == 0) return attachmentRejection(VK_SAMPLE_COUNT_1_BIT);
+    if (*aa == 0) return "MSAA scan conversion without a multisample coverage count is unsupported";
     const auto samplesLog2 = *aa & 7u;
     if ((*aa & ~0x0071e007u) != 0 || samplesLog2 == 0u || samplesLog2 > 3u || ((*aa >> 20u) & 7u) != samplesLog2)
         return zeroMessage(0x2f8, *aa, "multisampling other than matching two, four or eight coverage and exposed samples");
     const auto samples = 1u << samplesLog2;
-    if ((*mode & 1u) == 0) return "multisample coverage requires MSAA scan conversion";
     if (auto reason = attachmentRejection(static_cast<VkSampleCountFlagBits>(samples)); !reason.empty()) return reason;
     const auto eqaa = word(0x201);
     const auto shader = word(0x203);
@@ -713,7 +711,9 @@ std::string DepthMaintenanceRejection(const QueueState& queue) {
     if ((zInfo & 3u) == 2u || (zInfo & 0x000f1000u) != 0 || (stencilInfo & 0x1001u) != 1u) return reject("without a supported stencil plane");
     if (auto reason = multisampleRejection(cx); !reason.empty()) return reason;
     const auto aa = find(cx, 0x2f8);
-    if (aa != cx.end() && (aa->second & 7u) != samples) return reject("with differing depth and rasterization sample counts");
+    const auto scan = find(cx, 0x292);
+    const auto coverage = scan != cx.end() && (scan->second & 1u) == 0 ? 0u : aa != cx.end() ? aa->second & 7u : samples;
+    if (coverage != samples) return reject("with differing depth and rasterization sample counts");
     if (word(0x013) != word(0x015) || (word(0x01b) & 0xffu) != (word(0x01d) & 0xffu)) return reject("with differing stencil read/write addresses");
     if (word(0x013) == 0 && (word(0x01b) & 0xffu) == 0) return reject("without a stencil address");
     return {};
@@ -1144,9 +1144,10 @@ std::optional<ColorResolvePass> DecodeColorResolvePass(const QueueState& queue) 
     Require(aa == 0u || ((aa & ~0x0071e007u) == 0u && (aa & 7u) == samplesLog2 && ((aa >> 20u) & 7u) == samplesLog2),
         "color resolve requires matching source coverage and exposed samples without coverage conversion");
     const auto eqaa = read(cx, 0x201);
-    Require((eqaa & ~0x00107777u) == 0u && (eqaa & 7u) == samplesLog2 && ((eqaa >> 4u) & 7u) <= samplesLog2 &&
-        ((eqaa >> 8u) & 7u) <= samplesLog2 && ((eqaa >> 12u) & 7u) <= samplesLog2 && (eqaa & 0x100000u) != 0u,
-        "color resolve with mixed anchor counts, overrasterization or unsupported EQAA state is unsupported");
+    Require((aa == 0u && eqaa == 0u) || ((eqaa & ~0x00107777u) == 0u && (eqaa & 7u) == samplesLog2 &&
+        ((eqaa >> 4u) & 7u) <= samplesLog2 && ((eqaa >> 8u) & 7u) <= samplesLog2 &&
+        ((eqaa >> 12u) & 7u) <= samplesLog2 && (eqaa & 0x100000u) != 0u),
+        "color resolve with mixed anchor counts, overrasterization or unsupported EQAA state is unsupported (EQAA=" + std::to_string(eqaa) + ", AA=" + std::to_string(aa) + ", samplesLog2=" + std::to_string(samplesLog2) + ")");
     Require(read(cx, 0x8e) == 0xfu && read(cx, 0x8f) == 0xfu, "color resolve requires all source components in MRT0");
     zero(cx, 0x80, ~0u, "color resolve window offset");
     Require(read(cx, 0x206) == 0x43fu, "color resolve requires homogeneous positions and all viewport transforms");
