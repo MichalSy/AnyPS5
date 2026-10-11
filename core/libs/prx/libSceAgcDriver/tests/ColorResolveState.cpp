@@ -151,6 +151,22 @@ void RunColorResolveStateTests() {
         smaller.context[0x2f8] = captured.context.at(0x2f8);
         rejects(smaller, "matching source coverage");
     }
+    auto packed = queue;
+    packed.context[0x31c] = packed.context[0x32b] = 0x40718u;
+    packed.context[0x31d] = 0x9000u;
+    packed.context[0x201] = 0x101011u;
+    packed.context[0x2f8] = 0x108001u;
+    packed.context[0x3b8] = 0x09c6c000u;
+    for (std::uint32_t offset = 0x2feu; offset <= 0x30du; ++offset) packed.context[offset] = 0u;
+    for (std::uint32_t pixel = 0; pixel < 4u; ++pixel) packed.context[0x2feu + pixel * 4u] = 0xcc44u;
+    const auto packedPass = DecodeColorResolvePass(packed);
+    Require(packedPass && packedPass->source.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && packedPass->destination.format == packedPass->source.format,
+        "captured R11G11B10F resolve with floating-point ROUND_MODE was rejected");
+    Require(packedPass->source.samples == VK_SAMPLE_COUNT_2_BIT && packedPass->destination.samples == VK_SAMPLE_COUNT_1_BIT &&
+        packedPass->source.elementBytes == 4u && packedPass->destination.elementBytes == 4u && packedPass->source.bytes == 65536u && packedPass->destination.bytes == 65536u,
+        "two-to-one packed-float resolve sample counts or layouts changed");
+    Require(packedPass->region.offset.x == 0 && packedPass->region.offset.y == 0 && packedPass->region.extent.width == Width && packedPass->region.extent.height == Height,
+        "two-to-one packed-float resolve region changed");
     auto wide = queue;
     wide.context[0x31d] = 0x12000u;
     wide.context[0x201] = 0x102022u;
@@ -210,8 +226,10 @@ void RunColorResolveStateTests() {
     for (const auto offset : {0x31fu,0x321u,0x325u,0x32eu,0x330u,0x334u,0x398u,0x399u,0x3a0u,0x3a1u,0x3a8u,0x3a9u}) {
         queue = captured; queue.context[offset] = 1u; rejects(queue,"CMASK, FMASK or DCC addresses");
     }
-    queue = captured; queue.context[0x31c] |= 0x40000u; rejects(queue,"nonstandard rounding");
-    queue = captured; queue.context[0x32b] = 0x8028u; rejects(queue,"matching RGBA8, BGRA8 or RGBA16F");
+    for (const auto offset : {0x31cu, 0x32bu}) {
+        queue = captured; queue.context[offset] |= 0x40000u; rejects(queue,"nonstandard rounding");
+    }
+    queue = captured; queue.context[0x32b] = 0x8028u; rejects(queue,"matching RGBA8");
     queue = captured; queue.context[0x31c] = queue.context[0x32b] = 0x8e28u;
     Require(DecodeColorResolvePass(queue)->source.format == VK_FORMAT_B8G8R8A8_SRGB, "matching sRGB resolve was rejected");
     queue = captured; queue.context[0x31b] = 1u; rejects(queue,"mipmapped, array or volume");

@@ -15,7 +15,7 @@ namespace {
 
 void ValidateTarget(const ColorTarget& target) {
     const bool wide = target.format == VK_FORMAT_R16G16B16A16_SFLOAT;
-    Require((wide || target.format == VK_FORMAT_R8G8B8A8_UNORM || target.format == VK_FORMAT_B8G8R8A8_UNORM || target.format == VK_FORMAT_R8G8B8A8_SRGB || target.format == VK_FORMAT_B8G8R8A8_SRGB) &&
+    Require((wide || target.format == VK_FORMAT_R8G8B8A8_UNORM || target.format == VK_FORMAT_B8G8R8A8_UNORM || target.format == VK_FORMAT_R8G8B8A8_SRGB || target.format == VK_FORMAT_B8G8R8A8_SRGB || target.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
         target.elementBytes == (wide ? 8u : 4u) && target.componentMapping == 0xe4u, "color resolve format or component mapping is unsupported");
     Require(target.tileMode == ColorTileMode::RenderTarget, "color resolve tile mode is unsupported");
     Require(target.depth == 1u && target.depthSlice == 0u && target.mipCount == 1u && target.mip == 0u && !target.mipTail, "color resolve arrays, volumes or mipmaps are unsupported");
@@ -59,7 +59,7 @@ VkImageMemoryBarrier Barrier(VkImage image, VkAccessFlags sourceAccess, VkAccess
     return barrier;
 }
 
-void ResolveSrgb(const Context& context, const ColorResolvePass& pass, MultisampleColorSurface& source, StorageTexture& destination) {
+void ResolveAttachment(const Context& context, const ColorResolvePass& pass, MultisampleColorSurface& source, StorageTexture& destination) {
     VkRenderPass renderPass = VK_NULL_HANDLE;
     try {
         std::array<VkAttachmentDescription, 2> attachments{};
@@ -85,7 +85,7 @@ void ResolveSrgb(const Context& context, const ColorResolvePass& pass, Multisamp
         info.pAttachments = attachments.data();
         info.subpassCount = 1u;
         info.pSubpasses = &subpass;
-        Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &info, nullptr, &renderPass), "vkCreateRenderPass sRGB color resolve");
+        Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &info, nullptr, &renderPass), "vkCreateRenderPass attachment color resolve");
         const std::array views{source.AttachmentView(pass.source.format), destination.AttachmentView(pass.destination.format)};
         Framebuffer framebuffer(context, renderPass, views, pass.source.extent);
         CommandBatch batch(context);
@@ -129,22 +129,25 @@ void ResolveColor(const Context& context, const ColorResolvePass& pass) {
     GuestMemory::CheckRange(reinterpret_cast<const void*>(pass.destination.address), pass.destination.bytes, destinationLayout.Alignment(), true);
     if (pass.region.extent.width == 0u || pass.region.extent.height == 0u) return;
 
+    const bool attachmentResolve = pass.source.format == VK_FORMAT_R8G8B8A8_SRGB || pass.source.format == VK_FORMAT_B8G8R8A8_SRGB || pass.source.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     VkFormatProperties properties{};
-    context.formatProperties(context.physical, pass.source.elementBytes == 8u ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM, &properties);
-    constexpr auto required = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    context.formatProperties(context.physical, attachmentResolve ? pass.source.format :
+        pass.source.elementBytes == 8u ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM, &properties);
+    const auto required = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+        (attachmentResolve ? 0u : VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
     Require((properties.optimalTilingFeatures & required) == required, "color resolve format lacks required transfer or attachment features");
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->Sync();
     const auto source = CachedMultisampleColorSurface(context, pass.source);
     const auto destination = CachedStorageSurface(context, DestinationSurface(pass.destination));
     Require(destination->Attachable() && destination->GuestBytes() == pass.destination.bytes, "color resolve destination storage image is incompatible");
-    Require(destination->StorageFormat() == source->NativeFormat(), "color resolve native image formats differ");
     Require(source->Image() != destination->Image(), "color resolve native images alias");
 
-    if (pass.source.format == VK_FORMAT_R8G8B8A8_SRGB || pass.source.format == VK_FORMAT_B8G8R8A8_SRGB) {
-        ResolveSrgb(context, pass, *source, *destination);
+    if (attachmentResolve) {
+        ResolveAttachment(context, pass, *source, *destination);
         destination->MarkDirty();
         return;
     }
+    Require(destination->StorageFormat() == source->NativeFormat(), "color resolve native image formats differ");
     CommandBatch batch(context);
     const auto commands = batch.Handle();
     const VkImageMemoryBarrier before[]{

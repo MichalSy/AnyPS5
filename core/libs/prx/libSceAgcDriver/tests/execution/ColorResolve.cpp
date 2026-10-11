@@ -396,6 +396,45 @@ void SmallSampleTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Block
     }
 }
 
+void PackedFloatTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Block& destinationBlock) {
+    const auto sourceTarget = Target(sourceBlock, VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_SAMPLE_COUNT_2_BIT);
+    const auto destinationTarget = Target(destinationBlock, sourceTarget.format, VK_SAMPLE_COUNT_1_BIT);
+    const AgcDriver::Graphics::MultisampleColorLayout sourceLayout(Width, Height, 4u, 2u);
+    const AgcDriver::Graphics::ColorTargetLayout destinationLayout(Width, Height, destinationTarget.tileMode, 4u);
+    constexpr std::array<std::uint32_t, 2> values{
+        0x3c0u | (0x400u << 11u) | (0x220u << 22u),
+        0x420u | (0x460u << 11u) | (0x250u << 22u)
+    };
+    constexpr std::uint32_t average = 0x400u | (0x440u << 11u) | (0x240u << 22u);
+    std::vector<std::byte> source(StorageBytes, std::byte{0xa9});
+    std::vector<std::byte> expected(StorageBytes, std::byte{0xb6});
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            for (std::uint32_t sample = 0; sample < values.size(); ++sample)
+                std::memcpy(source.data() + sourceLayout.Offset(x, y, sample), &values[sample], sizeof(values[sample]));
+        }
+    }
+    std::memcpy(sourceBlock.data, source.data(), source.size());
+    std::memcpy(destinationBlock.data, expected.data(), expected.size());
+    AgcDriver::GuestMemory::MarkWritten(sourceBlock.Address(), source.size());
+    AgcDriver::GuestMemory::MarkWritten(destinationBlock.Address(), expected.size());
+    Draw(device, Target(sourceBlock, VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_2_BIT), Whole, 0);
+    Draw(device, Target(destinationBlock, VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_1_BIT), Whole, 0);
+    for (const auto region : {Partial, Whole}) {
+        Resolve(device, sourceTarget, destinationTarget, region);
+        for (std::uint32_t y = 0; y < region.extent.height; ++y) {
+            for (std::uint32_t x = 0; x < region.extent.width; ++x) {
+                const auto offset = destinationLayout.Offset(region.offset.x + x, region.offset.y + y);
+                std::memcpy(expected.data() + offset, &average, sizeof(average));
+            }
+        }
+        Flush(device, destinationBlock);
+        Check(destinationBlock, expected, "two-sample packed-float resolve averages (1,2,4) and (3,6,12) to (2,4,8) through cached RGBA8 views and preserves padding");
+        Flush(device, sourceBlock);
+        Check(sourceBlock, source, "two-sample packed-float resolve preserves source samples and padding");
+    }
+}
+
 void BasicTests(AgcDriver::VulkanDevice& device, Block& sourceBlock, Block& destinationBlock, VkFormat format, const std::string& name) {
     auto source = SeedSamples(sourceBlock);
     auto expected = SeedDestination(destinationBlock);
@@ -813,6 +852,7 @@ int main() {
             GeometryAliasTests(*device, source, format, name);
         }
         SmallSampleTests(*device, source, destination);
+        PackedFloatTests(*device, source, destination);
         Flush(*device, source);
         Flush(*device, destination);
         LifetimeTests(*device, gpuLock);

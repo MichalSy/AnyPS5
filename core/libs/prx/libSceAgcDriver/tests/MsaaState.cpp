@@ -221,10 +221,10 @@ void colorRejections() {
     rejects(queue, "multisampled mipmapped, array or volume color views", false);
     queue = reference();
     queue.context[0x3b8] = 0x09000000u;
-    rejects(queue, "multisampled color requires SW_64KB_R_X and RGBA8 or RGBA16F elements", false);
+    rejects(queue, "multisampled color requires SW_64KB_R_X", false);
     queue = reference();
     queue.context[0x31c] = 0x872cu;
-    rejects(queue, "multisampled color requires SW_64KB_R_X and RGBA8 or RGBA16F elements", false);
+    rejects(queue, "multisampled color requires SW_64KB_R_X", false);
     for (const auto metadata : {0x10000000u,0x2000u}) {
         queue = reference();
         queue.context[0x31c] |= metadata;
@@ -307,6 +307,17 @@ void RunMsaaStateTests() {
             Require(wide.color.format == VK_FORMAT_R16G16B16A16_SFLOAT && wide.color.elementBytes == 8u && wide.color.bytes == 3u * 65536u, "four-sample half-float target layout changed");
             for (std::uint32_t pixel = 0; pixel < 4u; ++pixel) smaller.context[0x2feu + pixel * 4u] = 0x622ae6aeu;
             smaller.context[0x2f8] = (samplesLog2 << 20u) | (6u << 13u) | samplesLog2;
+        }
+        if (samples == 2u) {
+            smaller.context[0x31c] = 0x40718u;
+            smaller.context[0x31d] = 0x9000u;
+            smaller.context[0x3b8] = 0x09c6c000u;
+            const auto packed = DecodeState(smaller);
+            Require(DrawRejection(smaller, false).empty(), "two-sample packed-float color precheck rejected the captured Sonic Superstars format");
+            Require(packed.color.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && packed.color.elementBytes == 4u && packed.color.samples == VK_SAMPLE_COUNT_2_BIT,
+                "captured Sonic Superstars color registers did not decode to two-sample R11G11B10F");
+            Require(packed.color.tileMode == ColorTileMode::RenderTarget && packed.color.bytes == 65536u && packed.color.componentMapping == 0xe4u && packed.color.packing == ShaderRecompiler::ColorExportPacking::None,
+                "two-sample packed-float color layout or shader export mapping changed");
         }
         const auto standard = DecodeState(smaller);
         Require(standard.sampleLocations.empty() && standard.depth->sampleLocations.empty(), "standard sample pattern unnecessarily requires the custom-location extension");

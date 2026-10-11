@@ -335,6 +335,55 @@ void SmallSampleTests(AgcDriver::VulkanDevice& device, Block& block) {
     }
 }
 
+void PackedFloatTests(AgcDriver::VulkanDevice& device, Block& block) {
+    const auto color = Target(block, VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_SAMPLE_COUNT_2_BIT);
+    const AgcDriver::Graphics::MultisampleColorLayout layout(Width, Height, 4u, 2u);
+    constexpr std::array<std::uint32_t, 8> wide{0x000u, 0x001u, 0x3c0u, 0x7c0u, 0x7c1u, 0x7ffu, 0x400u, 0x780u};
+    constexpr std::array<std::uint32_t, 8> narrow{0x000u, 0x001u, 0x1e0u, 0x3e0u, 0x3e1u, 0x3ffu, 0x200u, 0x3c0u};
+    std::vector<std::byte> expected(StorageBytes, std::byte{0xa9});
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            for (std::uint32_t sample = 0; sample < 2u; ++sample) {
+                const auto value = wide[(x + y * 3u + sample * 3u) % wide.size()] |
+                    (wide[(x + y * 5u + sample + 4u) % wide.size()] << 11u) |
+                    (narrow[(x * 7u + y + sample * 5u + 2u) % narrow.size()] << 22u);
+                std::memcpy(expected.data() + layout.Offset(x, y, sample), &value, sizeof(value));
+            }
+        }
+    }
+    std::memcpy(block.data, expected.data(), expected.size());
+    AgcDriver::GuestMemory::MarkWritten(block.Address(), expected.size());
+    Draw(device, color, Whole, 0);
+    Flush(device, block);
+    Check(block, expected, "two-sample R11G11B10F upload preserves raw NaNs, infinities, subnormals and padding");
+    const auto expectWrite = [&](VkRect2D region, std::uint32_t sample, std::uint32_t mask, std::uint32_t bits) {
+        for (std::uint32_t y = 0; y < region.extent.height; ++y) {
+            for (std::uint32_t x = 0; x < region.extent.width; ++x) {
+                const auto offset = layout.Offset(region.offset.x + x, region.offset.y + y, sample);
+                std::uint32_t value;
+                std::memcpy(&value, expected.data() + offset, sizeof(value));
+                value = (value & ~mask) | bits;
+                std::memcpy(expected.data() + offset, &value, sizeof(value));
+            }
+        }
+    };
+    Draw(device, color, Partial, VK_COLOR_COMPONENT_R_BIT, 0x1u);
+    expectWrite(Partial, 0u, 0x7ffu, 0x3c0u);
+    Flush(device, block);
+    Check(block, expected, "two-sample R11G11B10F partial red writes preserve the masked sample, other packed channels and padding");
+    Draw(device, color, Partial, VK_COLOR_COMPONENT_G_BIT, 0x2u);
+    expectWrite(Partial, 1u, 0x003ff800u, 0x001e0000u);
+    const auto rgba = Target(block, VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_2_BIT);
+    Draw(device, rgba, OnePixel, VK_COLOR_COMPONENT_A_BIT, 0x1u);
+    expected[layout.Offset(2u, 2u, 0u) + 3u] = std::byte{0xff};
+    Flush(device, block);
+    Check(block, expected, "pending packed-float writes survive a same-address two-sample RGBA8 alias");
+    Draw(device, color, OnePixel, VK_COLOR_COMPONENT_B_BIT, 0x2u);
+    expectWrite(OnePixel, 1u, 0xffc00000u, 0x78000000u);
+    Flush(device, block);
+    Check(block, expected, "returning from the RGBA8 alias refreshes packed-float samples before a blue write");
+}
+
 void AliasTests(AgcDriver::VulkanDevice& device, Block& block) {
     auto expected = Seed(block);
     const auto rgba = Target(block, VK_FORMAT_R8G8B8A8_UNORM);
@@ -384,8 +433,9 @@ int main() {
         FormatTests(*device, block, VK_FORMAT_B8G8R8A8_SRGB, "BGRA8 SRGB");
         AliasTests(*device, block);
         SmallSampleTests(*device, block);
+        PackedFloatTests(*device, block);
         Flush(*device, block);
-        std::puts("real four/eight-sample color upload, draw, masks, byte conflicts, refresh, padding and aliases passed");
+        std::puts("real two/four/eight-sample color upload, draw, masks, byte conflicts, refresh, padding and aliases passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

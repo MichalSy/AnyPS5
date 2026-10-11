@@ -21,6 +21,14 @@ constexpr std::array<std::uint32_t, 27> Vertex{
     0x4a0606c1u, 0x4a0404c1u, 0x7e060b03u, 0x7e040b02u,
     0xf80008cfu, 0x01000302u, 0xbf810000u
 };
+constexpr std::array<std::uint32_t, 28> PackedCountVertex{
+    0xbfa00001u, 0x93eaff03u, 0x00080008u, 0x876bff03u, 0x000000ffu,
+    0x8f6a8c6au, 0x887c6a6bu, 0xbf900009u, 0x906a8803u, 0x81ea6a80u,
+    0x90fe6ac1u, 0xf8000941u, 0u, 0x81ea0380u, 0xbf8cff0fu,
+    0x90fe6ac1u, 0x34040a81u, 0x36060ac2u, 0x7e000280u, 0x7e0202f2u,
+    0x36040482u, 0x4a0606c1u, 0x4a0404c1u, 0x7e060b03u, 0x7e040b02u,
+    0xf80008cfu, 0x01000302u, 0xbf810000u
+};
 constexpr std::array<std::uint32_t, 5> Fragment{0x7e0002ffu, 0x3c003c00u, 0xf8001c0fu, 0u, 0xbf810000u};
 
 struct Case {
@@ -167,6 +175,49 @@ void RegisteredAliases() {
     }
 }
 
+void PackedCounts() {
+    Case example;
+    example.vertex->code.assign(PackedCountVertex.begin(), PackedCountVertex.end());
+    example.Check();
+    example.vertex->code.push_back(0xffffffffu);
+    example.vertex->code.push_back(0xe0700000u);
+    example.Check();
+    for (const auto waveInfo : {0u, 0x10000000u, 0x21000000u, 0xf7000000u}) {
+        const auto counts = 3u | (1u << 8u) | waveInfo;
+        const auto primitiveCount = (counts >> 8u) & 0xffu;
+        const auto vertexCount = counts & 0xffu;
+        const auto canonicalPrimitiveMask = ~std::uint64_t{0} >> (64u - primitiveCount);
+        const auto canonicalVertexMask = ~std::uint64_t{0} >> (64u - vertexCount);
+        const auto packedPrimitiveMask = ~std::uint64_t{0} >> ((0u - (counts >> 8u)) & 63u);
+        const auto packedVertexMask = ~std::uint64_t{0} >> ((0u - counts) & 63u);
+        Graphics::Require(primitiveCount == 1u && vertexCount == 3u && ((primitiveCount << 12u) | vertexCount) == 0x1003u,
+            "packed count unpacking changed primitive allocation or vertex count");
+        Graphics::Require(canonicalPrimitiveMask == 1u && canonicalVertexMask == 7u && packedPrimitiveMask == canonicalPrimitiveMask && packedVertexMask == canonicalVertexMask,
+            "packed count negation changed the canonical primitive or vertex EXEC masks");
+    }
+    constexpr std::array<std::array<float, 2>, 3> corners{{{-1.0f, -1.0f}, {1.0f, -1.0f}, {-1.0f, 1.0f}}};
+    for (std::uint32_t vertexId = 0u; vertexId < 3u; ++vertexId) {
+        const auto x = static_cast<float>(std::bit_cast<std::int32_t>(((vertexId << 1u) & 2u) - 1u));
+        const auto y = static_cast<float>(std::bit_cast<std::int32_t>((vertexId & 0xfffffffeu) - 1u));
+        Graphics::Require(x == corners[vertexId][0] && y == corners[vertexId][1],
+            "packed count rectangle must retain the canonical VGPR vertex-ID corner arithmetic");
+    }
+    { Case truncated; truncated.vertex->code.assign(PackedCountVertex.begin(), PackedCountVertex.end() - 1);
+      Reject([&] { truncated.Check(); }, "vertex instructions or coverage"); }
+    const std::array<std::pair<std::size_t, std::uint32_t>, 18> changed{{
+        {1u, 0x93eaff08u}, {2u, 0x00080009u}, {3u, 0x876bff08u}, {4u, 0x0000007fu},
+        {5u, 0x8f6a8b6au}, {6u, 0x887c6a6cu}, {7u, 0xbf900001u}, {8u, 0x906a8903u},
+        {9u, 0x81ea6a81u}, {10u, 0x90fe6ac0u}, {11u, 0xf8000940u}, {12u, 1u},
+        {13u, 0x81ea0381u}, {15u, 0x90fe6ac0u}, {16u, 0x34041081u},
+        {25u, 0xf80008dfu}, {26u, 0x00000302u}, {27u, 0xbf82ffffu}
+    }};
+    for (const auto& [word, instruction] : changed) {
+        Case mutated; mutated.vertex->code.assign(PackedCountVertex.begin(), PackedCountVertex.end());
+        mutated.vertex->code[word] = instruction;
+        Reject([&] { mutated.Check(); }, "vertex instructions or coverage");
+    }
+}
+
 void InstructionEffects() {
     const std::array<std::pair<std::size_t, std::uint32_t>, 13> changedVertex{{
         {3u, 0x8700ff08u}, {7u, 0xbf900001u}, {9u, 0x90fe6ac0u}, {10u, 0xf8000940u}, {11u, 1u},
@@ -199,6 +250,7 @@ int main() {
         RegisteredBounds();
         RegisteredAliases();
         InstructionEffects();
+        PackedCounts();
         std::cout << "Fixed color resolve shader guard tests passed\n";
         return 0;
     } catch (const std::exception& error) {

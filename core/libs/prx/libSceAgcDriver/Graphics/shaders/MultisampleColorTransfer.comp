@@ -4,7 +4,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #if WIDE_TEXEL
 layout(rgba16ui, set = 0, binding = 0) uniform uimage2DMS surface;
 #else
-layout(rgba8, set = 0, binding = 0) uniform image2DMS surface;
+layout(rgba8ui, set = 0, binding = 0) uniform uimage2DMS surface;
 #endif
 layout(std430, set = 0, binding = 1) buffer Pixels {
     uint data[];
@@ -33,9 +33,11 @@ void main() {
     }
 #else
     if (parameters.store != 0) {
-        pixels.data[index] = packUnorm4x8(imageLoad(surface, coordinate, int(position.z)));
+        uvec4 value = imageLoad(surface, coordinate, int(position.z));
+        pixels.data[index] = value.x | (value.y << 8u) | (value.z << 16u) | (value.w << 24u);
     } else {
-        imageStore(surface, coordinate, int(position.z), unpackUnorm4x8(pixels.data[index]));
+        uint value = pixels.data[index];
+        imageStore(surface, coordinate, int(position.z), uvec4(value & 0xffu, (value >> 8u) & 0xffu, (value >> 16u) & 0xffu, value >> 24u));
     }
 #endif
 }
