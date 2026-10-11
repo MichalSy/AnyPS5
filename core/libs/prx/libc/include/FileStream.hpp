@@ -1,9 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBC_INCLUDE_FILESTREAM_HPP
 #define CORE_LIBS_PRX_LIBC_INCLUDE_FILESTREAM_HPP
 
-#include "GuestFileDescriptors.hpp"
 #include <cstdio>
-#include <cerrno>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -11,7 +9,6 @@
 #include <utility>
 #include <cstdint>
 #include <cstddef>
-#include <mutex>
 #include <type_traits>
 #ifdef _WIN32
 #include <io.h>
@@ -38,52 +35,110 @@ static constexpr const char* FOPEN_MSG_NULL_ARG = "null argument";
 static constexpr const char* FOPEN_MSG_NOT_FOUND = "file not found";
 static constexpr const char* FOPEN_MSG_OPEN_FAILED = "open failed";
 
-struct FileStreamState;
-
 class FileStream {
+    // Only the macro-accessed FreeBSD prefix is exposed. The remaining guest
+    // FILE area is reserved; host state lives beyond it and is never a guest FILE*.
     GuestFilePrefix _guest{};
     std::byte _reserved[256 - sizeof(GuestFilePrefix)]{};
-    FileStreamState* state = nullptr;
-    bool dynamic = false;
+    std::FILE* _handle;
+    bool _dynamic;
     bool encodingError = false;
 
 public:
-    explicit FileStream(std::FILE* handle, bool dynamic = false);
-    FileStream(std::FILE* handle, int accessMode, bool dynamic);
-    FileStream(std::FILE* handle, const GuestFiles::Lease& lease, bool dynamic);
-    ~FileStream();
+    explicit FileStream(std::FILE* handle, bool dynamic = false) : _handle(handle), _dynamic(dynamic) {
+        if (!_handle) throw std::runtime_error("FileStream: null handle");
+        _guest.flags = handle == stdin ? 4 : handle == stdout || handle == stderr ? 8 : 0x10;
+#ifdef _WIN32
+        const int descriptor = _fileno(handle);
+#else
+        const int descriptor = ::fileno(handle);
+#endif
+        _guest.descriptor = descriptor >= 0 && descriptor <= 32767 ? static_cast<std::int16_t>(descriptor) : -1;
+    }
 
     FileStream(const FileStream&) = delete;
     FileStream& operator=(const FileStream&) = delete;
 
-    std::FILE* GetHandle();
-    int Descriptor();
-    bool IsDynamic() const { return dynamic; }
+    std::FILE* GetHandle() const {
+        if (!_handle) throw std::runtime_error("FileStream: closed stream");
+        return _handle;
+    }
+
+    bool IsDynamic() const {
+        return _dynamic;
+    }
+
     GuestFilePrefix& GuestState() { return _guest; }
-    bool Reopen(const std::filesystem::path& filename, const char* mode);
-    void SyncStatus();
-    void SetEncodingError();
-    void ClearError();
-    int Close();
-    void Lock();
-    void Unlock();
-    void SyncUnlockedStatus();
+    bool Reopen(const std::filesystem::path& filename, const char* mode) {
+        auto* previous = GetHandle();
+        _guest = {};
+        encodingError = false;
+#ifdef _WIN32
+        std::wstring wideMode;
+        for (const char character : std::string_view(mode)) wideMode.push_back(static_cast<unsigned char>(character));
+        _handle = ::_wfreopen(filename.c_str(), wideMode.c_str(), previous);
+#else
+        _handle = std::freopen(filename.c_str(), mode, previous);
+#endif
+        if (!_handle) return false;
+        _guest.flags = 0x10;
+#ifdef _WIN32
+        const int descriptor = _fileno(_handle);
+#else
+        const int descriptor = ::fileno(_handle);
+#endif
+        _guest.descriptor = descriptor >= 0 && descriptor <= 32767 ? static_cast<std::int16_t>(descriptor) : -1;
+        return true;
+    }
+    void SyncStatus() {
+        _guest.readRemaining = 0;
+        _guest.writeRemaining = 0;
+        _guest.flags = static_cast<std::int16_t>((_guest.flags & ~0x60) |
+            (std::feof(GetHandle()) ? 0x20 : 0) | (std::ferror(GetHandle()) || encodingError ? 0x40 : 0));
+    }
+
+    void SyncUnlockedStatus() {
+        _guest.readRemaining = 0;
+        _guest.writeRemaining = 0;
+#ifdef _WIN32
+        const bool endOfFile = std::feof(GetHandle()) != 0;
+        const bool error = std::ferror(GetHandle()) != 0;
+#else
+        const bool endOfFile = ::feof_unlocked(GetHandle()) != 0;
+        const bool error = ::ferror_unlocked(GetHandle()) != 0;
+#endif
+        _guest.flags = static_cast<std::int16_t>((_guest.flags & ~0x60) |
+            (endOfFile ? 0x20 : 0) | (error || encodingError ? 0x40 : 0));
+    }
+
+    void SetEncodingError() {
+        encodingError = true;
+        SyncStatus();
+    }
+
+    void ClearError() {
+        std::clearerr(GetHandle());
+        encodingError = false;
+        SyncStatus();
+    }
+
+    void Close() {
+        GetHandle();
+        if (std::fclose(std::exchange(_handle, nullptr)) != 0) throw std::runtime_error("FileStream: close failed");
+        _guest.flags = 0;
+        _guest.descriptor = -1;
+    }
 };
 static_assert(std::is_standard_layout_v<FileStream>);
 
 inline std::FILE* GetNativeStream(FileStream* stream) {
-    if (!stream) { errno = 22; return nullptr; }
+    if (!stream) throw std::runtime_error("FileStream: null stream");
     return stream->GetHandle();
 }
 
 extern "C" {
-extern FileStream _Stdin_nid_postfix;
 extern FileStream _Stdout_nid_postfix;
 extern FileStream _Stderr_nid_postfix;
-std::mutex& GuestFileStreamMutex_nid_no_patch();
-// Caller holds the stream mutex while replacing the matching registry entry.
-int GuestFileStreamCheckRedirect_nid_no_patch(const GuestFiles::Lease& previous);
-void GuestFileStreamRedirect_nid_no_patch(const GuestFiles::Lease& previous, const GuestFiles::Lease& replacement);
 }
 
 #endif

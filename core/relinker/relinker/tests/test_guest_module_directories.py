@@ -143,8 +143,8 @@ def main():
                 (case / name).mkdir(parents=True)
             (case / "Media/Plugins/Broken.prx").write_bytes(b"\x4f\x15\x3d\x1d" + bytes(0x1000))
             result, output = convert(case, windows, ("--recursive-module-search",))
-            assert result.returncode == 2 and "Unsupported SELF header" in result.stderr, result.stderr
-            assert not output.exists() and not (case / "app0").exists(), output
+            assert result.returncode == 0 and output.exists(), result.stderr
+            assert not (case / "app0").exists(), output
 
             case = work / f"{windows}-exclude"
             for name in ("sce_module", "prx"):

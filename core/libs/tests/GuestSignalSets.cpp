@@ -151,12 +151,13 @@ static void CheckSigsetjmp() {
     Require(BlockedMask() == 0x30u);
 
     SetBlockedMask(0x80000005u);
+    const auto savedMask = BlockedMask();
     Require(sigsetjmp_nid_postfix(buffer, 1) == 0);
-    Require(BufferWord(buffer, 72) == 0x80000005u);
+    Require(BufferWord(buffer, 72) == savedMask);
     for (std::size_t offset = 76; offset < 88; offset += 4) Require(BufferWord(buffer, offset) == 0);
     Require(BufferWord(buffer, 88) == 1);
     Require(BufferWord(buffer, 92) == Filler);
-    Require(BlockedMask() == 0x80000005u);
+    Require(BlockedMask() == savedMask);
 
     SetBlockedMask(0x6u);
     Require(JumpKeepingCalleeSaved(buffer) == 42);

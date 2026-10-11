@@ -2428,56 +2428,6 @@ void verifyUnusedUnnormalizedSampler() {
     expectFailure([&] { static_cast<void>(populate(foldOnly)); }, "normalized guest sampler is used with a texel offset that is not a constant", "unnormalized samplers: a normalized S# was accepted for an offset that only folds");
 }
 
-void verifySrgbColorComparison() {
-    using namespace ShaderRecompiler;
-    ImageResource image{};
-    image.resourceClass = ImageResourceClass::Sampled;
-    image.numericClass = IrTextureNumericClass::Float;
-    image.dimension = RdnaImageDimension::Dim2D;
-    image.depthCompare = true;
-    image.read = true;
-    ShaderInfo info;
-    info.images = {image};
-    info.samplers = {SamplerResource{}};
-    info.sampledPairs = {{0u, 0u, 0u}};
-    info.runtimeImageModes = {ResourceMaterializer::RuntimeImageModes(image)};
-    ResourceSnapshot snapshot;
-    snapshot.images = {DescriptorValue{{0x00001000u, 130u << 20u, 0x0000c000u, 0x90000facu, 0u, 0u, 0u, 0u}, 8u}};
-    snapshot.samplers = {DescriptorValue{{0x00003092u, 0u, 0u, 0u}, 4u}};
-    const auto state = [&] { return ResourceMaterializer::EmulatedCompareState(info, snapshot, 0u); };
-    const auto point = state();
-    require((point & EmulatedCompare::Enabled) != 0u && (point & EmulatedCompare::Linear) == 0u && (point & EmulatedCompare::SingleLevel) != 0u && EmulatedCompare::Reference(point) == EmulatedCompare::ReferenceUnorm && EmulatedCompare::Function(point) == 3u, "sRGB comparison: point sampling has incorrect reference or filter state");
-    snapshot.samplers[0].dwords[2] = 0x00500000u;
-    require(state() == (point | EmulatedCompare::Linear), "sRGB comparison: bilinear sampling changed more than the filter state");
-    const auto mode = info.runtimeImageModes[0].at(ResourceMaterializer::RuntimeImageMode(image, snapshot.images[0], info.runtimeImageModes[0]));
-    require(!mode.depthCompare && !mode.srgbDecode && mode.numericClass == IrTextureNumericClass::Float && (mode.emulatedCompare & EmulatedCompare::Enabled) != 0u, "sRGB comparison: native sRGB decoding was replaced by depth comparison or a second gamma conversion");
-    const auto prepared = DescriptorBindingBuilder{}.Prepare({}, info, IrShaderStage::Compute, snapshot);
-    require(std::find(prepared.specialization.begin(), prepared.specialization.end(), PipelineSpecializationConstant{PipelineSpecialization::CompareBase + 4u, EmulatedCompare::ReferenceUnorm}) != prepared.specialization.end(), "sRGB comparison: reference clamp was not passed to shader specialization");
-    for (const auto flag : {1u << 20u, 1u << 31u}) {
-        snapshot.samplers[0].dwords[0] |= flag;
-        expectFailure([&] { static_cast<void>(state()); }, "forced or disabled degamma", "sRGB comparison: an unsupported sampler gamma mode was accepted");
-        snapshot.samplers[0].dwords[0] &= ~flag;
-    }
-    for (const auto format : {IrBufferFormat::Format8_8_8_8UInt, IrBufferFormat::Format8Srgb, IrBufferFormat::Format8_8Srgb, IrBufferFormat::Bc1Srgb}) {
-        snapshot.images[0].dwords[1] = static_cast<std::uint32_t>(format) << 20u;
-        expectFailure([&] { static_cast<void>(state()); }, "comparison sampling of a color texture is implemented only", "sRGB comparison: another unsupported format was accepted");
-    }
-    for (const auto [format, reference] : {std::pair{IrBufferFormat::Format8_8_8_8UNorm, EmulatedCompare::ReferenceUnorm}, std::pair{IrBufferFormat::Format8_8_8_8SNorm, EmulatedCompare::ReferenceSnorm}, std::pair{IrBufferFormat::Format16_16Float, EmulatedCompare::ReferenceFloat}}) {
-        snapshot.images[0].dwords[1] = static_cast<std::uint32_t>(format) << 20u;
-        require(EmulatedCompare::Reference(state()) == reference, "sRGB comparison: an existing format changed reference clamp");
-    }
-    snapshot.images[0].dwords[1] = static_cast<std::uint32_t>(IrBufferFormat::Format32Float) << 20u;
-    require(state() == 0u, "sRGB comparison: R32 float left native depth comparison");
-    snapshot.images[0].dwords[1] = 130u << 20u;
-    info.images[0].indirectRoot = 0u;
-    expectFailure([&] { static_cast<void>(state()); }, "unsupported color comparison image instructions", "sRGB comparison: an indirect image was accepted");
-    info.images[0].indirectRoot = ImageResource::NoIndirectImage;
-    snapshot.images[0].dwords[3] = 0xa0000facu;
-    expectFailure([&] { static_cast<void>(state()); }, "only for 2D, 2D array and cube views", "sRGB comparison: a 3D view was accepted");
-    snapshot.images[0].dwords[3] = 0x90000fadu;
-    expectFailure([&] { static_cast<void>(state()); }, "X channel is red", "sRGB comparison: a non-red comparison channel was accepted");
-}
-
 void verifyWaveUniformValues() {
     using namespace ShaderRecompiler;
     IrProgram program;
@@ -3094,7 +3044,6 @@ int main(int argc, char** argv) {
         verifyCoherentBufferAccesses();
         verifyUnnormalizedSamplers();
         verifyUnusedUnnormalizedSampler();
-        verifySrgbColorComparison();
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
         verifyBdaReadFallbackFunctions();

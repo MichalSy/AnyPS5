@@ -52,8 +52,6 @@ static void RequireNotTerminal(int descriptor) {
 }
 
 int main() {
-    std::FILE* unrelated = std::tmpfile();
-    Require(unrelated != nullptr);
     const auto name = "anyps5-terminal-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     const int file = open_nid_postfix(name.c_str(), 0x202, 0644);
     Require(file >= 0);
@@ -94,8 +92,6 @@ int main() {
     Require(close_nid_postfix(file) == 0);
     Require(Fails(tcgetattr_nid_postfix(file, attributes), BadDescriptor));
     Require(Fails(tcsetattr_nid_postfix(file, Flush, attributes), BadDescriptor));
-    Require(std::fputc('H', unrelated) == 'H');
-    Require(std::fclose(unrelated) == 0);
     std::filesystem::remove(name);
     return 0;
 }

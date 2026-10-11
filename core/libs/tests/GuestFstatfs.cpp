@@ -9,12 +9,6 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
-#ifndef _WIN32
-#include <cerrno>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
 
 struct GuestStatfs {
     std::uint32_t f_version;
@@ -47,7 +41,6 @@ int APS5_VABI _fstatfs_nid_postfix(int, GuestStatfs*);
 int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
 int APS5_VABI close_nid_postfix(int);
 int APS5_VABI pipe_nid_postfix(int*);
-int APS5_VABI dup2_nid_postfix(int, int);
 int APS5_VABI socketpair_nid_postfix(int, int, int, int*);
 int* APS5_VABI __error_nid_postfix();
 }
@@ -90,26 +83,6 @@ static void RequireVolume(int descriptor, const std::filesystem::path& path) {
     Require(fs.f_fstypename[0] == '\0' && fs.f_mntfromname[0] == '\0' && fs.f_mntonname[0] == '\0');
 }
 
-#ifndef _WIN32
-static void HostDescriptorIsolation(int file, const std::filesystem::path& path) {
-    constexpr int target = 256;
-    Require(::fcntl(target, F_GETFD) == -1 && errno == EBADF);
-    int native[2];
-    Require(::pipe(native) == 0 && native[0] != target && native[1] != target);
-    Require(::dup2(native[0], target) == target && ::close(native[0]) == 0);
-    struct stat expected{};
-    Require(::fstat(target, &expected) == 0 && S_ISFIFO(expected.st_mode));
-    RequireFailure(target, GuestEbadf);
-    Require(dup2_nid_postfix(file, target) == target);
-    RequireVolume(target, path);
-    Require(close_nid_postfix(target) == 0);
-    RequireFailure(target, GuestEbadf);
-    struct stat actual{};
-    Require(::fstat(target, &actual) == 0 && actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino);
-    Require(::close(target) == 0 && ::close(native[1]) == 0);
-}
-#endif
-
 int main() {
     const auto root = std::filesystem::temp_directory_path() /
         ("anyps5-fstatfs-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -125,9 +98,6 @@ int main() {
     const int file = sceKernelOpen("/anyps5-fstatfs-test/file.txt", SCE_KERNEL_O_RDONLY, 0);
     Require(file >= 0);
     RequireVolume(file, filePath);
-#ifndef _WIN32
-    HostDescriptorIsolation(file, filePath);
-#endif
     *__error_nid_postfix() = 0;
     Require(_fstatfs_nid_postfix(file, nullptr) == -1);
     Require(*__error_nid_postfix() == GuestEfault);

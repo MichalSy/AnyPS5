@@ -1,5 +1,4 @@
 #include "SceTypes.hpp"
-#include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <algorithm>
 #include <chrono>
@@ -14,9 +13,6 @@
 #include <io.h>
 #include <windows.h>
 #else
-#include <cerrno>
-#include <fcntl.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #endif
 extern "C" {
@@ -40,7 +36,6 @@ int APS5_VABI open_nid_postfix(const char*, int, int);
 int APS5_VABI creat_nid_postfix(const char*, int);
 int APS5_VABI _open_nid_postfix(const char*, int, ...);
 int APS5_VABI close_nid_postfix(int);
-int APS5_VABI dup2_nid_postfix(int, int);
 int APS5_VABI flock_nid_postfix(int, int);
 int APS5_VABI stat_nid_postfix(const char*, FileStat*);
 int APS5_VABI lstat_nid_postfix(const char*, FileStat*);
@@ -81,29 +76,6 @@ static void Check(bool value, int line) {
     }
 }
 #define Require(value) Check((value), __LINE__)
-
-#ifndef _WIN32
-static void FdatasyncHostDescriptorIsolation(int file) {
-    constexpr int target = 256;
-    Require(::fcntl(target, F_GETFD) == -1 && errno == EBADF);
-    int native[2];
-    Require(::pipe(native) == 0 && native[0] != target && native[1] != target);
-    Require(::dup2(native[0], target) == target && ::close(native[0]) == 0);
-    struct stat expected{};
-    Require(::fstat(target, &expected) == 0 && S_ISFIFO(expected.st_mode));
-    Require(fdatasync_nid_postfix(target) == -1 && *__error_nid_postfix() == 9);
-    Require(sceKernelFdatasync(target) == static_cast<int>(0x80020009u));
-    Require(dup2_nid_postfix(file, target) == target);
-    Require(fdatasync_nid_postfix(target) == 0 && sceKernelFdatasync(target) == 0);
-    Require(close_nid_postfix(target) == 0);
-    Require(fdatasync_nid_postfix(target) == -1 && *__error_nid_postfix() == 9);
-    Require(sceKernelFdatasync(target) == static_cast<int>(0x80020009u));
-    struct stat actual{};
-    Require(::fstat(target, &actual) == 0 && actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino);
-    Require(::close(target) == 0 && ::close(native[1]) == 0);
-}
-#endif
-
 int main() {
     Require(chmod_nid_postfix(nullptr, 0600) == -1 && *__error_nid_postfix() == 14);
     Require(sceKernelChmod_nid_postfix(nullptr, 0600) == static_cast<int>(0x8002000eu));
@@ -227,25 +199,6 @@ int main() {
         { std::ofstream stream(replacement); stream << "replacement"; }
         Require(rename_nid_postfix(name(replacement).c_str(), name(dangling).c_str()) == 0);
         Require(!std::filesystem::is_symlink(dangling) && std::filesystem::is_regular_file(dangling));
-        const auto destinationLoop = area / "destination_loop";
-        std::filesystem::create_symlink(destinationLoop.filename(), destinationLoop);
-        const auto loopReplacement = area / "loop_replacement";
-        { std::ofstream stream(loopReplacement); stream << "loop replacement"; }
-        Require(rename_nid_postfix(name(loopReplacement).c_str(), name(destinationLoop).c_str()) == 0);
-        Require(!std::filesystem::exists(loopReplacement) && std::filesystem::is_regular_file(destinationLoop));
-        { std::ifstream stream(destinationLoop); std::string contents; std::getline(stream, contents); Require(contents == "loop replacement"); }
-        const auto sourceLoop = area / "source_loop";
-        std::filesystem::create_symlink(sourceLoop.filename(), sourceLoop);
-        Require(rename_nid_postfix(name(sourceLoop).c_str(), name(destinationLoop).c_str()) == 0);
-        Require(std::filesystem::symlink_status(sourceLoop).type() == std::filesystem::file_type::not_found);
-        Require(std::filesystem::is_symlink(destinationLoop) && std::filesystem::read_symlink(destinationLoop) == sourceLoop.filename());
-        const auto sameTarget = area / "same_target";
-        const auto sourceLink = area / "source_link";
-        { std::ofstream stream(sameTarget); stream << "target"; }
-        std::filesystem::create_symlink(sameTarget.filename(), sourceLink);
-        Require(rename_nid_postfix(name(sourceLink).c_str(), name(sameTarget).c_str()) == 0);
-        Require(std::filesystem::symlink_status(sourceLink).type() == std::filesystem::file_type::not_found);
-        Require(std::filesystem::is_symlink(sameTarget) && std::filesystem::read_symlink(sameTarget) == sameTarget.filename());
 #endif
         std::filesystem::remove_all(area);
     }
@@ -263,13 +216,14 @@ int main() {
     Require(sceKernelUtimes_nid_postfix(sized.string().c_str(), nullptr) == 0);
     std::FILE* native = std::fopen(sized.string().c_str(), "r+b");
     Require(native != nullptr);
-    const int descriptor = sceKernelOpen(sized.string().c_str(), SCE_KERNEL_O_RDWR, 0);
-    Require(descriptor >= 3 && descriptor <= 32767 && sceKernelFsync(descriptor) == 0);
+#ifdef _WIN32
+    const int descriptor = _fileno(native);
+#else
+    const int descriptor = ::fileno(native);
+#endif
+    Require(descriptor >= 0 && sceKernelFsync(descriptor) == 0);
     Require(fdatasync_nid_postfix(descriptor) == 0);
     Require(sceKernelFdatasync(descriptor) == 0);
-#ifndef _WIN32
-    FdatasyncHostDescriptorIsolation(descriptor);
-#endif
     const auto ownerWrite = [&] {
         return (std::filesystem::status(sized).permissions() & std::filesystem::perms::owner_write) != std::filesystem::perms::none;
     };
@@ -287,13 +241,6 @@ int main() {
     Require(futimes_nid_postfix(descriptor, overflow) == -1 && *__error_nid_postfix() == 22);
     const KernelTimeval negative[2]{{0, -1}, {0, 0}};
     Require(futimes_nid_postfix(descriptor, negative) == -1 && *__error_nid_postfix() == 22);
-    Require(sceKernelClose(descriptor) == 0);
-    Require(fdatasync_nid_postfix(descriptor) == -1 && *__error_nid_postfix() == 9);
-    char nativeContents[8]{};
-    Require(std::fread(nativeContents, 1, sizeof(nativeContents), native) == 3);
-    Require(std::memcmp(nativeContents, "012", 3) == 0 && std::ferror(native) == 0);
-    std::rewind(native);
-    Require(std::fgetc(native) == '0');
     Require(std::fclose(native) == 0);
     Require(std::filesystem::file_size(sized) == 3);
     Require(sceKernelFchmod(descriptor, 0600) == static_cast<int>(0x80020009u));

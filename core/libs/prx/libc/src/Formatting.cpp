@@ -189,11 +189,9 @@ int APS5_VABI vasprintf_nid_postfix(char** destination, const char* format, VaLi
 
 int APS5_VABI vfprintf_nid_postfix(FileStream* stream, const char* format, VaList* args) {
     auto* native = GetNativeStream(stream);
-    if (!native) return -1;
 #ifdef _WIN32
     std::string buffer;
     const int count = LibcDetail::FormatWindows(nullptr, 0, format, args, &buffer);
-    if (count < 0) return -1;
     const int result = std::fwrite(buffer.data(), 1, static_cast<size_t>(count), native) ==
         static_cast<size_t>(count) ? count : -1;
 #else
@@ -210,7 +208,6 @@ int APS5_VABI vfprintf_nid_postfix(FileStream* stream, const char* format, VaLis
     va_end(copy);
 #endif
     stream->SyncStatus();
-    if (result < 0 && std::ferror(native)) errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
     return result;
 }
 
@@ -233,7 +230,6 @@ int APS5_VABI fprintf_nid_postfix(FileStream* stream, const char* format, ...) {
 
 int APS5_VABI fscanf_nid_postfix(FileStream* stream, const char* format, ...) {
     auto* native = GetNativeStream(stream);
-    if (!native) return -1;
 #ifdef _WIN32
     __builtin_sysv_va_list args;
     __builtin_sysv_va_start(args, format);
@@ -246,7 +242,6 @@ int APS5_VABI fscanf_nid_postfix(FileStream* stream, const char* format, ...) {
     va_end(args);
 #endif
     stream->SyncStatus();
-    if (result < 0 && std::ferror(native)) errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
     return result;
 }
 
@@ -255,7 +250,7 @@ int APS5_VABI fscanf_nid_postfix(FileStream* stream, const char* format, ...) {
 int APS5_VABI printf_nid_postfix(const char* format, ...) {
     __builtin_sysv_va_list args;
     __builtin_sysv_va_start(args, format);
-    const int result = vfprintf_nid_postfix(&_Stdout_nid_postfix, format, reinterpret_cast<VaList*>(args));
+    const int result = LibcDetail::PrintWindows(format, args);
     __builtin_sysv_va_end(args);
     return result;
 }
@@ -263,7 +258,7 @@ int APS5_VABI printf_nid_postfix(const char* format, ...) {
 int APS5_VABI libc_printf_nid_postfix(const char* format, ...) {
     __builtin_sysv_va_list args;
     __builtin_sysv_va_start(args, format);
-    const int result = vfprintf_nid_postfix(&_Stdout_nid_postfix, format, reinterpret_cast<VaList*>(args));
+    const int result = LibcDetail::PrintWindows(format, args);
     __builtin_sysv_va_end(args);
     return result;
 }
@@ -289,7 +284,7 @@ int APS5_VABI sprintf_nid_postfix(char* buffer, const char* format, ...) {
 int APS5_VABI printf_nid_postfix(const char* format, ...) {
     std::va_list args;
     va_start(args, format);
-    const int result = vfprintf_nid_postfix(&_Stdout_nid_postfix, format, reinterpret_cast<VaList*>(args));
+    const int result = HasGuestWideFormat(format) ? LibcDetail::PrintWindows(format, args) : std::vprintf(format, args);
     va_end(args);
     return result;
 }
@@ -297,7 +292,7 @@ int APS5_VABI printf_nid_postfix(const char* format, ...) {
 int APS5_VABI libc_printf_nid_postfix(const char* format, ...) {
     std::va_list args;
     va_start(args, format);
-    const int result = vfprintf_nid_postfix(&_Stdout_nid_postfix, format, reinterpret_cast<VaList*>(args));
+    const int result = HasGuestWideFormat(format) ? LibcDetail::PrintWindows(format, args) : std::vprintf(format, args);
     va_end(args);
     return result;
 }
@@ -373,7 +368,16 @@ int APS5_VABI sscanf_s_nid_postfix(const char* buffer, const char* format, ...) 
 #endif
 
 int APS5_VABI vprintf_nid_postfix(const char* str, VaList* c) {
-    return vfprintf_nid_postfix(&_Stdout_nid_postfix, str, c);
+#ifdef _WIN32
+    return LibcDetail::PrintWindows(str, c);
+#else
+    if (HasGuestWideFormat(str)) return LibcDetail::PrintWindows(str, c);
+    std::va_list copy;
+    va_copy(copy, *reinterpret_cast<std::va_list*>(c));
+    const int result = std::vprintf(str, copy);
+    va_end(copy);
+    return result;
+#endif
 }
 
 int APS5_VABI vsprintf_nid_postfix(char* str, const char* format, VaList* args) {
@@ -424,7 +428,7 @@ int APS5_VABI snprintf_s_nid_postfix(char* buffer, size_t size, const char* form
 int APS5_VABI printf_s_nid_postfix(const char* format, ...) {
     __builtin_sysv_va_list args;
     __builtin_sysv_va_start(args, format);
-    const int result = vfprintf_nid_postfix(&_Stdout_nid_postfix, format, reinterpret_cast<VaList*>(args));
+    const int result = LibcDetail::PrintWindows(format, args);
     __builtin_sysv_va_end(args);
     return result;
 }
@@ -473,7 +477,7 @@ int APS5_VABI snprintf_s_nid_postfix(char* buffer, size_t size, const char* form
 int APS5_VABI printf_s_nid_postfix(const char* format, ...) {
     std::va_list args;
     va_start(args, format);
-    const int result = vfprintf_nid_postfix(&_Stdout_nid_postfix, format, reinterpret_cast<VaList*>(args));
+    const int result = HasGuestWideFormat(format) ? LibcDetail::PrintWindows(format, args) : std::vprintf(format, args);
     va_end(args);
     return result;
 }
@@ -481,13 +485,7 @@ int APS5_VABI printf_s_nid_postfix(const char* format, ...) {
 #endif
 
 int APS5_VABI puts_nid_postfix(const char* s) {
-    if (!s) { errno = 22; return EOF; }
-    auto* native = GetNativeStream(&_Stdout_nid_postfix);
-    if (!native) return EOF;
-    const int result = std::fputs(s, native) == EOF ? EOF : std::fputc('\n', native);
-    _Stdout_nid_postfix.SyncStatus();
-    if (result == EOF) errno = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
-    return result;
+    return std::puts(s);
 }
 
 }

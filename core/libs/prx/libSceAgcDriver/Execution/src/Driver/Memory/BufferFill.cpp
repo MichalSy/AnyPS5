@@ -1,7 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferFill.hpp"
 #include "ThreadOwned.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
@@ -138,6 +137,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         const auto range = DecodePatternFillRange(userData, packet);
         if (!range) return false;
         if (range->invocations == 0) return true;
+        if (queueId == 0 && DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
         std::lock_guard inputLock(GuestMemory::GpuMutex());
         recordLabelsForPacket(localDevice.get(), queueId);

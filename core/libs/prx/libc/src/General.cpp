@@ -248,14 +248,14 @@ int SetWorkingDirectory(WorkingDirectory& state, const std::filesystem::path& re
             const auto relative = canonical.lexically_relative(base);
             if (relative.empty() || *relative.begin() == "..") continue;
             state.current = (std::filesystem::path("/") / prefix / relative).lexically_normal();
-            if (state.current.filename() == ".") state.current = state.current.parent_path();
+            if (state.current != state.current.root_path() && state.current.filename().empty()) state.current = state.current.parent_path();
             return 0;
         }
     }
     const auto relative = canonical.lexically_relative(state.root);
     if (relative.empty() || *relative.begin() == "..") return 45;
     state.current = (std::filesystem::path("/") / relative).lexically_normal();
-    if (state.current.filename() == ".") state.current = state.current.parent_path();
+    if (state.current != state.current.root_path() && state.current.filename().empty()) state.current = state.current.parent_path();
     return 0;
 }
 }

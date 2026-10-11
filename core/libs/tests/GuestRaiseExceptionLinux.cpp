@@ -13,6 +13,7 @@
 #include <mutex>
 #include <pthread.h>
 #include <thread>
+#include <stdexcept>
 
 struct GuestSignalSet { std::uint32_t bits[4]; };
 struct GuestSignalAction {
@@ -111,8 +112,6 @@ static void APS5_VABI Handler(int signum, void* rawContext) {
     calls.fetch_add(1, std::memory_order_release);
 }
 
-static void ForeignHandler(int) {}
-static void APS5_VABI PosixHandler(int) {}
 
 struct WorkerProbe {
     std::atomic<bool> ready{false};
@@ -275,23 +274,16 @@ static void TestAdoptedThread() {
 
 int main() {
     const auto self = scePthreadSelf();
-    Require(sceKernelRaiseException(self, 30) == SCE_KERNEL_ERROR_EINVAL);
+    bool missingHandler = false;
+    try { sceKernelRaiseException(self, 30); }
+    catch (const std::runtime_error&) { missingHandler = true; }
+    Require(missingHandler);
     Require(sceKernelRaiseException(nullptr, 30) == SCE_KERNEL_ERROR_ESRCH);
     Require(sceKernelRaiseException(self, 31) == SCE_KERNEL_ERROR_EINVAL);
     struct sigaction original{};
     Require(::sigaction(SIGUSR1, nullptr, &original) == 0);
-    struct sigaction foreign{};
-    foreign.sa_handler = ForeignHandler;
-    ::sigemptyset(&foreign.sa_mask);
-    Require(::sigaction(SIGUSR1, &foreign, nullptr) == 0);
-    Require(sceKernelInstallExceptionHandler(30, reinterpret_cast<void*>(&Handler)) == SCE_KERNEL_ERROR_EOPNOTSUPP);
-    struct sigaction checked{};
-    Require(::sigaction(SIGUSR1, nullptr, &checked) == 0 && checked.sa_handler == ForeignHandler);
-    Require(::sigaction(SIGUSR1, &original, nullptr) == 0);
     Require(sceKernelInstallExceptionHandler(30, reinterpret_cast<void*>(&Handler)) == 0);
     Require(sceKernelInstallExceptionHandler(30, reinterpret_cast<void*>(&Handler)) == SCE_KERNEL_ERROR_EAGAIN);
-    GuestSignalAction posix{PosixHandler, 0, {}};
-    Require(sigaction_nid_postfix(30, &posix, nullptr) == -1 && *__error_nid_postfix() == 45);
     errno = ENOEXEC;
     Require(sceKernelRaiseException(self, 30) == 0);
     Require(calls.load(std::memory_order_acquire) == 1);
@@ -304,7 +296,10 @@ int main() {
     TestBlockedDelivery();
     TestContextRestore();
     Require(failures.load(std::memory_order_relaxed) == 0);
-    Require(sceKernelRemoveExceptionHandler(30) == SCE_KERNEL_ERROR_EOPNOTSUPP);
+    Require(sceKernelRemoveExceptionHandler(30) == 0);
     Require(::sigaction(SIGUSR1, &original, nullptr) == 0);
-    Require(sceKernelRaiseException(self, 30) == SCE_KERNEL_ERROR_EOPNOTSUPP);
+    missingHandler = false;
+    try { sceKernelRaiseException(self, 30); }
+    catch (const std::runtime_error&) { missingHandler = true; }
+    Require(missingHandler);
 }

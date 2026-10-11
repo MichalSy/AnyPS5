@@ -74,7 +74,7 @@ struct GuestMcontext {
     std::uint64_t spare[6];
 };
 
-struct alignas(16) GuestUcontext {
+struct alignas(64) GuestUcontext {
     std::uint32_t sigmask[4];
     std::int32_t reserved[12];
     GuestMcontext mcontext;
@@ -329,6 +329,8 @@ void FromHost(const mcontext_t& host, GuestMcontext& m) {
     m.cs = static_cast<std::uint64_t>(g[REG_CSGSFS]) & 0xffffu;
     m.ss = static_cast<std::uint64_t>(g[REG_CSGSFS]) >> 48;
     m.len = sizeof(GuestMcontext);
+    m.fpformat = host.fpregs == nullptr ? 0x10000 : 0x10002;
+    m.ownedfp = host.fpregs == nullptr ? 0x20000 : 0x20001;
     static_assert(sizeof(*host.fpregs) <= sizeof(m.fpstate) && FxsaveRegisterBytes <= sizeof(*host.fpregs));
     if (host.fpregs != nullptr) std::memcpy(m.fpstate, host.fpregs, sizeof(*host.fpregs));
 }
@@ -357,6 +359,7 @@ void ToHost(const GuestMcontext& m, mcontext_t& host) {
 }
 
 void Deliver(int, siginfo_t*, void* context) {
+    const int savedErrno = errno;
     const auto handler = Handler(RaisedSignal);
     if (handler == nullptr) {
         static constexpr char message[] = "sceKernelRaiseException: the handler was removed before the signal was delivered\n";
@@ -369,6 +372,7 @@ void Deliver(int, siginfo_t*, void* context) {
     FromHost(host, ucontext.mcontext);
     CallHandler(handler, RaisedSignal, ucontext);
     ToHost(ucontext.mcontext, host);
+    errno = savedErrno;
 }
 
 void InstallDelivery() {

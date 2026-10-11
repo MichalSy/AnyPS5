@@ -532,7 +532,7 @@ static int AddDescriptorEvent(KernelEqueue eq, int fd, std::size_t size, void* u
     if (size > 1) {
         NotImplemented_nid_no_patch(filter == EVFILT_READ ? "sceKernelAddReadEvent: low watermark" : "sceKernelAddWriteEvent: low watermark");
     }
-    if (!GuestSockets::GuestSocketIsOpen_nid_no_patch(fd)) {
+    if (!GuestSockets::IsOpen(fd)) {
         return SCE_KERNEL_ERROR_EBADF;
     }
     KernelEqueueEvent event{};

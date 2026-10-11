@@ -2,7 +2,6 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
-#include "prx/libc/include/GuestFileDescriptors.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/File/include/FileLock.hpp"
@@ -21,39 +20,31 @@
 #include <fcntl.h>
 #include <io.h>
 #include <sys/stat.h>
-extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
-static void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
 static int NativeOpen(const std::filesystem::path& p, int nativeFlags, std::uint16_t mode) {
     return ::_wopen(p.wstring().c_str(), nativeFlags, static_cast<int>(mode));
 }
 static std::int64_t NativeLseek(int fd, std::int64_t offset, int whence) {
-    const int initialError = errno;
-    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
-    errno = initialError;
-    const auto result = ::_lseeki64(fd, offset, whence);
-    const int error = errno;
-    _set_thread_local_invalid_parameter_handler(previous);
-    errno = error;
-    return result;
+    return ::_lseeki64(fd, offset, whence);
 }
 static int NativeRead(int fd, void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
         throw std::runtime_error("sceKernelRead: nbytes exceeds platform limit");
     }
-    char empty = 0;
-    return ::_read(fd, buf == nullptr ? &empty : buf, static_cast<unsigned int>(n));
+    return ::_read(fd, buf, static_cast<unsigned int>(n));
 }
 static int NativeWrite(int fd, const void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
         throw std::runtime_error("sceKernelWrite: nbytes exceeds platform limit");
     }
-    const char empty = 0;
-    return ::_write(fd, buf == nullptr ? &empty : buf, static_cast<unsigned int>(n));
+    return ::_write(fd, buf, static_cast<unsigned int>(n));
 }
-static void NativeCleanup(int fd) noexcept {
-    File::ForgetRandomDevice(fd);
-    File::ForgetDirectoryDescriptor(fd);
-    File::ForgetFileLock(fd);
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+static void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
+static int NativeClose(int fd) {
+    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
+    const int result = ::_close(fd);
+    _set_thread_local_invalid_parameter_handler(previous);
+    return result;
 }
 static int NativeUnlink(const std::filesystem::path& p) {
     const auto path = p.wstring();
@@ -95,9 +86,7 @@ static std::int64_t NativeRead(int fd, void* buf, std::size_t n) {
 static std::int64_t NativeWrite(int fd, const void* buf, std::size_t n) {
     return ::write(fd, buf, n);
 }
-static void NativeCleanup(int fd) noexcept {
-    File::ForgetRandomDevice(fd);
-}
+static int NativeClose(int fd) { return ::close(fd); }
 static int NativeUnlink(const std::filesystem::path& p) {
     return ::unlink(p.c_str());
 }
@@ -113,40 +102,45 @@ static int MapFlags(int sceFlags) {
     if (sceFlags & SCE_KERNEL_O_TRUNC) f |= O_TRUNC;
     if (sceFlags & SCE_KERNEL_O_EXCL) f |= O_EXCL;
     if (sceFlags & SCE_KERNEL_O_SYNC) f |= O_SYNC;
-    if (sceFlags & SCE_KERNEL_O_NONBLOCK) f |= O_NONBLOCK;
     if (sceFlags & SCE_KERNEL_O_DIRECTORY) f |= O_DIRECTORY;
     return f;
 }
 #endif
 
-static int SceErrorFromGuest(int error) {
-    return static_cast<int>(0x80020000u | static_cast<unsigned>(error));
-}
 extern "C" int* APS5_VABI __error_nid_postfix();
 extern "C" int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...);
 static constexpr int GuestSetFlags = 4;
 
 static int SceErrorFromErrno(int error) {
-    return SceErrorFromGuest(GuestFiles::GuestFileNativeError_nid_no_patch(error));
+    constexpr int GuestEio = 5;
+    const int guest = error > 0 && error <= 34 ? error : GuestEio;
+    return static_cast<int>(0x80020000u | static_cast<unsigned>(guest));
 }
 
+static int SceIoErrorFromErrno(int error) {
+    int guest = SceErrorFromErrno(error) & 0xffff;
+    if (error == EAGAIN) guest = 35;
+#ifdef EDEADLK
+    else if (error == EDEADLK) guest = 11;
+#endif
+#ifdef EDQUOT
+    else if (error == EDQUOT) guest = 69;
+#endif
+#ifdef EOVERFLOW
+    else if (error == EOVERFLOW) guest = 84;
+#endif
+    return static_cast<int>(0x80020000u | static_cast<unsigned>(guest));
+}
 
 extern "C" {
 
 int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
-    if (path == nullptr) return SCE_KERNEL_ERROR_EFAULT;
-    if (*path == '\0') return SCE_KERNEL_ERROR_ENOENT;
-    if ((flags & SCE_KERNEL_O_ACCMODE) == SCE_KERNEL_O_ACCMODE) return SCE_KERNEL_ERROR_EINVAL;
-    if (GuestFiles::GuestFileInitializeStandards_nid_no_patch() != 0) return SceErrorFromGuest(errno);
-    const int nativeFlags = MapFlags(flags);
-    APS5_LOG_OUT("path=%s flags=0x%X nativeFlags=0x%X mode=0%o", path, flags, nativeFlags, mode);
-    if (File::IsRandomDevicePath(path)) {
-        if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY)
-            throw std::runtime_error(std::string(__func__) + ": writing to " + path + " is not implemented");
+    if (path != nullptr && *path == '\0') return SCE_KERNEL_ERROR_ENOENT;
+    APS5_LOG_OUT("path=%s flags=0x%X nativeFlags=0x%X mode=0%o", path, flags, MapFlags(flags), mode);
+    if (path != nullptr && File::IsRandomDevicePath(path)) {
+        if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY) throw std::runtime_error(std::string(__func__) + ": writing to " + path + " is not implemented");
         const int fd = File::OpenRandomDevice();
-        if (fd < 0) return SceErrorFromErrno(errno);
-        const auto lease = GuestFiles::GuestFileAdoptOwned_nid_no_patch(fd, 0, NativeCleanup);
-        return lease ? GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(lease) : SceErrorFromGuest(errno);
+        return fd < 0 ? SceErrorFromErrno(errno) : fd;
     }
     auto native = ResolvePath_nid_no_patch(path);
 #ifdef _WIN32
@@ -156,9 +150,9 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
         if (std::filesystem::exists(status) && !std::filesystem::is_directory(status)) return SceErrorFromErrno(ENOTDIR);
     }
 #endif
-    int fd = NativeOpen(native, nativeFlags, mode);
+    int fd = NativeOpen(native, MapFlags(flags), mode);
 #ifdef _WIN32
-    if (fd < 0 && errno != ENOENT && (flags & SCE_KERNEL_O_ACCMODE) == SCE_KERNEL_O_RDONLY) {
+    if (fd < 0 && errno != ENOENT) {
         std::error_code error;
         if (std::filesystem::is_directory(native, error)) {
             if ((flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_EXCL)) == (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_EXCL)) errno = EEXIST;
@@ -167,16 +161,25 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
         }
     }
 #endif
-    if (fd < 0) return SceErrorFromErrno(errno);
-    const auto lease = GuestFiles::GuestFileAdoptOwned_nid_no_patch(fd, flags & SCE_KERNEL_O_ACCMODE, NativeCleanup);
-    if (!lease) return SceErrorFromGuest(errno);
+    if (fd < 0) {
+        return SceErrorFromErrno(errno);
+    }
     if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY || (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)))
         RecordWrittenPath_nid_no_patch(native);
-    return GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(lease);
+    return fd;
 }
 
 int APS5_VABI sceKernelClose(int d) {
-    return GuestFiles::GuestFileClose_nid_no_patch(d) == 0 ? 0 : SceErrorFromGuest(errno);
+    File::ForgetRandomDevice(d);
+#ifdef _WIN32
+    File::ForgetDirectoryDescriptor(d);
+    File::ForgetFileLock(d);
+#endif
+    if (NativeClose(d) != 0) {
+        if (errno == EBADF) return SCE_KERNEL_ERROR_EBADF;
+        throw std::runtime_error(std::string(__func__) + ": close failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
+    }
+    return 0;
 }
 
 std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
@@ -184,16 +187,15 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
         const auto n = GuestSockets::Read(d, buf, nbytes);
         return n < 0 ? SceKernelError(*__error_nid_postfix()) : n;
     }
-    const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(d);
-    if (!lease) return SceErrorFromGuest(errno);
-    if (GuestFiles::GuestFileAccessMode_nid_no_patch(lease) == 1) return SCE_KERNEL_ERROR_EBADF;
-    if (buf == nullptr && nbytes != 0) return SCE_KERNEL_ERROR_EFAULT;
+    if (buf == nullptr) {
+        throw std::invalid_argument(std::string(__func__) + ": buf is null");
+    }
     const GuestArena::HostWrite destination(buf, nbytes);
-    if (!destination.Open()) return SCE_KERNEL_ERROR_EFAULT;
-    const int native = GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease);
-    if (File::ReadRandomDevice(native, buf, nbytes)) return static_cast<std::int64_t>(nbytes);
-    const auto result = NativeRead(native, buf, nbytes);
-    return result < 0 ? SceErrorFromErrno(errno) : static_cast<std::int64_t>(result);
+    if (!destination.Open()) errno = EFAULT;
+    else if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<std::int64_t>(nbytes);
+    auto n = destination.Open() ? NativeRead(d, buf, nbytes) : -1;
+    if (n < 0) return SceIoErrorFromErrno(errno);
+    return static_cast<std::int64_t>(n);
 }
 
 std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes) {
@@ -201,20 +203,21 @@ std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes
         const auto n = GuestSockets::Write(d, buf, nbytes);
         return n < 0 ? SceKernelError(*__error_nid_postfix()) : n;
     }
-    const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(d);
-    if (!lease) return SceErrorFromGuest(errno);
-    if (GuestFiles::GuestFileAccessMode_nid_no_patch(lease) == 0) return SCE_KERNEL_ERROR_EBADF;
-    if (buf == nullptr && nbytes != 0) return SCE_KERNEL_ERROR_EFAULT;
-    const auto result = NativeWrite(GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease), buf, nbytes);
-    return result < 0 ? SceErrorFromErrno(errno) : static_cast<std::int64_t>(result);
+    if (buf == nullptr) {
+        throw std::invalid_argument(std::string(__func__) + ": buf is null");
+    }
+    auto n = NativeWrite(d, buf, nbytes);
+    if (n < 0) return SceIoErrorFromErrno(errno);
+    return static_cast<std::int64_t>(n);
 }
 
 std::int64_t APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
-    if (whence < 0 || whence > 2) return SCE_KERNEL_ERROR_EINVAL;
-    const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(d);
-    if (!lease) return SceErrorFromGuest(errno);
-    const auto result = NativeLseek(GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease), offset, whence);
-    return result < 0 ? SceErrorFromErrno(errno) : result;
+    if (whence < 0 || whence > 2) {
+        throw std::invalid_argument(std::string(__func__) + ": invalid whence=" + std::to_string(whence));
+    }
+    std::int64_t result = NativeLseek(d, offset, whence);
+    if (result < 0) return SceIoErrorFromErrno(errno);
+    return result;
 }
 
 int APS5_VABI sceKernelStat(const char* path, FileStat* sb) {
@@ -262,8 +265,7 @@ int APS5_VABI sceKernelUnlink(const char* path) {
 
 int APS5_VABI sceKernelFcntl(int d, int command, ...) {
     if (d < GuestSockets::FirstDescriptor) {
-        const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(d);
-        if (!lease) return SCE_KERNEL_ERROR_EBADF;
+        if (!DescriptorIsOpen_nid_no_patch(d)) return SCE_KERNEL_ERROR_EBADF;
         throw std::runtime_error(std::string(__func__) + ": file descriptors are not implemented, fd=" + std::to_string(d));
     }
     int result;

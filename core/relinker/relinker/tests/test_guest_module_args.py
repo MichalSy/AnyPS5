@@ -75,7 +75,7 @@ def load_and_record(work, provider, module):
 def main():
     if sys.argv[1] == '--load':
         import ctypes
-        host = ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL if sys.platform == 'darwin' else ctypes.DEFAULT_MODE)
+        host = ctypes.CDLL(sys.argv[2], mode=ctypes.RTLD_GLOBAL)
         host.SetPendingArgs.argtypes = [ctypes.c_size_t, ctypes.c_void_p]
         host.SetPendingArgs(ARGS, ARGP)
         ctypes.CDLL(sys.argv[3])

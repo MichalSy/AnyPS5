@@ -350,10 +350,17 @@ int main() {
             RunSrgbZero(*device, Format8888Srgb, {ClampEdge, FilterPoint, BorderBlack, 0u, 0u, false, function}, point.c_str());
             RunSrgbZero(*device, Format8888Srgb, {ClampEdge, FilterBilinear, BorderBlack, 0u, 0u, false, function}, bilinear.c_str());
         }
-        RunSrgbZero(*device, Format8Srgb, {ClampEdge, FilterPoint}, "point 8 srgb");
-        RunSrgbZero(*device, Format8Srgb, {ClampEdge, FilterBilinear}, "bilinear 8 srgb");
-        RunSrgbZero(*device, Format8_8Srgb, {ClampEdge, FilterPoint}, "point 8_8 srgb");
-        RunSrgbZero(*device, Format8_8Srgb, {ClampEdge, FilterBilinear}, "bilinear 8_8 srgb");
+        for (const auto format : {Format8Srgb, Format8_8Srgb}) {
+            for (const auto filter : {FilterPoint, FilterBilinear}) {
+                const Sampler sampler{ClampEdge, filter};
+                const auto bit = format == Format8Srgb ? 1u : 2u;
+                if ((device->Target().srgbDecodeFormats & bit) != 0u) {
+                    Reject(*device, format, sampler, "samples or gathers an sRGB image the device cannot sample");
+                } else {
+                    RunSrgbZero(*device, format, sampler, "small sRGB comparison");
+                }
+            }
+        }
         Run(*device, {ClampEdge, FilterPoint}, "point, clamp to edge");
         Run(*device, {ClampWrap, FilterPoint}, "point, wrap");
         Run(*device, {ClampWrap, FilterPoint}, "point, wrap with negative offsets", true);

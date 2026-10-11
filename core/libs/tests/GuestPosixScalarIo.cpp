@@ -1,5 +1,4 @@
 #include "SceTypes.hpp"
-#include "prx/libc/include/GuestFileDescriptors.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include <cerrno>
@@ -159,13 +158,8 @@ int main() {
 #ifndef _WIN32
     int nonBlockingPipe[2] = {-1, -1};
     Require(pipe_nid_postfix(nonBlockingPipe) == 0);
-    {
-        const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(nonBlockingPipe[0]);
-        Require(lease != nullptr);
-        const int native = GuestFiles::GuestFileNativeDescriptor_nid_no_patch(lease);
-        const int pipeFlags = ::fcntl(native, F_GETFL);
-        Require(pipeFlags >= 0 && ::fcntl(native, F_SETFL, pipeFlags | O_NONBLOCK) == 0);
-    }
+    const int pipeFlags = fcntl(nonBlockingPipe[0], F_GETFL);
+    Require(pipeFlags >= 0 && fcntl(nonBlockingPipe[0], F_SETFL, pipeFlags | O_NONBLOCK) == 0);
     RequirePosixFailure([&] { return read_nid_postfix(nonBlockingPipe[0], buffer, 1); }, GuestEagain);
     RequirePosixFailure([&] { return _read_nid_postfix(nonBlockingPipe[0], buffer, 1); }, GuestEagain);
     Require(sceKernelRead(nonBlockingPipe[0], direct, 1) == static_cast<std::int32_t>(0x80020000u | GuestEagain));

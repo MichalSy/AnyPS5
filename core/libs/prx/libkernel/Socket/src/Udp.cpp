@@ -213,7 +213,7 @@ void GuestAddress(const sockaddr_storage& native, void* output, std::uint32_t* l
 }
 }
 
-int GuestSockets::GuestSocketClose_nid_no_patch(int descriptor) {
+int GuestSockets::Close(int descriptor) {
     {
         std::lock_guard lock(socketsMutex);
         if (!sockets.erase(descriptor)) return Fail(9);
@@ -278,7 +278,7 @@ bool GuestSockets::WaitAny(const std::vector<Interest>& interests, std::uint64_t
     return true;
 }
 
-bool GuestSockets::GuestSocketIsOpen_nid_no_patch(int descriptor) {
+bool GuestSockets::IsOpen(int descriptor) {
     std::lock_guard lock(socketsMutex);
     return sockets.contains(descriptor);
 }
@@ -286,6 +286,10 @@ int GuestSockets::Family(int descriptor) {
     std::lock_guard lock(socketsMutex);
     const auto found = sockets.find(descriptor);
     return found == sockets.end() ? -1 : found->second->family;
+}
+
+extern "C" bool GuestSocketIsOpen_nid_no_patch(int descriptor) {
+    return GuestSockets::IsOpen(descriptor);
 }
 
 namespace {
@@ -907,7 +911,7 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
 }
 
 std::int64_t GuestSockets::Read(int descriptor, void* buffer, std::size_t length) {
-    if (length == 0) return GuestSocketIsOpen_nid_no_patch(descriptor) ? 0 : Fail(9);
+    if (length == 0) return IsOpen(descriptor) ? 0 : Fail(9);
     return recv_nid_postfix(descriptor, buffer, std::min<std::size_t>(length, INT_MAX), 0);
 }
 
@@ -922,7 +926,7 @@ std::int64_t GuestSockets::Readv(int descriptor, const Iovec* iov, int iovcnt) {
         if (iov[i].length > static_cast<std::size_t>(INT_MAX) - total) return Fail(22);
         total += iov[i].length;
     }
-    if (total == 0) return GuestSocketIsOpen_nid_no_patch(descriptor) ? 0 : Fail(9);
+    if (total == 0) return IsOpen(descriptor) ? 0 : Fail(9);
     std::vector<char> buffer;
     try {
         buffer.resize(total);
