@@ -44,6 +44,18 @@ alignas(256) constexpr std::array<std::uint32_t, 16> ExplicitLodCode{
     0x80000501, 0xbf8c3f70, 0xf0900f08, 0x00610c02, 0xbf8c3f70, 0xe0701020, 0x80000c01, 0xbf810000,
 };
 
+constexpr auto ConstantLodCode(std::uint32_t move) {
+    std::array<std::uint32_t, Code.size() + 1u> code{};
+    std::copy_n(Code.begin(), 14u, code.begin());
+    code[14] = move;
+    std::copy(Code.begin() + 14u, Code.end(), code.begin() + 15u);
+    code[15] = 0xf0900f08u;
+    return code;
+}
+
+alignas(256) constexpr auto ExplicitZeroLodCode = ConstantLodCode(0x7e080280u);
+alignas(256) constexpr auto ExplicitFourLodCode = ConstantLodCode(0x7e0802f6u);
+
 constexpr std::array<float, 8> LineV{0.0f, 0.5f, 1.0f, 1.5f, -0.25f, 3.0f, 0.25f, 0.75f};
 constexpr std::array<std::uint32_t, 8> LineY{0u, 1u, 2u, 3u, 0xffffffffu, 7u, 0u, 5u};
 
@@ -164,14 +176,14 @@ void CheckPlane() {
     }
 }
 
-void RequireRefused(AgcDriver::VulkanDevice& device) {
+void RequireRefused(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::array<std::uint32_t, 8>& descriptor, const std::string& reason) {
     std::string refusal;
     try {
-        Run(device, ExplicitLodCode, LineDescriptor());
+        Run(device, code, descriptor);
     } catch (const std::exception& error) {
         refusal = error.what();
     }
-    Require(refusal.find("incompatible with the static runtime image interface") != std::string::npos, "image_sample_l 2d on a 1D texture was not refused: " + refusal);
+    Require(refusal.find(reason) != std::string::npos, "image_sample_l 2d on a 1D texture was not refused: " + refusal);
 }
 
 }
@@ -184,11 +196,20 @@ int main() {
         FillInput(true);
         Run(*device, Code, LineDescriptor());
         CheckLine();
+        FillInput(true);
+        Run(*device, ExplicitZeroLodCode, LineDescriptor());
+        CheckLine();
+        FillInput(true);
+        Run(*device, ExplicitFourLodCode, LineDescriptor());
+        CheckLine();
         FillTexture(Plane, PlaneDescriptor(), Size);
         FillInput(false);
         Run(*device, Code, PlaneDescriptor());
         CheckPlane();
-        RequireRefused(*device);
+        RequireRefused(*device, ExplicitLodCode, LineDescriptor(), "incompatible with the static runtime image interface");
+        auto mips = LineDescriptor();
+        mips[3] |= 1u << 16u;
+        RequireRefused(*device, ExplicitFourLodCode, mips, "requires a single mip level");
         std::puts("image plane address on line tests passed");
         return 0;
     } catch (const std::exception& error) {

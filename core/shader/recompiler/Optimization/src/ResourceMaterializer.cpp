@@ -774,6 +774,9 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
             if (modes[index].constantSwizzle && modes[index].numericClass == decoded.numericClass) return index;
         }
     }
+    if (image.dimension == RdnaImageDimension::Dim2D && decoded.dimension == RdnaImageDimension::Dim1D && image.flatLineRequiresSingleLevel && ((descriptor.dwords[3] >> 12u) & 0xfu) != ((descriptor.dwords[3] >> 16u) & 0xfu)) {
+        throw std::runtime_error("constant-LOD 2D sampling through a 1D view requires a single mip level");
+    }
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         const auto& mode = modes[index];
         if (((mode.emulatedCompare & EmulatedCompare::Enabled) != 0u) != emulated) continue;

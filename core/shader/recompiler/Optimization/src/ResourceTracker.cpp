@@ -1039,14 +1039,24 @@ private:
         resource.scalar = resource.scalar || op == IrOpcode::ReadConstBuffer || memory.kind == ResourceKind::ScalarBuffer;
     }
 
-    std::uint32_t AddImage(std::uint32_t source, const MemoryInfo& memory, IrOpcode op, std::uint32_t pc) {
+    std::uint32_t AddImage(std::uint32_t source, const MemoryInfo& memory, const IrValue& inst) {
+        const auto op = inst.Opcode();
+        const auto pc = inst.Flags<MemoryFlags>().pc;
+        bool constantLod = false;
+        if (op == IrOpcode::ImageSampleRaw && memory.imageDimension == RdnaImageDimension::Dim2D && memory.imageSampleFlags == RdnaImageSampleFlagLod) {
+            const auto* address = inst.Argument(2)->Resolve();
+            if (address->Opcode() == IrOpcode::MakeImageAddress && address->ArgumentCount() > 2u) {
+                const auto* lod = address->Argument(2)->Resolve();
+                constantLod = lod->HasImmediate() && lod->Type() == IrType::U32 && (lod->ImmediateU32() & 0x7f800000u) != 0x7f800000u;
+            }
+        }
         const auto resourceClass = ImageOpcodeInfoOf(op).resourceClass;
         const auto mip = resourceClass == ImageResourceClass::Storage && memory.imageHasMip ? ImageMipMode::DynamicStorage : ImageMipMode::None;
         const bool depth = (memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0;
         for (std::uint32_t i = 0; i < m_info.images.size(); i++) {
             auto& image = m_info.images[i];
             if (image.source == source && image.resourceClass == resourceClass && image.dimension == memory.imageDimension && image.mipMode == mip && image.depthCompare == depth && image.r128 == memory.imageR128 && image.packed == memory.imagePacked && image.byElements == memory.imageByElements && image.byComponents == (memory.imageByElements != 0u ? memory.dataDwords / memory.imageByElements : 0u)) {
-                Merge(image, memory, op, pc);
+                Merge(image, memory, op, pc, constantLod);
                 return i;
             }
         }
@@ -1064,12 +1074,12 @@ private:
         image.packed = memory.imagePacked;
         image.byElements = memory.imageByElements;
         image.byComponents = memory.imageByElements != 0u ? memory.dataDwords / memory.imageByElements : 0u;
-        Merge(image, memory, op, pc);
+        Merge(image, memory, op, pc, constantLod);
         m_info.images.push_back(image);
         return static_cast<std::uint32_t>(m_info.images.size() - 1);
     }
 
-    static void Merge(ImageResource& image, const MemoryInfo& memory, IrOpcode op, std::uint32_t pc) {
+    static void Merge(ImageResource& image, const MemoryInfo& memory, IrOpcode op, std::uint32_t pc, bool constantLod) {
         const auto access = ImageOpcodeInfoOf(op).access;
         const bool atomic = access == ImageAccess::Atomic;
         const bool write = access == ImageAccess::Write || atomic;
@@ -1090,8 +1100,9 @@ private:
         const bool flatVolumeSample = op == IrOpcode::ImageSampleRaw && memory.imageSampleFlags == RdnaImageSampleFlagLevelZero;
         image.flatVolumeCompatible = image.flatVolumeCompatible && (flatVolumeLoad || flatVolumeSample) && !memory.imagePacked && memory.imageByElements == 0u;
         const bool flatLineLoad = op == IrOpcode::ImageRead && !memory.imageHasMip && memory.imageSampleFlags == 0u;
-        const bool flatLineSample = op == IrOpcode::ImageSampleRaw && memory.imageSampleFlags == RdnaImageSampleFlagLevelZero;
+        const bool flatLineSample = op == IrOpcode::ImageSampleRaw && (memory.imageSampleFlags == RdnaImageSampleFlagLevelZero || constantLod);
         image.flatLineCompatible = image.flatLineCompatible && (flatLineLoad || flatLineSample) && !memory.imagePacked && memory.imageByElements == 0u;
+        image.flatLineRequiresSingleLevel = image.flatLineRequiresSingleLevel || constantLod;
         if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
             constexpr auto unsupported = RdnaImageSampleFlagLod | RdnaImageSampleFlagDerivative;
             if (op == IrOpcode::ImageGatherRaw || (memory.imageSampleFlags & unsupported) != 0u) image.emulatedCompare |= EmulatedCompare::Unsupported;
@@ -1227,7 +1238,7 @@ private:
         } else {
             GetHandle(inst.Argument(0), IrOpcode::GetImageResource, 8, handle, source);
         }
-        resource = AddImage(source, memory, op, flags.pc);
+        resource = AddImage(source, memory, inst);
         if (resource == std::numeric_limits<std::uint32_t>::max()) {
             fail("image resource limit exceeded");
         }
