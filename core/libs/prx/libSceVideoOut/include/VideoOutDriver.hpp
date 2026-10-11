@@ -222,7 +222,7 @@ private:
     void presentLoop(std::stop_token token, std::promise<void>& started);
     void vblankLoop(std::stop_token token);
     void vblankEnd();
-    void processFlip(FlipRequest& req);
+    std::uint64_t processFlip(FlipRequest& req);
     void triggerEvents(VideoOutConfig& cfg, int eventKind, void* triggerData);
 
     std::mutex mutex;
