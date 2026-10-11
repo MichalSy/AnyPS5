@@ -93,6 +93,7 @@ TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words,
 struct CachedTexture {
     TextureKey key;
     std::uint64_t address;
+    std::uint64_t guestBytes;
     std::vector<std::byte> bytes;
     std::shared_ptr<Texture> texture;
     // A fast-cleared surface is cached as its clear texels; it stays valid while the keys are unchanged.
@@ -635,7 +636,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
-        } else if (source == nullptr && it->bytes.size() == guestBytes && it->keys == *keys) {
+        } else if (source == nullptr && it->guestBytes == guestBytes && it->keys == *keys) {
             // Unwritten pages need no comparison; partially resident textures compare only committed
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
@@ -644,7 +645,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
-            if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
+            const bool current = it->bytes.empty()
+                ? generation != 0 && GuestMemory::Watched(address, bytes) && GuestMemory::UnchangedSince(address, bytes, it->generation)
+                : *keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, bytes, it->generation) || equalsCommitted();
+            if (current) {
                 it->generation = generation;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
@@ -656,7 +660,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
+    CachedTexture entry{key, address, guestBytes, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
@@ -674,6 +678,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
         }
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
+        // Watched snapshots are validated by stamps. A later write or loss of coverage rebuilds
+        // the texture; untracked memory keeps the bytes needed for committed-page comparisons.
+        if (generation != 0 && GuestMemory::Watched(address, bytes)) std::vector<std::byte>().swap(entry.bytes);
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }

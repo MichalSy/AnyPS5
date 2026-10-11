@@ -485,6 +485,52 @@ void RemappedColorTest(const Device& device) {
     ClearCachedTextures(device.GetContext().device);
 }
 
+void SampledSnapshotTest(const Context& context) {
+    ClearCachedTextures(context.device);
+    GuestBlock memory(Block);
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearCachedTextures(device); }
+    } cleanup{context.device};
+    const auto address = memory.Address();
+    const std::array<std::uint32_t, 8> words{
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32Float << 20u) | (3u << 30u),
+        15u | (63u << 14u), 0xfacu | (9u << 28u), 0, 0, 0, 0
+    };
+    const auto fill = [&](float value) {
+        std::fill_n(reinterpret_cast<std::uint32_t*>(memory.data), Block / sizeof(std::uint32_t), std::bit_cast<std::uint32_t>(value));
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    };
+    const auto lookup = [&] { return CachedSampledTexture(context, words); };
+    SampleProgram sampler(context);
+    fill(0.25f);
+    auto texture = lookup();
+    Require(!texture->ViewsStorageImage(), "the sampled snapshot oracle unexpectedly views a storage image");
+    Require(sampler.RedBits(*texture) == std::bit_cast<std::uint32_t>(0.25f), "the initial sampled snapshot has wrong GPU pixels");
+    if (AgcDriver::GuestMemory::Watched(address, Block)) {
+        Require(lookup() == texture, "an unchanged watched sampled snapshot was rebuilt");
+        fill(0.5f);
+        auto changed = lookup();
+        Require(changed != texture && sampler.RedBits(*changed) == std::bit_cast<std::uint32_t>(0.5f),
+            "a CPU write to a watched sampled snapshot did not replace its GPU pixels");
+        texture = std::move(changed);
+        AgcDriver::GuestMemory::Unwatch(address, Block);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(!AgcDriver::GuestMemory::Watched(address, Block), "the sampled snapshot oracle remains watched");
+        changed = lookup();
+        Require(changed != texture && sampler.RedBits(*changed) == std::bit_cast<std::uint32_t>(0.5f),
+            "loss of write watching did not rebuild the sampled snapshot with its current GPU pixels");
+        texture = std::move(changed);
+    }
+    Require(lookup() == texture, "an unchanged untracked sampled snapshot was rebuilt");
+    fill(0.75f);
+    const auto changed = lookup();
+    Require(changed != texture && sampler.RedBits(*changed) == std::bit_cast<std::uint32_t>(0.75f),
+        "an untracked sampled snapshot reused stale GPU pixels after a CPU write");
+    Require(lookup() == changed, "an unchanged untracked sampled snapshot did not reuse its replacement");
+}
+
 void ReadStorageImage(const Context& context, const StorageTexture& storage, Buffer& readback) {
     CommandBatch batch(context);
     const auto commands = batch.Handle();
@@ -841,6 +887,7 @@ int main() {
         std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
         Run(device->GetContext());
         RemappedColorTest(*device);
+        SampledSnapshotTest(device->GetContext());
         StorageRoundTripTest(device->GetContext(), false);
         StorageRoundTripTest(device->GetContext(), true);
         StorageRoundTripTest(device->GetContext(), true, true);
