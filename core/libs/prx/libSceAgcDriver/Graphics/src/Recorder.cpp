@@ -1,3 +1,4 @@
+#include "prx/libkernel/System/include/DebugBridge.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -1992,14 +1993,21 @@ bool Recorder::gpuSampleCounter() {
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         moduleInfo.codeSize = sizeof(SAMPLE_COUNTER_SPV);
         moduleInfo.pCode = SAMPLE_COUNTER_SPV;
-        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule sample counter");
+        {
+            DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule sample counter");
+        }
         VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipelineInfo.stage.module = module;
         pipelineInfo.stage.pName = "main";
         pipelineInfo.layout = sampleLayout;
-        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &samplePipeline), "vkCreateComputePipelines sample counter");
+        {
+            DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &samplePipeline), "vkCreateComputePipelines sample counter");
+            activity.Complete();
+        }
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         module = VK_NULL_HANDLE;
         const VkPushConstantRange dumpPush{VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleDumpPushBytes};
@@ -2007,10 +2015,17 @@ bool Recorder::gpuSampleCounter() {
         Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &dumpLayout), "vkCreatePipelineLayout sample dumps");
         moduleInfo.codeSize = sizeof(SAMPLE_DUMPS_SPV);
         moduleInfo.pCode = SAMPLE_DUMPS_SPV;
-        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule sample dumps");
+        {
+            DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule sample dumps");
+        }
         pipelineInfo.stage.module = module;
         pipelineInfo.layout = dumpLayout;
-        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &dumpPipeline), "vkCreateComputePipelines sample dumps");
+        {
+            DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &dumpPipeline), "vkCreateComputePipelines sample dumps");
+            activity.Complete();
+        }
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         module = VK_NULL_HANDLE;
     } catch (const std::exception& error) {
@@ -2280,14 +2295,21 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
             VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             moduleInfo.codeSize = sizeof(MESH_ARGUMENTS_SPV);
             moduleInfo.pCode = MESH_ARGUMENTS_SPV;
-            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule mesh arguments");
+            {
+                DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
+                Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule mesh arguments");
+            }
             VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
             pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
             pipelineInfo.stage.module = module;
             pipelineInfo.stage.pName = "main";
             pipelineInfo.layout = meshArgumentLayout;
-            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &meshArgumentPipeline), "vkCreateComputePipelines mesh arguments");
+            {
+                DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
+                Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &meshArgumentPipeline), "vkCreateComputePipelines mesh arguments");
+                activity.Complete();
+            }
             context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
             meshArgumentState = 1;
         } catch (const std::exception& error) {
@@ -3169,7 +3191,10 @@ void Recorder::Submit() {
         submission.pSignalSemaphores = &timeline;
     }
     const auto submitStart = std::chrono::steady_clock::now();
-    Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    {
+        DebugBridgeWorkActivity activity(DebugBridgeWork::GpuSubmit);
+        Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    }
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
@@ -3219,6 +3244,7 @@ struct RestoreSyncSite {
 // the recorder may be torn down meanwhile (its destructor waits for the registered waiters to
 // leave after completing every batch, so the handles stay valid until this returns).
 VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial) {
+    DebugBridgeWorkActivity activity(DebugBridgeWork::GpuGraphicsWait);
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
@@ -3229,6 +3255,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
         std::fprintf(stderr, "[gpu] recorded batch %llu still running on the GPU after %d s (timeline wait)\n", static_cast<unsigned long long>(serial), waited);
         result = waitSemaphores(device, &wait, 5'000'000'000ull);
     }
+    activity.Finish(result == VK_SUCCESS);
     return result;
 }
 
@@ -3622,13 +3649,16 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
+        DebugBridgeWorkActivity fenceActivity(DebugBridgeWork::GpuGraphicsWait);
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
+        fenceActivity.Finish(result == VK_SUCCESS);
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
+            DebugBridgeWorkActivity idleActivity(DebugBridgeWork::GpuIdleWait);
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }

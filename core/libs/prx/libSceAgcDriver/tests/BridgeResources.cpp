@@ -4,9 +4,9 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <array>
 
-static JsonValue Shaders(BridgeCollector& collector) {
+static JsonValue Resources(BridgeCollector& collector) {
     const auto event = Await(collector, "event", {}, "resource_status");
-    return Member(Member(event, "data", JsonType::Object), "shaders", JsonType::Object);
+    return Member(event, "data", JsonType::Object);
 }
 
 int main() {
@@ -36,7 +36,12 @@ int main() {
         NoEvents(collector, std::chrono::milliseconds(120));
         collector.Send(hello.source, Command(1, "shader-enable", R"({"enabled":true})"));
         Await(collector, "command_completed", "shader-enable");
-        auto shaders = Shaders(collector);
+        auto data = Resources(collector);
+        auto shaders = Member(data, "shaders", JsonType::Object);
+        auto work = Member(Member(data, "activity", JsonType::Object), "translation", JsonType::Object);
+        Require(Unsigned(work, "started") == 2 && Unsigned(work, "completed") == 2
+            && Unsigned(work, "failed") == 0 && Unsigned(work, "total_us") > 0,
+            "Actual compiler work did not publish successful elapsed operations");
         const auto payload = first->artifact->artifact.spirv.size() * sizeof(std::uint32_t);
         Require(Unsigned(shaders, "translations_active") == 0 && Unsigned(shaders, "translations_completed") == 2,
             "Actual front-end and SPIR-V emission scopes were not counted before activation");
@@ -59,7 +64,12 @@ int main() {
         NoEvents(collector, std::chrono::milliseconds(120));
         collector.Send(hello.source, Command(3, "shader-reenable", R"({"enabled":true})"));
         Await(collector, "command_completed", "shader-reenable");
-        shaders = Shaders(collector);
+        data = Resources(collector);
+        shaders = Member(data, "shaders", JsonType::Object);
+        work = Member(Member(data, "activity", JsonType::Object), "translation", JsonType::Object);
+        Require(Unsigned(work, "started") == 3 && Unsigned(work, "completed") == 2
+            && Unsigned(work, "failed") == 1 && Unsigned(work, "active") == 0,
+            "Actual RDNA failure was absent from cumulative work telemetry");
         Require(Unsigned(shaders, "translations_active") == 0 && Unsigned(shaders, "translations_completed") == 2,
             "Cache reuse fabricated translation or failed compilation retained an active scope");
         Require(Unsigned(shaders, "cached_variants_count") == 1 && Unsigned(shaders, "variant_spirv_bytes") == payload

@@ -487,8 +487,18 @@ void testBridge() {
     collector.Send(hello.source, Command(1, "enable", R"({"enabled":true})"));
     Await(collector, "command_received", "enable");
     CheckMonitoringState(Member(Await(collector, "command_completed", "enable"), "result", JsonType::Object), true, 1);
+    const auto noFrames = [&] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(120);
+        BridgePacket packet;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (!collector.Receive(std::chrono::milliseconds(10), packet)) continue;
+            const auto root = parseJsonDocument(packet.text);
+            if (Member(root, "type", JsonType::String).stringValue == "event")
+                check(Member(root, "name", JsonType::String).stringValue == "resource_status", "Overlay or cancelled flip emitted frame telemetry");
+        }
+    };
     const auto count = flip(handle, cfg);
-    auto first = Await(collector, "event");
+    auto first = Await(collector, "event", {}, "frame_timing");
     auto data = Member(first, "data", JsonType::Object);
     check(Member(first, "name", JsonType::String).stringValue == "frame_timing" && Unsigned(first, "frame") > 0, "missing genuine FrameTiming correlation");
     check(Unsigned(data, "output_handle") == static_cast<std::uint64_t>(handle)
@@ -497,7 +507,7 @@ void testBridge() {
     Member(data, "flip_interval_us", JsonType::Null);
     const auto firstTimestamp = Unsigned(data, "timestamp_us");
     flip(handle, cfg);
-    auto next = Await(collector, "event");
+    auto next = Await(collector, "event", {}, "frame_timing");
     data = Member(next, "data", JsonType::Object);
     check(Unsigned(next, "frame") > Unsigned(first, "frame") && Unsigned(data, "completed_flip_count") == count + 1,
         "completed frame identity did not increase");
@@ -507,13 +517,13 @@ void testBridge() {
     const int overlay = sceVideoOutOpen(255, VIDEO_OUT_BUS_TYPE_OVERLAY, 0, nullptr);
     auto overlayCfg = VideoOutDriver::Get().GetConfig(overlay);
     flip(overlay, overlayCfg);
-    NoEvents(collector, std::chrono::milliseconds(120));
+    noFrames();
     sceVideoOutClose(overlay);
     sceVideoOutClose(handle);
     check(sceVideoOutOpen(255, VIDEO_OUT_BUS_TYPE_MAIN, 0, nullptr) == handle, "bridge reopen changed handle");
     auto reopened = VideoOutDriver::Get().GetConfig(handle);
     flip(handle, reopened);
-    data = Member(Await(collector, "event"), "data", JsonType::Object);
+    data = Member(Await(collector, "event", {}, "frame_timing"), "data", JsonType::Object);
     check(Unsigned(data, "output_generation") > cfg->generation && Unsigned(data, "completed_flip_count") == 1, "bridge lost reopened output generation");
     Member(data, "flip_interval_us", JsonType::Null);
     auto gate = std::make_shared<Gate>();
@@ -530,7 +540,7 @@ void testBridge() {
         check(reopened->vblankCond.wait_for(lock, std::chrono::seconds(10), [&] { return reopened->flipStatus.flipPendingNum == 0; }), "cancelled flip remained pending");
         check(reopened->flipStatus.count == 1, "cancelled bridge fixture flip succeeded");
     }
-    NoEvents(collector, std::chrono::milliseconds(120));
+    noFrames();
     AgcDriverUnregisterVideoOutput_nid_postfix(7, gate);
     LibcRunShutdown_nid_postfix();
 }

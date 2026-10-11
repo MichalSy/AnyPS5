@@ -1,3 +1,4 @@
+#include "prx/libkernel/System/include/DebugBridge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleColorSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -136,14 +137,21 @@ MultisampleColorSurface::MultisampleColorSurface(const Context& context, const C
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         moduleInfo.codeSize = target.elementBytes == 8u ? sizeof(MULTISAMPLE_COLOR_TRANSFER_WIDE_SPV) : sizeof(MULTISAMPLE_COLOR_TRANSFER_SPV);
         moduleInfo.pCode = target.elementBytes == 8u ? MULTISAMPLE_COLOR_TRANSFER_WIDE_SPV : MULTISAMPLE_COLOR_TRANSFER_SPV;
-        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule multisample color");
+        {
+            DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule multisample color");
+        }
         VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipelineInfo.stage.module = module;
         pipelineInfo.stage.pName = "main";
         pipelineInfo.layout = pipelineLayout;
-        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines multisample color");
+        {
+            DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines multisample color");
+            activity.Complete();
+        }
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         module = VK_NULL_HANDLE;
         const std::array<VkDescriptorPoolSize, 2> sizes{{{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}}};

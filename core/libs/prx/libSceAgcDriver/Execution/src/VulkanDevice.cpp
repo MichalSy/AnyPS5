@@ -560,6 +560,7 @@ struct VulkanDevice::State {
     // Blocks on the fence, or polls it every 50 us with APS5_PRESENT_POLL_FENCE=1 (the difference
     // in the wait is the presenter's wake-up latency).
     void WaitPresentFence(VkFence fence) {
+        DebugBridgeWorkActivity activity(DebugBridgeWork::GpuPresentWait);
         static const bool poll = std::getenv("APS5_PRESENT_POLL_FENCE") != nullptr;
         if (!poll) {
             check(DeviceFunction<PFN_vkWaitForFences>("vkWaitForFences")(device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences present");
@@ -578,7 +579,9 @@ struct VulkanDevice::State {
     ~State() {
         contextReady = false;
         if (device != VK_NULL_HANDLE) {
+            DebugBridgeWorkActivity idleActivity(DebugBridgeWork::GpuIdleWait);
             const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+            idleActivity.Finish(idle == VK_SUCCESS);
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
             {
@@ -1440,6 +1443,7 @@ void VulkanDevice::PrepareForReplacement() {
 }
 
 void VulkanDevice::WaitIdle() {
+    DebugBridgeWorkActivity activity(DebugBridgeWork::GpuIdleWait);
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle begin");
     RetirePresents(0);
     if (state->recorder) {
@@ -2338,6 +2342,7 @@ bool VulkanDevice::AcquireImage() {
     std::uint32_t index = 0;
     timing.Mark("fence_reset");
     // An out-of-date swapchain (the window changed) drops this frame; the next Resize recreates it.
+    DebugBridgeWorkActivity acquireActivity(DebugBridgeWork::GpuAcquireWait);
     const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 5'000'000'000ULL, VK_NULL_HANDLE, state->acquireFence, &index);
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
         state->extent = {0, 0};
@@ -2347,6 +2352,7 @@ bool VulkanDevice::AcquireImage() {
     timing.Mark("acquire_image");
     APS5_LOG_OUT_DEBUG("vkAcquireNextImageKHR index=%u imageCount=%zu", index, state->images.size());
     check(wait(state->device, 1, &state->acquireFence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences acquire");
+    acquireActivity.Finish(true);
     timing.Mark("acquire_fence_wait");
     APS5_LOG_OUT_DEBUG("Acquire fence complete index=%u", index);
     require(index < state->images.size() && index < state->rendered.size(), "acquired image index is out of range");
@@ -2533,7 +2539,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    {
+        DebugBridgeWorkActivity activity(DebugBridgeWork::GpuSubmit);
+        check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    }
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -2654,7 +2663,9 @@ void VulkanDevice::QueuePresent() {
     present.swapchainCount = 1;
     present.pSwapchains = &state->swapchain;
     present.pImageIndices = &index;
+    DebugBridgeWorkActivity presentActivity(DebugBridgeWork::GpuPresentWait);
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
+    presentActivity.Finish(presented == VK_SUCCESS || presented == VK_SUBOPTIMAL_KHR || presented == VK_ERROR_OUT_OF_DATE_KHR);
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
     timing.Mark("queue_present");
@@ -3837,7 +3848,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
         moduleInfo.pCode = shader.spirv.data();
-        check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
+        {
+            DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
+            check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
+        }
         timing.Mark("validate_shader_module");
         const std::array<VkDescriptorSetLayout, 2> setLayouts{resources->Layout(), shader.workgroupMemoryDwords != 0 ? state->workgroupMemoryLayout : VK_NULL_HANDLE};
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};

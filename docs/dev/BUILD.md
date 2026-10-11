@@ -109,7 +109,7 @@ It never waits for FrameRift. Normal runtime shutdown sends a best-effort
 `goodbye`; crashes and forced termination are detected by the receiver's timeout.
 An unavailable receiver does not stop the game or change existing logging.
 
-The bridge advertises `set_monitoring` and `resource_status`. Monitoring starts
+The bridge advertises `set_monitoring`, `resource_status` and `work_activity`. Monitoring starts
 off; the `set_monitoring` command accepts `{"enabled":true}` or `false`, acknowledges
 receipt and reports completion with enabled state and monitoring epoch. Main-output
 flip samples use a bounded nonblocking producer queue; saturation drops telemetry.
@@ -128,6 +128,22 @@ process RSS and the driver heap estimate have different scopes and are not addit
 The [FrameRift protocol](https://github.com/MichalSy/FrameRift/blob/main/docs/debug-bridge.md#shader-and-memory-resources)
 defines their units and nullable fields. Input commands, screenshots and game pause
 remain unavailable.
+
+`work_activity` adds eleven fixed work records to resource events: preparation,
+translation, specialization, pipeline build/optimization, shader-module creation,
+presentation/acquisition/idle/graphics synchronization, and queue submission.
+Each reports active calls and lifetime started/completed/failed counters, elapsed
+microseconds and the longest finished attempt. Short work remains observable even
+when its latest active gauge is zero. Producers only update atomics and query the
+monotonic clock; serialization and nonblocking UDP stay on the bridge worker.
+
+Durations are elapsed wall time, including waits, and are credited when an attempt
+finishes. Nested scopes overlap; they are not additive CPU usage or GPU execution
+time. Specialized-module preparation includes disk-cache lookup and SPIR-V
+optimization; idle can include retirement and synchronization. Instrumentation
+does not cover every thread, mutex, I/O operation, startup import probe or driver
+activity. FrameRift displays the actual observed delta window and labels unexplained
+missing frames as an unknown stall. Existing file logging is unchanged.
 
 ## Pipeline statistics
 

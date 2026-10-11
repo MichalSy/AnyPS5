@@ -1,3 +1,4 @@
+#include "prx/libkernel/System/include/DebugBridge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -363,7 +364,11 @@ CommandBatch::~CommandBatch() {
 void CommandBatch::release() noexcept {
     if (pending) {
         auto result = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence);
-        if (result == VK_NOT_READY) result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        if (result == VK_NOT_READY) {
+            DebugBridgeWorkActivity activity(DebugBridgeWork::GpuIdleWait);
+            result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+            activity.Finish(result == VK_SUCCESS);
+        }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) std::terminate();
     }
     if (commands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
@@ -387,7 +392,10 @@ void CommandBatch::Submit() {
     submission.commandBufferCount = 1;
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    {
+        DebugBridgeWorkActivity activity(DebugBridgeWork::GpuSubmit);
+        Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    }
     timing.Mark("queue_submit");
     pending = true;
     submitted = true;
@@ -397,7 +405,9 @@ void CommandBatch::Wait() {
     Require(submitted, "command batch has not been submitted");
     if (!pending) return;
     PerformanceTimer timing("Graphics.Wait");
+    DebugBridgeWorkActivity activity(DebugBridgeWork::GpuGraphicsWait);
     const auto result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 5'000'000'000ULL);
+    activity.Finish(result == VK_SUCCESS);
     timing.Mark("fence_wait");
     if (result == VK_SUCCESS || result == VK_ERROR_DEVICE_LOST) pending = false;
     Check(result, "vkWaitForFences graphics");

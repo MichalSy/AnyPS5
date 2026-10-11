@@ -490,6 +490,7 @@ struct SpecializedModule {
 };
 
 std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, bool useDiskCache) {
+    DebugBridgeWorkActivity activity(DebugBridgeWork::Specialization);
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::vector<std::byte> diskKey;
     const bool disk = useDiskCache && SpecializedDiskCache::Enabled();

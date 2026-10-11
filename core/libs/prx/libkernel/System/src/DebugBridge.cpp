@@ -54,6 +54,15 @@ constexpr std::array memoryNames{
     "storage_cache_bytes", "storage_cache_budget_bytes", "gpu_heap_usage_bytes", "gpu_heap_budget_bytes", "gpu_heap_timestamp_us"
 };
 
+constexpr std::array workNames{
+    "preparation", "translation", "specialization", "pipeline_build", "pipeline_optimization",
+    "shader_module", "gpu_present_wait", "gpu_acquire_wait", "gpu_idle_wait", "gpu_graphics_wait", "gpu_submit"
+};
+constexpr std::array workFields{"active", "started", "completed", "failed", "total_us", "max_us"};
+static_assert(workNames.size() == static_cast<std::size_t>(DebugBridgeWork::Count));
+using WorkSnapshot = std::array<std::array<std::uint64_t, workFields.size()>, workNames.size()>;
+constinit std::array<std::array<std::atomic<std::uint64_t>, workFields.size()>, workNames.size()> workCounters{};
+
 struct ResourceCounters {
     std::array<std::atomic<std::uint64_t>, shaderNames.size()> shaders{};
     std::atomic<std::uint64_t> sampledBytes{unavailable};
@@ -70,6 +79,7 @@ constinit ResourceCounters resourceCounters;
 struct ResourceSnapshot {
     std::array<std::uint64_t, shaderNames.size()> shaders{};
     std::array<std::uint64_t, memoryNames.size()> memory{};
+    WorkSnapshot activity{};
     bool operator==(const ResourceSnapshot&) const = default;
 };
 
@@ -386,7 +396,7 @@ private:
     std::string packet(const char* type) {
         auto result = envelope(type);
         if (std::strcmp(type, "hello") == 0)
-            result += ",\"game_id\":" + gameId + ",\"capabilities\":[\"set_monitoring\",\"resource_status\"]";
+            result += ",\"game_id\":" + gameId + ",\"capabilities\":[\"set_monitoring\",\"resource_status\",\"work_activity\"]";
         if (std::strcmp(type, "hello") == 0 || std::strcmp(type, "heartbeat") == 0)
             result += ",\"monitoring\":" + monitoringJson();
         return result + '}';
@@ -419,6 +429,9 @@ private:
         ResourceSnapshot snapshot;
         for (std::size_t index = 0; index < snapshot.shaders.size(); ++index)
             snapshot.shaders[index] = resourceCounters.shaders[index].load(std::memory_order_relaxed);
+        for (std::size_t index = 0; index < workNames.size(); ++index)
+            for (std::size_t field = 0; field < workFields.size(); ++field)
+                snapshot.activity[index][field] = workCounters[index][field].load(std::memory_order_relaxed);
         const auto heapTimestamp = resourceCounters.heapTimestamp.load(std::memory_order_acquire);
         snapshot.memory = {
             processRss, processRssTimestamp,
@@ -441,6 +454,16 @@ private:
             if (index != 0) packet += ',';
             packet += std::string("\"") + memoryNames[index] + "\":"
                 + (snapshot.memory[index] == unavailable ? "null" : std::to_string(snapshot.memory[index]));
+        }
+        packet += "},\"activity\":{";
+        for (std::size_t index = 0; index < workNames.size(); ++index) {
+            if (index != 0) packet += ',';
+            packet += std::string("\"") + workNames[index] + "\":{";
+            for (std::size_t field = 0; field < workFields.size(); ++field) {
+                if (field != 0) packet += ',';
+                packet += std::string("\"") + workFields[field] + "\":" + std::to_string(snapshot.activity[index][field]);
+            }
+            packet += '}';
         }
         packet += "}}}";
         socket.Send(port, packet);
@@ -661,4 +684,25 @@ extern "C" void DebugBridgePublishGpuHeap_nid_no_patch(std::uint64_t usage, std:
     resourceCounters.heapUsage.store(usage, std::memory_order_relaxed);
     resourceCounters.heapBudget.store(budget, std::memory_order_relaxed);
     resourceCounters.heapTimestamp.store(timestampUs, std::memory_order_release);
+}
+
+extern "C" std::uint64_t DebugBridgeBeginWork_nid_no_patch(DebugBridgeWork work) noexcept {
+    const auto index = static_cast<std::size_t>(work);
+    if (index >= workCounters.size()) return 0;
+    const auto started = TimestampUs(std::chrono::steady_clock::now());
+    workCounters[index][1].fetch_add(1, std::memory_order_relaxed);
+    workCounters[index][0].fetch_add(1, std::memory_order_relaxed);
+    return started;
+}
+
+extern "C" void DebugBridgeEndWork_nid_no_patch(DebugBridgeWork work, std::uint64_t startedUs, bool success) noexcept {
+    const auto index = static_cast<std::size_t>(work);
+    if (index >= workCounters.size()) return;
+    const auto elapsed = TimestampUs(std::chrono::steady_clock::now()) - startedUs;
+    auto& counters = workCounters[index];
+    counters[success ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
+    counters[4].fetch_add(elapsed, std::memory_order_relaxed);
+    auto maximum = counters[5].load(std::memory_order_relaxed);
+    while (elapsed > maximum && !counters[5].compare_exchange_weak(maximum, elapsed, std::memory_order_relaxed)) {}
+    counters[0].fetch_sub(1, std::memory_order_relaxed);
 }

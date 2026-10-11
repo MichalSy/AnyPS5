@@ -49,7 +49,7 @@ static std::string CheckBridgePacket(BridgePacket& packet, std::uint64_t& sequen
     Require(type == "hello" || type == "heartbeat" || type == "goodbye", "Connection bridge emitted an unexpected event");
     if (type == "hello") {
         Require(StringField(text, "game_id") == "PPSA90000", "Wrong bridge game identity");
-        Require(text.find("\"capabilities\":[\"set_monitoring\",\"resource_status\"]") != std::string::npos, "Bridge did not advertise monitoring and resources");
+        Require(text.find("\"capabilities\":[\"set_monitoring\",\"resource_status\",\"work_activity\"]") != std::string::npos, "Bridge did not advertise monitoring and resources");
         Require(text.find("\"monitoring\":{\"enabled\":false,\"epoch\":0}") != std::string::npos, "Monitoring was enabled by default");
     }
     return type;
@@ -98,8 +98,8 @@ static void CheckMonitoring(BridgeCollector& collector) {
     auto root = parseJsonDocument(hello.text);
     Require(Member(root, "type", JsonType::String).stringValue == "hello", "First monitoring packet is not hello");
     const auto& capabilities = Member(root, "capabilities", JsonType::Array).arrayValue;
-    Require(capabilities.size() == 2 && capabilities[0].stringValue == "set_monitoring"
-        && capabilities[1].stringValue == "resource_status", "Wrong monitoring capabilities");
+    Require(capabilities.size() == 3 && capabilities[0].stringValue == "set_monitoring"
+        && capabilities[1].stringValue == "resource_status" && capabilities[2].stringValue == "work_activity", "Wrong monitoring capabilities");
     CheckMonitoringState(Member(root, "monitoring", JsonType::Object), false, 0);
     DebugBridgePublishFrame_nid_no_patch({1, 1, 1, 1, 1000});
     NoEvents(collector, std::chrono::milliseconds(120));
@@ -211,12 +211,14 @@ static void CheckResources(BridgeCollector& collector) {
     DebugBridgeShaderCounter(DebugBridgeShaderMetric::VariantSpirvBytes, 512);
     {
         DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::TranslationsActive, DebugBridgeShaderMetric::TranslationsCompleted);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
         activity.Complete();
     }
     try {
         DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::TranslationsActive, DebugBridgeShaderMetric::TranslationsCompleted);
         throw std::runtime_error("translation failure");
     } catch (const std::runtime_error&) {}
+    DebugBridgeWorkActivity waitActivity(DebugBridgeWork::GpuPresentWait);
     DebugBridgeStart_nid_no_patch();
     BridgePacket hello;
     Require(collector.Receive(std::chrono::milliseconds(1000), hello), "Resource bridge did not start");
@@ -230,6 +232,16 @@ static void CheckResources(BridgeCollector& collector) {
         "Failure path leaked activity or counted unsuccessful completion");
     Require(Unsigned(shaders, "source_code_bytes") == 256 && Unsigned(shaders, "cached_variants_count") == 1
         && Unsigned(shaders, "variant_spirv_bytes") == 512, "Pre-start or disabled shader bookkeeping was lost");
+    const auto& activity = Member(data, "activity", JsonType::Object);
+    const auto& translation = Member(activity, "translation", JsonType::Object);
+    Require(Unsigned(translation, "started") == 2 && Unsigned(translation, "completed") == 1
+        && Unsigned(translation, "failed") == 1 && Unsigned(translation, "active") == 0
+        && Unsigned(translation, "total_us") >= 2000 && Unsigned(translation, "max_us") >= 2000,
+        "Work accounting lost elapsed time, failures or short completed operations");
+    const auto& present = Member(activity, "gpu_present_wait", JsonType::Object);
+    Require(Unsigned(present, "active") == 1 && Unsigned(present, "started") == 1
+        && Unsigned(present, "total_us") == 0, "Ongoing work was omitted or counted as completed time");
+    waitActivity.Finish(false);
     auto memory = Member(data, "memory", JsonType::Object);
     Require(Unsigned(memory, "sampled_cache_bytes") == 0, "An empty observed cache became unavailable");
     Member(memory, "sampled_cache_budget_bytes", JsonType::Null);
@@ -278,6 +290,14 @@ static void CheckResources(BridgeCollector& collector) {
     shaders = Member(data, "shaders", JsonType::Object);
     Require(Unsigned(shaders, "translations_active") == 0 && Unsigned(shaders, "translations_completed") == 100001
         && Unsigned(shaders, "disk_cache_hits") == 100000, "Concurrent short activity was lost or retained as active");
+    const auto& finalTranslation = Member(Member(data, "activity", JsonType::Object), "translation", JsonType::Object);
+    Require(Unsigned(finalTranslation, "active") == 0 && Unsigned(finalTranslation, "started") == 100002
+        && Unsigned(finalTranslation, "completed") == 100001 && Unsigned(finalTranslation, "failed") == 1
+        && Unsigned(finalTranslation, "total_us") >= 2000, "Concurrent cumulative work accounting lost operations");
+    const auto& finalPresent = Member(Member(data, "activity", JsonType::Object), "gpu_present_wait", JsonType::Object);
+    Require(Unsigned(finalPresent, "active") == 0 && Unsigned(finalPresent, "failed") == 1
+        && Unsigned(finalPresent, "completed") == 0 && Unsigned(finalPresent, "total_us") >= 120000,
+        "Explicit Vulkan failure did not close its measured work scope");
     memory = Member(data, "memory", JsonType::Object);
     Require(Unsigned(memory, "sampled_cache_bytes") == 130 && Unsigned(memory, "sampled_cache_budget_bytes") == 1024
         && Unsigned(memory, "storage_cache_bytes") == 96 && Unsigned(memory, "storage_cache_budget_bytes") == 256,

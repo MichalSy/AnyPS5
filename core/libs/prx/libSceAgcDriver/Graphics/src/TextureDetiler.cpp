@@ -1,3 +1,4 @@
+#include "prx/libkernel/System/include/DebugBridge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
@@ -91,7 +92,10 @@ TextureDetiler::TextureDetiler(const Context& context) : context(context) {
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         moduleInfo.codeSize = sizeof(TEXTURE_DETILE_SPV);
         moduleInfo.pCode = TEXTURE_DETILE_SPV;
-        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
+        {
+            DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
+        }
         bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &imageDescriptorLayout), "vkCreateDescriptorSetLayout");
         pipelineLayoutInfo.pSetLayouts = &imageDescriptorLayout;
@@ -163,7 +167,10 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         moduleInfo.codeSize = sizeof(TEXTURE_DETILE_IMAGE_SPV);
         moduleInfo.pCode = TEXTURE_DETILE_IMAGE_SPV;
-        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &imageModule), "vkCreateShaderModule");
+        {
+            DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &imageModule), "vkCreateShaderModule");
+        }
     }
     std::array<VkSpecializationMapEntry, 22> entries{};
     for (std::uint32_t index = 0; index < entries.size(); ++index) entries[index] = {index, index * 4u, 4};
@@ -181,7 +188,11 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
     createInfo.stage = stage;
     createInfo.layout = image ? imagePipelineLayout : pipelineLayout;
     VkPipeline result = VK_NULL_HANDLE;
-    Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &createInfo, nullptr, &result), "vkCreateComputePipelines");
+    {
+        DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &createInfo, nullptr, &result), "vkCreateComputePipelines");
+        activity.Complete();
+    }
     pipelines.emplace_back(key, result);
     return result;
 }
@@ -292,14 +303,22 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
         moduleInfo.codeSize = sizeof(CMASK_CLEAR_SPV);
         moduleInfo.pCode = CMASK_CLEAR_SPV;
         VkShaderModule cmaskModule = VK_NULL_HANDLE;
-        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &cmaskModule), "vkCreateShaderModule CMASK clear");
+        {
+            DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &cmaskModule), "vkCreateShaderModule CMASK clear");
+        }
         VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipelineInfo.stage.module = cmaskModule;
         pipelineInfo.stage.pName = "main";
         pipelineInfo.layout = cmaskPipelineLayout;
-        const auto created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &cmaskPipeline);
+        VkResult created;
+        {
+            DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
+            created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &cmaskPipeline);
+            if (created == VK_SUCCESS) activity.Complete();
+        }
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, cmaskModule, nullptr);
         Check(created, "vkCreateComputePipelines CMASK clear");
         cmaskErrors = std::make_unique<Buffer>(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);

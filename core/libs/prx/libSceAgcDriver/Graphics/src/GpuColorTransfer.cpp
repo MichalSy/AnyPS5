@@ -1,3 +1,4 @@
+#include "prx/libkernel/System/include/DebugBridge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/ColorTransfer_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -28,14 +29,21 @@ GpuColorTransfer::GpuColorTransfer(const Context& context) : context(context) {
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         moduleInfo.codeSize = sizeof(COLOR_TRANSFER_SPV);
         moduleInfo.pCode = COLOR_TRANSFER_SPV;
-        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule color transfer");
+        {
+            DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule color transfer");
+        }
         VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipelineInfo.stage.module = module;
         pipelineInfo.stage.pName = "main";
         pipelineInfo.layout = pipelineLayout;
-        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines color transfer");
+        {
+            DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines color transfer");
+            activity.Complete();
+        }
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         module = VK_NULL_HANDLE;
         const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
