@@ -660,7 +660,7 @@ PreparedRegistration PrepareRegisteredWithTemplates(const ShaderSnapshot& snapsh
     if (compute) {
         const auto shutdown = LibcShutdownToken_nid_postfix();
         if (shutdown.stop_requested()) throw ProcessShutdown{};
-        append();
+        appendDeferred({});
         if (shutdown.stop_requested()) throw ProcessShutdown{};
         request.context.compute->partialThreads = {1, 1, 1};
         appendDeferred({});

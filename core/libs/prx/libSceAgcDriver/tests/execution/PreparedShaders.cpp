@@ -390,7 +390,9 @@ void LazyPartialRegistration() {
     const bool cached = ShaderRecompiler::ShaderDiskCache::Enabled();
     const auto before = loads();
     AgcDriverRegisterShader_nid_postfix(&header.shader);
-    Require(!cached || loads() == before + 1, "registration eagerly loaded the unused partial compute artifact");
+    Require(!cached || loads() == before, "registration eagerly loaded an unused compute artifact");
+    AgcDriverResolveShaderAbi_nid_postfix(&header.shader, {}, {});
+    Require(!cached || loads() == before, "ABI resolution eagerly loaded an unused compute artifact");
     std::vector<std::uint32_t> commands;
     for (const auto reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
     const auto dispatchOffset = commands.size();
