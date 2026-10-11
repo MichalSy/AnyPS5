@@ -41,6 +41,59 @@ class DebugBridge;
 std::atomic<DebugBridge*> activeBridge{nullptr};
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 
+constexpr auto unavailable = std::numeric_limits<std::uint64_t>::max();
+constexpr std::array shaderNames{
+    "translations_active", "translations_completed", "cached_variants_count", "source_code_bytes",
+    "variant_spirv_bytes", "disk_cache_hits", "disk_cache_misses", "disk_cache_writes",
+    "disk_cache_load_failures", "disk_cache_write_failures", "preparation_queue_pending", "preparation_active",
+    "pipeline_builds_active", "pipeline_builds_completed", "pipeline_optimization_queue_pending", "pipeline_optimizations_active"
+};
+static_assert(shaderNames.size() == static_cast<std::size_t>(DebugBridgeShaderMetric::Count));
+constexpr std::array memoryNames{
+    "process_rss_bytes", "process_rss_timestamp_us", "sampled_cache_bytes", "sampled_cache_budget_bytes",
+    "storage_cache_bytes", "storage_cache_budget_bytes", "gpu_heap_usage_bytes", "gpu_heap_budget_bytes", "gpu_heap_timestamp_us"
+};
+
+struct ResourceCounters {
+    std::array<std::atomic<std::uint64_t>, shaderNames.size()> shaders{};
+    std::atomic<std::uint64_t> sampledBytes{unavailable};
+    std::atomic<std::uint64_t> sampledBudget{unavailable};
+    std::atomic<std::uint64_t> storageBytes{unavailable};
+    std::atomic<std::uint64_t> storageBudget{unavailable};
+    std::atomic<std::uint64_t> heapUsage{unavailable};
+    std::atomic<std::uint64_t> heapBudget{unavailable};
+    std::atomic<std::uint64_t> heapTimestamp{unavailable};
+};
+
+constinit ResourceCounters resourceCounters;
+
+struct ResourceSnapshot {
+    std::array<std::uint64_t, shaderNames.size()> shaders{};
+    std::array<std::uint64_t, memoryNames.size()> memory{};
+    bool operator==(const ResourceSnapshot&) const = default;
+};
+
+std::uint64_t TimestampUs(std::chrono::steady_clock::time_point time) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(time.time_since_epoch()).count());
+}
+
+std::uint64_t ProcessRss() noexcept {
+#ifdef __linux__
+    static const auto pageBytes = ::sysconf(_SC_PAGESIZE);
+    if (pageBytes <= 0) return unavailable;
+    auto* file = std::fopen("/proc/self/statm", "r");
+    if (!file) return unavailable;
+    unsigned long long virtualPages = 0;
+    unsigned long long residentPages = 0;
+    const auto fields = std::fscanf(file, "%llu %llu", &virtualPages, &residentPages);
+    std::fclose(file);
+    if (fields != 2 || residentPages > unavailable / static_cast<std::uint64_t>(pageBytes)) return unavailable;
+    return residentPages * static_cast<std::uint64_t>(pageBytes);
+#else
+    return unavailable;
+#endif
+}
+
 void Diagnose(const char* message) noexcept {
     if (!diagnosed.test_and_set(std::memory_order_relaxed))
         std::fprintf(stderr, "[debug-bridge] disabled: %s\n", message);
@@ -333,7 +386,7 @@ private:
     std::string packet(const char* type) {
         auto result = envelope(type);
         if (std::strcmp(type, "hello") == 0)
-            result += ",\"game_id\":" + gameId + ",\"capabilities\":[\"set_monitoring\"]";
+            result += ",\"game_id\":" + gameId + ",\"capabilities\":[\"set_monitoring\",\"resource_status\"]";
         if (std::strcmp(type, "hello") == 0 || std::strcmp(type, "heartbeat") == 0)
             result += ",\"monitoring\":" + monitoringJson();
         return result + '}';
@@ -349,6 +402,52 @@ private:
             + ",\"flip_interval_us\":" + (sample.hasInterval ? std::to_string(sample.intervalUs) : "null")
             + ",\"monitoring_epoch\":" + std::to_string(sample.epoch)
             + ",\"dropped_samples\":" + std::to_string(sample.dropped) + "}}";
+    }
+
+    void resources(DatagramSocket& socket, std::chrono::steady_clock::time_point now) {
+        const auto state = monitoring.load(std::memory_order_acquire);
+        if (!(state & 1)) {
+            hasResourceSnapshot = false;
+            return;
+        }
+        const auto epoch = state >> 1;
+        if (now >= nextRssAt) {
+            processRss = ProcessRss();
+            processRssTimestamp = processRss == unavailable ? unavailable : TimestampUs(now);
+            nextRssAt = now + std::chrono::seconds(1);
+        }
+        ResourceSnapshot snapshot;
+        for (std::size_t index = 0; index < snapshot.shaders.size(); ++index)
+            snapshot.shaders[index] = resourceCounters.shaders[index].load(std::memory_order_relaxed);
+        const auto heapTimestamp = resourceCounters.heapTimestamp.load(std::memory_order_acquire);
+        snapshot.memory = {
+            processRss, processRssTimestamp,
+            resourceCounters.sampledBytes.load(std::memory_order_relaxed), resourceCounters.sampledBudget.load(std::memory_order_relaxed),
+            resourceCounters.storageBytes.load(std::memory_order_relaxed), resourceCounters.storageBudget.load(std::memory_order_relaxed),
+            heapTimestamp == unavailable ? unavailable : resourceCounters.heapUsage.load(std::memory_order_relaxed),
+            heapTimestamp == unavailable ? unavailable : resourceCounters.heapBudget.load(std::memory_order_relaxed), heapTimestamp
+        };
+        const bool initial = !hasResourceSnapshot || resourceEpoch != epoch;
+        if (!initial && (now - resourceSentAt < std::chrono::milliseconds(250)
+            || (snapshot == lastResourceSnapshot && now - resourceSentAt < std::chrono::seconds(5)))) return;
+        auto packet = envelope("event") + ",\"name\":\"resource_status\",\"data\":{\"timestamp_us\":"
+            + std::to_string(TimestampUs(std::chrono::steady_clock::now())) + ",\"monitoring_epoch\":" + std::to_string(epoch) + ",\"shaders\":{";
+        for (std::size_t index = 0; index < snapshot.shaders.size(); ++index) {
+            if (index != 0) packet += ',';
+            packet += std::string("\"") + shaderNames[index] + "\":" + std::to_string(snapshot.shaders[index]);
+        }
+        packet += "},\"memory\":{";
+        for (std::size_t index = 0; index < snapshot.memory.size(); ++index) {
+            if (index != 0) packet += ',';
+            packet += std::string("\"") + memoryNames[index] + "\":"
+                + (snapshot.memory[index] == unavailable ? "null" : std::to_string(snapshot.memory[index]));
+        }
+        packet += "}}}";
+        socket.Send(port, packet);
+        resourceSentAt = now;
+        resourceEpoch = epoch;
+        lastResourceSnapshot = snapshot;
+        hasResourceSnapshot = true;
     }
 
     static const JsonValue& member(const JsonValue& object, const char* name, JsonType type) {
@@ -449,6 +548,7 @@ private:
                 }
                 if (stopping.load(std::memory_order_acquire)) break;
                 const auto now = Clock::now();
+                resources(socket, now);
                 if (now >= helloAt) {
                     socket.Send(port, packet("hello"));
                     helloAt = now + std::chrono::seconds(3);
@@ -489,6 +589,13 @@ private:
     std::array<Command, 128> commands{};
     std::size_t commandWrite = 0;
     std::uint64_t lastCommandSequence = 0;
+    ResourceSnapshot lastResourceSnapshot;
+    std::chrono::steady_clock::time_point resourceSentAt{};
+    std::chrono::steady_clock::time_point nextRssAt{};
+    std::uint64_t resourceEpoch = 0;
+    std::uint64_t processRss = unavailable;
+    std::uint64_t processRssTimestamp = unavailable;
+    bool hasResourceSnapshot = false;
     bool started = false;
     bool stopped = false;
     std::uint16_t port = 0;
@@ -532,4 +639,26 @@ extern "C" void DebugBridgeStop_nid_no_patch() noexcept {
 
 extern "C" void DebugBridgePublishFrame_nid_no_patch(const DebugBridgeFrame& frame) noexcept {
     if (auto* bridge = activeBridge.load(std::memory_order_acquire)) bridge->Publish(frame);
+}
+
+extern "C" void DebugBridgeAddShaderMetric_nid_no_patch(DebugBridgeShaderMetric metric, std::int64_t delta) noexcept {
+    const auto index = static_cast<std::size_t>(metric);
+    if (index < resourceCounters.shaders.size())
+        resourceCounters.shaders[index].fetch_add(static_cast<std::uint64_t>(delta), std::memory_order_relaxed);
+}
+
+extern "C" void DebugBridgePublishSampledCache_nid_no_patch(std::uint64_t bytes, std::uint64_t budgetBytes) noexcept {
+    resourceCounters.sampledBytes.store(bytes, std::memory_order_relaxed);
+    if (budgetBytes != 0) resourceCounters.sampledBudget.store(budgetBytes, std::memory_order_relaxed);
+}
+
+extern "C" void DebugBridgePublishStorageCache_nid_no_patch(std::uint64_t bytes, std::uint64_t budgetBytes) noexcept {
+    resourceCounters.storageBytes.store(bytes, std::memory_order_relaxed);
+    if (budgetBytes != 0) resourceCounters.storageBudget.store(budgetBytes, std::memory_order_relaxed);
+}
+
+extern "C" void DebugBridgePublishGpuHeap_nid_no_patch(std::uint64_t usage, std::uint64_t budget, std::uint64_t timestampUs) noexcept {
+    resourceCounters.heapUsage.store(usage, std::memory_order_relaxed);
+    resourceCounters.heapBudget.store(budget, std::memory_order_relaxed);
+    resourceCounters.heapTimestamp.store(timestampUs, std::memory_order_release);
 }

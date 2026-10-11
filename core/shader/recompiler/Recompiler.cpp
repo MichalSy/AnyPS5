@@ -1,4 +1,5 @@
 #include "Recompiler.hpp"
+#include "prx/libkernel/System/include/DebugBridge.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -150,6 +151,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
 }
 
 IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation) {
+    DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::TranslationsActive, DebugBridgeShaderMetric::TranslationsCompleted);
     ShaderPreparationContext local;
     const auto frontend = (preparation != nullptr ? *preparation : local).AcquireFrontend(request);
     const auto stageKind = toShaderStageKind(request.shader.stage);
@@ -250,6 +252,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     dumpIr("resources");
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
 
+    activity.Complete();
     return program;
 }
 
@@ -353,6 +356,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                 if (profile) std::fprintf(stderr, "[recompile] source key collision %llu: %zu entries share a key (%zu code words)\n", static_cast<unsigned long long>(collisions), bucket.size() + 1, request.shader.code.size());
             }
             bucket.push_back(source);
+            DebugBridgeShaderCounter(DebugBridgeShaderMetric::SourceCodeBytes, static_cast<std::int64_t>(source->code.size() * sizeof(std::uint32_t)));
         }
     }
     {
@@ -382,6 +386,7 @@ std::uint64_t nextVariantId() {
 }
 
 CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, std::exception_ptr* emissionFailure = nullptr) try {
+    DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::TranslationsActive, DebugBridgeShaderMetric::TranslationsCompleted);
     const auto inputInfo = RequestInputInfo(request);
     constexpr DeadCodeEliminator deadCodeEliminator;
     constexpr ResourceMaterializer resourceMaterializer;
@@ -467,7 +472,9 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     }
 #endif
 
-    return {request.layout, std::move(program).TakeCompiledInfo(), std::move(static_cast<CompiledBindingLayout&>(bindings)), std::move(result)};
+    auto variant = CompiledVariant{request.layout, std::move(program).TakeCompiledInfo(), std::move(static_cast<CompiledBindingLayout&>(bindings)), std::move(result)};
+    activity.Complete();
+    return variant;
 } catch (const std::bad_alloc&) {
     throw;
 } catch (...) {
@@ -845,6 +852,8 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     }
     source.program.reset();
     source.variants.push_back(variant);
+    DebugBridgeShaderCounter(DebugBridgeShaderMetric::CachedVariantsCount, 1);
+    DebugBridgeShaderCounter(DebugBridgeShaderMetric::VariantSpirvBytes, static_cast<std::int64_t>(variant->artifact.spirv.size() * sizeof(std::uint32_t)));
     return variant;
 }
 

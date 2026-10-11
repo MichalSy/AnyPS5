@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libkernel/System/include/DebugBridge.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
 #include <condition_variable>
@@ -65,8 +66,12 @@ void runJobs(LibraryStore& store) {
         store.work.wait(lock, [&] { return !store.jobs.empty(); });
         auto [device, job] = std::move(store.jobs.front());
         store.jobs.pop_front();
+        DebugBridgeShaderCounter(DebugBridgeShaderMetric::PipelineOptimizationQueuePending, -1);
         lock.unlock();
-        job();
+        {
+            DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineOptimizationsActive);
+            job();
+        }
         lock.lock();
         if (--store.pending[device] == 0) store.idle.notify_all();
     }
@@ -79,6 +84,7 @@ void enqueue(LibraryStore& store, VkDevice device, std::function<void()> job) {
     }
     ++store.pending[device];
     store.jobs.emplace_back(device, std::move(job));
+    DebugBridgeShaderCounter(DebugBridgeShaderMetric::PipelineOptimizationQueuePending, 1);
     store.work.notify_one();
 }
 
@@ -181,7 +187,11 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             break;
         }
         VkPipeline handle = VK_NULL_HANDLE;
-        Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle), "vkCreateGraphicsPipelines library");
+        {
+            DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
+            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle), "vkCreateGraphicsPipelines library");
+            activity.Complete();
+        }
         cache.emplace(key, handle);
         if (optimize) {
             for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {
@@ -202,7 +212,11 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &linked};
     create.layout = info.layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline), "vkCreateGraphicsPipelines link");
+    {
+        DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
+        Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline), "vkCreateGraphicsPipelines link");
+        activity.Complete();
+    }
     ++device.counters.linked;
     if (optimize && optimized != nullptr) {
         auto slot = std::make_shared<OptimizedPipeline>();
@@ -221,7 +235,11 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             create.flags = VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
             create.layout = libraryLayout;
             VkPipeline result = VK_NULL_HANDLE;
-            if (createPipelines(slot->device, cache, 1, &create, nullptr, &result) != VK_SUCCESS) return;
+            {
+                DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
+                if (createPipelines(slot->device, cache, 1, &create, nullptr, &result) != VK_SUCCESS) return;
+                activity.Complete();
+            }
             slot->handle.store(result);
             if (slot->released.load()) {
                 if (const auto handle = slot->handle.exchange(VK_NULL_HANDLE)) slot->destroy(slot->device, handle, nullptr);

@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/LogMacros.hpp"
+#include "prx/libkernel/System/include/DebugBridge.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -992,11 +993,13 @@ public:
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
                 tasks.push_back(std::move(task));
+                DebugBridgeShaderCounter(DebugBridgeShaderMetric::PreparationQueuePending, 1);
                 lock.unlock();
                 ready.notify_one();
                 return;
             }
         }
+        DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PreparationActive);
         task();
     }
 
@@ -1031,10 +1034,14 @@ private:
                 pool.ready.wait(lock, [&] { return !pool.tasks.empty(); });
                 task = std::move(pool.tasks.front());
                 pool.tasks.pop_front();
+                DebugBridgeShaderCounter(DebugBridgeShaderMetric::PreparationQueuePending, -1);
                 ++pool.running;
             }
-            task();
-            task = nullptr;
+            {
+                DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PreparationActive);
+                task();
+                task = nullptr;
+            }
             {
                 std::lock_guard lock(pool.mutex);
                 --pool.running;

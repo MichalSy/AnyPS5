@@ -1,5 +1,6 @@
 #include "tests/DebugBridgeTestPeer.hpp"
 #include <iostream>
+#include <thread>
 
 static std::string StringField(const std::string& text, const char* name) {
     const std::string key = std::string("\"") + name + "\":\"";
@@ -48,7 +49,7 @@ static std::string CheckBridgePacket(BridgePacket& packet, std::uint64_t& sequen
     Require(type == "hello" || type == "heartbeat" || type == "goodbye", "Connection bridge emitted an unexpected event");
     if (type == "hello") {
         Require(StringField(text, "game_id") == "PPSA90000", "Wrong bridge game identity");
-        Require(text.find("\"capabilities\":[\"set_monitoring\"]") != std::string::npos, "Bridge did not advertise monitoring");
+        Require(text.find("\"capabilities\":[\"set_monitoring\",\"resource_status\"]") != std::string::npos, "Bridge did not advertise monitoring and resources");
         Require(text.find("\"monitoring\":{\"enabled\":false,\"epoch\":0}") != std::string::npos, "Monitoring was enabled by default");
     }
     return type;
@@ -97,7 +98,8 @@ static void CheckMonitoring(BridgeCollector& collector) {
     auto root = parseJsonDocument(hello.text);
     Require(Member(root, "type", JsonType::String).stringValue == "hello", "First monitoring packet is not hello");
     const auto& capabilities = Member(root, "capabilities", JsonType::Array).arrayValue;
-    Require(capabilities.size() == 1 && capabilities[0].stringValue == "set_monitoring", "Wrong monitoring capabilities");
+    Require(capabilities.size() == 2 && capabilities[0].stringValue == "set_monitoring"
+        && capabilities[1].stringValue == "resource_status", "Wrong monitoring capabilities");
     CheckMonitoringState(Member(root, "monitoring", JsonType::Object), false, 0);
     DebugBridgePublishFrame_nid_no_patch({1, 1, 1, 1, 1000});
     NoEvents(collector, std::chrono::milliseconds(120));
@@ -195,11 +197,117 @@ static void CheckMonitoring(BridgeCollector& collector) {
     DebugBridgeStop_nid_no_patch();
 }
 
+static JsonValue ResourceData(BridgeCollector& collector, std::chrono::seconds timeout = std::chrono::seconds(3)) {
+    auto root = Await(collector, "event", {}, "resource_status", timeout);
+    Require(findObjectMember(root, "frame") == nullptr, "Resource snapshot invented a frame correlation");
+    return Member(root, "data", JsonType::Object);
+}
+
+static void CheckResources(BridgeCollector& collector) {
+    using Clock = std::chrono::steady_clock;
+    DebugBridgePublishSampledCache_nid_no_patch(0, 0);
+    DebugBridgeShaderCounter(DebugBridgeShaderMetric::SourceCodeBytes, 256);
+    DebugBridgeShaderCounter(DebugBridgeShaderMetric::CachedVariantsCount, 1);
+    DebugBridgeShaderCounter(DebugBridgeShaderMetric::VariantSpirvBytes, 512);
+    {
+        DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::TranslationsActive, DebugBridgeShaderMetric::TranslationsCompleted);
+        activity.Complete();
+    }
+    try {
+        DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::TranslationsActive, DebugBridgeShaderMetric::TranslationsCompleted);
+        throw std::runtime_error("translation failure");
+    } catch (const std::runtime_error&) {}
+    DebugBridgeStart_nid_no_patch();
+    BridgePacket hello;
+    Require(collector.Receive(std::chrono::milliseconds(1000), hello), "Resource bridge did not start");
+    NoEvents(collector, std::chrono::milliseconds(120));
+    collector.Send(hello.source, Command(1, "resource-enable", R"({"enabled":true})"));
+    Await(collector, "command_completed", "resource-enable");
+    auto data = ResourceData(collector);
+    Require(Unsigned(data, "monitoring_epoch") == 1, "Wrong resource monitoring epoch");
+    auto shaders = Member(data, "shaders", JsonType::Object);
+    Require(Unsigned(shaders, "translations_active") == 0 && Unsigned(shaders, "translations_completed") == 1,
+        "Failure path leaked activity or counted unsuccessful completion");
+    Require(Unsigned(shaders, "source_code_bytes") == 256 && Unsigned(shaders, "cached_variants_count") == 1
+        && Unsigned(shaders, "variant_spirv_bytes") == 512, "Pre-start or disabled shader bookkeeping was lost");
+    auto memory = Member(data, "memory", JsonType::Object);
+    Require(Unsigned(memory, "sampled_cache_bytes") == 0, "An empty observed cache became unavailable");
+    Member(memory, "sampled_cache_budget_bytes", JsonType::Null);
+    for (const auto* name : {"storage_cache_bytes", "storage_cache_budget_bytes", "gpu_heap_usage_bytes",
+        "gpu_heap_budget_bytes", "gpu_heap_timestamp_us"}) Member(memory, name, JsonType::Null);
+#ifdef __linux__
+    Require(Unsigned(memory, "process_rss_bytes") > 0 && Unsigned(memory, "process_rss_timestamp_us") <= Unsigned(data, "timestamp_us"),
+        "Process RSS is missing or has a future source timestamp");
+#else
+    Member(memory, "process_rss_bytes", JsonType::Null);
+    Member(memory, "process_rss_timestamp_us", JsonType::Null);
+#endif
+    DebugBridgePublishSampledCache_nid_no_patch(128, 1024);
+    DebugBridgePublishSampledCache_nid_no_patch(130, 0);
+    DebugBridgePublishStorageCache_nid_no_patch(64, 256);
+    DebugBridgePublishStorageCache_nid_no_patch(96, 0);
+    const auto heapTimestamp = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count());
+    DebugBridgePublishGpuHeap_nid_no_patch(700, 900, heapTimestamp);
+    const auto burstAt = Clock::now();
+    std::array<std::thread, 4> producers;
+    for (auto& producer : producers) producer = std::thread([] {
+        for (unsigned index = 0; index < 25000; ++index) {
+            DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::TranslationsActive, DebugBridgeShaderMetric::TranslationsCompleted);
+            DebugBridgeShaderCounter(DebugBridgeShaderMetric::DiskCacheHits, 1);
+            activity.Complete();
+        }
+    });
+    for (auto& producer : producers) producer.join();
+    Require(Clock::now() - burstAt < std::chrono::seconds(1), "Resource producers blocked on delivery");
+    unsigned packets = 0;
+    std::uint64_t lastTimestamp = Unsigned(data, "timestamp_us");
+    const auto until = Clock::now() + std::chrono::milliseconds(1300);
+    BridgePacket packet;
+    while (Clock::now() < until) {
+        if (!collector.Receive(std::chrono::milliseconds(30), packet)) continue;
+        auto root = parseJsonDocument(packet.text);
+        if (Member(root, "type", JsonType::String).stringValue != "event") continue;
+        Require(Member(root, "name", JsonType::String).stringValue == "resource_status", "Resource producer invented frame events");
+        data = Member(root, "data", JsonType::Object);
+        const auto timestamp = Unsigned(data, "timestamp_us");
+        Require(timestamp > lastTimestamp && timestamp - lastTimestamp >= 240000, "Resource changes were not coalesced to four updates per second");
+        lastTimestamp = timestamp;
+        ++packets;
+    }
+    Require(packets > 0 && packets <= 6, "Resource burst exceeded its publication bound");
+    shaders = Member(data, "shaders", JsonType::Object);
+    Require(Unsigned(shaders, "translations_active") == 0 && Unsigned(shaders, "translations_completed") == 100001
+        && Unsigned(shaders, "disk_cache_hits") == 100000, "Concurrent short activity was lost or retained as active");
+    memory = Member(data, "memory", JsonType::Object);
+    Require(Unsigned(memory, "sampled_cache_bytes") == 130 && Unsigned(memory, "sampled_cache_budget_bytes") == 1024
+        && Unsigned(memory, "storage_cache_bytes") == 96 && Unsigned(memory, "storage_cache_budget_bytes") == 256,
+        "Memory cache update reset a known budget");
+    Require(Unsigned(memory, "gpu_heap_usage_bytes") == 700 && Unsigned(memory, "gpu_heap_budget_bytes") == 900
+        && Unsigned(memory, "gpu_heap_timestamp_us") == heapTimestamp && heapTimestamp <= Unsigned(data, "timestamp_us"),
+        "GPU tuple is incomplete or cache updates refreshed its source timestamp");
+    data = ResourceData(collector, std::chrono::seconds(6));
+    Require(Unsigned(data, "timestamp_us") > lastTimestamp && Unsigned(data, "monitoring_epoch") == 1,
+        "Enabled idle resources were not periodically refreshed without flips");
+    collector.Send(hello.source, Command(2, "resource-disable", R"({"enabled":false})"));
+    Await(collector, "command_completed", "resource-disable");
+    DebugBridgePublishStorageCache_nid_no_patch(32, 0);
+    DebugBridgeShaderCounter(DebugBridgeShaderMetric::DiskCacheMisses, 3);
+    NoEvents(collector, std::chrono::milliseconds(300));
+    collector.Send(hello.source, Command(3, "resource-reenable", R"({"enabled":true})"));
+    Await(collector, "command_completed", "resource-reenable");
+    data = ResourceData(collector);
+    Require(Unsigned(data, "monitoring_epoch") == 3
+        && Unsigned(Member(data, "shaders", JsonType::Object), "disk_cache_misses") == 3
+        && Unsigned(Member(data, "memory", JsonType::Object), "storage_cache_bytes") == 32,
+        "Reactivation did not publish disabled-period changes immediately");
+    DebugBridgeStop_nid_no_patch();
+}
+
 int main(int argc, char** argv) {
     try {
         const std::string_view mode = argc > 1 ? argv[1] : "active";
         Require(argc <= 2, "Expected one bridge test mode");
-        Require(mode == "monitoring" || mode == "active" || mode == "shutdown" || mode == "disabled" || mode == "invalid-port" || mode == "invalid-host" || mode == "absent",
+        Require(mode == "resources" || mode == "monitoring" || mode == "active" || mode == "shutdown" || mode == "disabled" || mode == "invalid-port" || mode == "invalid-host" || mode == "absent",
             "Unknown bridge test mode");
         BridgeCollector collector;
         for (const auto* name : {"APS5_DEBUG_BRIDGE", "FRAMERIFT_BRIDGE_HOST", "FRAMERIFT_BRIDGE_PORT",
@@ -211,7 +319,8 @@ int main(int argc, char** argv) {
             SetEnvironment("FRAMERIFT_GAME_ID", "PPSA90000");
         }
         if (mode == "disabled") SetEnvironment("APS5_DEBUG_BRIDGE", "0");
-        if (mode == "monitoring") CheckMonitoring(collector);
+        if (mode == "resources") CheckResources(collector);
+        else if (mode == "monitoring") CheckMonitoring(collector);
         else if (mode == "active" || mode == "shutdown") CheckActive(collector, mode == "shutdown");
         else {
             DebugBridgeStart_nid_no_patch();

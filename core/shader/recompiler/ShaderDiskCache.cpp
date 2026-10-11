@@ -1,4 +1,5 @@
 #include "ShaderDiskCache.hpp"
+#include "prx/libkernel/System/include/DebugBridge.hpp"
 #include "CacheKey.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "ThreadOwned.hpp"
@@ -717,19 +718,23 @@ public:
         bool loaded = false;
         if (!ReadWholeFile(directory / name, file)) {
             misses.fetch_add(1, std::memory_order_relaxed);
+            DebugBridgeShaderCounter(DebugBridgeShaderMetric::DiskCacheMisses, 1);
         } else {
             switch (DecodeEntry(file, key, variant)) {
                 case LoadStatus::Loaded:
                     hits.fetch_add(1, std::memory_order_relaxed);
+                    DebugBridgeShaderCounter(DebugBridgeShaderMetric::DiskCacheHits, 1);
                     bytesRead.fetch_add(file.size(), std::memory_order_relaxed);
                     loaded = true;
                     break;
                 case LoadStatus::Absent:
                 case LoadStatus::KeyMismatch:
                     misses.fetch_add(1, std::memory_order_relaxed);
+                    DebugBridgeShaderCounter(DebugBridgeShaderMetric::DiskCacheMisses, 1);
                     break;
                 case LoadStatus::Rejected: {
                     const auto failures = loadFailures.fetch_add(1, std::memory_order_relaxed);
+                    DebugBridgeShaderCounter(DebugBridgeShaderMetric::DiskCacheLoadFailures, 1);
                     if (failures < 8) std::fprintf(stderr, "[shader-disk-cache] rejected %s (%zu bytes): truncated, corrupt or another format; recompiling\n", name.c_str(), file.size());
                     break;
                 }
@@ -799,9 +804,11 @@ private:
         const auto file = EncodeEntry(job.key, *job.variant);
         if (WriteFileAtomically(directory / EntryName(job.key), file)) {
             writes.fetch_add(1, std::memory_order_relaxed);
+            DebugBridgeShaderCounter(DebugBridgeShaderMetric::DiskCacheWrites, 1);
             bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
         } else {
             const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
+            DebugBridgeShaderCounter(DebugBridgeShaderMetric::DiskCacheWriteFailures, 1);
             if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (directory / EntryName(job.key)).string().c_str());
         }
     }

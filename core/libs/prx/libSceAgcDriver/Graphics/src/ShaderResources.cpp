@@ -33,6 +33,9 @@
 #include <unordered_set>
 #include <utility>
 #include "prx/libc/include/GuestAllocations.hpp"
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+#include "prx/libkernel/System/include/DebugBridge.hpp"
+#endif
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -196,6 +199,9 @@ void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.index.erase(it->key);
     cache.entries.erase(it);
     ++cache.erasures;
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+    DebugBridgePublishSampledCache_nid_no_patch(cache.bytes, 0);
+#endif
 }
 
 void dropUncachedViews(TextureCache& cache) {
@@ -488,8 +494,19 @@ std::uint64_t storageBudget(const Context& context) {
 }
 
 std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
-    if (const auto forced = forcedCacheBudget(); forced != 0) return forced;
-    if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudget(context.memory);
+    if (const auto forced = forcedCacheBudget(); forced != 0) {
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+        DebugBridgePublishSampledCache_nid_no_patch(cache.bytes, forced);
+#endif
+        return forced;
+    }
+    if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) {
+        const auto budget = TextureCacheBudget(context.memory);
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+        DebugBridgePublishSampledCache_nid_no_patch(cache.bytes, budget);
+#endif
+        return budget;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (cache.budgetDevice == context.physical && now - cache.budgetRead < std::chrono::seconds(1)) return cache.budget;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
@@ -499,6 +516,13 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
     const auto sampled = SampledTextureMemory();
     const auto storage = storageCacheBytes();
     const auto budget = SampledTextureBudget(context.memory, &reported, sampled + storage);
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+    if (const auto heap = largestDeviceLocalHeap(context.memory); heap && reported.heapBudget[*heap] != 0) {
+        DebugBridgePublishGpuHeap_nid_no_patch(reported.heapUsage[*heap], reported.heapBudget[*heap],
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count()));
+    }
+    DebugBridgePublishSampledCache_nid_no_patch(cache.bytes, budget);
+#endif
     const bool fresh = cache.budgetDevice != context.physical;
     if (const auto heap = largestDeviceLocalHeap(context.memory); heap && (fresh || SampledBudgetReportDue(cache.reportedBudget, budget, now - cache.reportedAt))) {
         char was[48] = "";
@@ -718,6 +742,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return texture;
     }
     cache.bytes += entry.accounted;
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+    DebugBridgePublishSampledCache_nid_no_patch(cache.bytes, budget);
+#endif
     entry.present = Recorder::Presents();
     ++cache.counts.inserted;
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
@@ -800,6 +827,9 @@ void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::i
     cache.index.erase(it->key);
     cache.byImage.erase(it->texture.get());
     cache.entries.erase(it);
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+    DebugBridgePublishStorageCache_nid_no_patch(cache.bytes.load(std::memory_order_relaxed), 0);
+#endif
 }
 
 // Storage images are shared by every descriptor of one surface (address, extent, layers, format, tile
@@ -900,6 +930,9 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
     const auto budget = storageBudget(context);
     while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) evictStorage(cache, std::prev(cache.entries.end()));
     cache.bytes += entry.accounted;
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+    DebugBridgePublishStorageCache_nid_no_patch(cache.bytes.load(std::memory_order_relaxed), budget);
+#endif
     auto texture = entry.texture;
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();

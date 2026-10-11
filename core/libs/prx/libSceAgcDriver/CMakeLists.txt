@@ -272,6 +272,11 @@ add_shader_recompiler(shader_recompiler_agc_driver libc
         GUARD_SOURCES
         ${agcShaderCacheGuardSources}
 )
+if(ANYPS5_ENABLE_DEBUG_BRIDGE)
+    target_compile_definitions(libSceAgcDriver PRIVATE ANYPS5_ENABLE_DEBUG_BRIDGE=1)
+    target_compile_definitions(shader_recompiler_agc_driver PUBLIC ANYPS5_ENABLE_DEBUG_BRIDGE=1)
+    target_link_libraries(shader_recompiler_agc_driver PRIVATE libkernel)
+endif()
 
 target_link_libraries(libSceAgcDriver PRIVATE
         shader_recompiler_agc_driver
@@ -622,6 +627,20 @@ target_include_directories(agc_shader_disk_cache_tests PRIVATE ${LIBS_INCLUDE_DI
 target_link_libraries(agc_shader_disk_cache_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_shader_disk_cache_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_disk_cache_tests)
+
+if(ANYPS5_ENABLE_DEBUG_BRIDGE AND BUILD_TESTING)
+    add_test_executable(agc_bridge_resource_tests tests/BridgeResources.cpp)
+    target_include_directories(agc_bridge_resource_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_bridge_resource_tests PRIVATE shader_recompiler_agc_driver libkernel libc)
+    configure_windows_unwind(agc_bridge_resource_tests)
+    add_test(NAME agc_bridge_resources COMMAND agc_bridge_resource_tests)
+    set_tests_properties(agc_bridge_resources PROPERTIES TIMEOUT 15)
+    if(WIN32)
+        target_link_libraries(agc_bridge_resource_tests PRIVATE ws2_32)
+        set_tests_properties(agc_bridge_resources PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+endif()
 
 add_test_executable(agc_specialized_disk_cache_tests EXCLUDE_FROM_ALL tests/SpecializedDiskCache.cpp)
 target_include_directories(agc_specialized_disk_cache_tests PRIVATE ${LIBS_INCLUDE_DIR})

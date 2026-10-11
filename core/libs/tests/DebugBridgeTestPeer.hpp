@@ -149,14 +149,16 @@ static std::uint64_t Unsigned(const JsonValue& object, const char* name) {
     return number;
 }
 
-static JsonValue Await(BridgeCollector& collector, const char* type, const std::string& commandId = {}) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+static JsonValue Await(BridgeCollector& collector, const char* type, const std::string& commandId = {},
+    const std::string& eventName = "frame_timing", std::chrono::seconds timeout = std::chrono::seconds(3)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     BridgePacket packet;
     while (std::chrono::steady_clock::now() < deadline) {
         if (!collector.Receive(std::chrono::milliseconds(100), packet)) continue;
         auto root = parseJsonDocument(packet.text);
         if (Member(root, "type", JsonType::String).stringValue != type) continue;
         if (!commandId.empty() && Member(root, "command_id", JsonType::String).stringValue != commandId) continue;
+        if (std::string_view(type) == "event" && Member(root, "name", JsonType::String).stringValue != eventName) continue;
         return root;
     }
     throw std::runtime_error(std::string("Missing bridge packet: ") + type);

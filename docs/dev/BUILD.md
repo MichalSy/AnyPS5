@@ -90,7 +90,7 @@ ctest --test-dir build/write-watch --output-on-failure
 
 With `CMAKE_OSX_ARCHITECTURES=x86_64` Apple silicon runs the tests through Rosetta, which is how relinked titles run; without it they run natively. The full `BUILD_TESTING` build on macOS also registers them.
 
-## FrameRift connection
+## FrameRift debug bridge
 
 Build with `ANYPS5_ENABLE_DEBUG_BRIDGE=ON` to include the connection worker in
 `libkernel.prx` and start it when the video output driver initializes. Rebuild the
@@ -109,8 +109,25 @@ It never waits for FrameRift. Normal runtime shutdown sends a best-effort
 `goodbye`; crashes and forced termination are detected by the receiver's timeout.
 An unavailable receiver does not stop the game or change existing logging.
 
-This version advertises an empty capability list. It only establishes connection
-state; it provides no frame measurements, input commands, screenshots or game pause.
+The bridge advertises `set_monitoring` and `resource_status`. Monitoring starts
+off; the `set_monitoring` command accepts `{"enabled":true}` or `false`, acknowledges
+receipt and reports completion with enabled state and monitoring epoch. Main-output
+flip samples use a bounded nonblocking producer queue; saturation drops telemetry.
+Shader and resource counters are atomic and remain available when monitoring is
+off, so activation includes the current process caches. Bridge-disabled builds omit
+these hooks.
+
+`resource_status` independently reports preparation/optimization queues, active
+and completed translation/pipeline operations, retained shader variants and payload
+bytes, disk-cache counters, texture-cache accounting and the existing Vulkan heap
+budget sample. The worker coalesces changes to at most four resource packets per
+second and refreshes every five seconds. Linux process RSS is sampled on that worker
+at most once per second; it is unavailable on other platforms in this increment.
+GPU source age is separate from packet age. Cache accounting, CPU shader payload,
+process RSS and the driver heap estimate have different scopes and are not additive.
+The [FrameRift protocol](https://github.com/MichalSy/FrameRift/blob/main/docs/debug-bridge.md#shader-and-memory-resources)
+defines their units and nullable fields. Input commands, screenshots and game pause
+remain unavailable.
 
 ## Pipeline statistics
 
