@@ -20,6 +20,9 @@
 #if APS5_ENABLE_TIMING_LOG
 #include "prx/libSceVideoOut/include/FrameTimingLog.hpp"
 #endif
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+#include "prx/libkernel/System/include/DebugBridge.hpp"
+#endif
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -270,6 +273,9 @@ VideoOutDriver::VideoOutDriver() {
         attached.get();
         vblankThread = std::jthread([this](std::stop_token token) { vblankLoop(token); });
         LibcRegisterShutdown_nid_postfix([] { VideoOutDriver::Get().Shutdown(); });
+#ifdef ANYPS5_ENABLE_DEBUG_BRIDGE
+        DebugBridgeStart_nid_no_patch();
+#endif
     } catch (...) {
         if (vblankThread.joinable()) {
             vblankThread.request_stop();
