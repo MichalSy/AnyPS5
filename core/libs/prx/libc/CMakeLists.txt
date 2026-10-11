@@ -15,6 +15,8 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Random.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Time.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FileAndHeap.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/FileStream.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestFileDescriptors.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StdioExtras.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StandardStreams.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestAllocations.cpp
@@ -314,7 +316,7 @@ if(BUILD_TESTING)
     endif()
     add_test_executable(guest_standard_stream_tests ${LIBS_INCLUDE_DIR}/tests/GuestStandardStreams.cpp)
     target_include_directories(guest_standard_stream_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(guest_standard_stream_tests PRIVATE libc)
+    target_link_libraries(guest_standard_stream_tests PRIVATE libkernel libc)
     configure_windows_unwind(guest_standard_stream_tests)
     add_test(NAME guest_standard_streams COMMAND guest_standard_stream_tests)
     if(WIN32)

@@ -216,12 +216,8 @@ int main() {
     Require(sceKernelUtimes_nid_postfix(sized.string().c_str(), nullptr) == 0);
     std::FILE* native = std::fopen(sized.string().c_str(), "r+b");
     Require(native != nullptr);
-#ifdef _WIN32
-    const int descriptor = _fileno(native);
-#else
-    const int descriptor = ::fileno(native);
-#endif
-    Require(descriptor >= 0 && sceKernelFsync(descriptor) == 0);
+    const int descriptor = sceKernelOpen(sized.string().c_str(), 2, 0);
+    Require(descriptor >= 3 && sceKernelFsync(descriptor) == 0);
     Require(fdatasync_nid_postfix(descriptor) == 0);
     Require(sceKernelFdatasync(descriptor) == 0);
     const auto ownerWrite = [&] {
@@ -241,6 +237,7 @@ int main() {
     Require(futimes_nid_postfix(descriptor, overflow) == -1 && *__error_nid_postfix() == 22);
     const KernelTimeval negative[2]{{0, -1}, {0, 0}};
     Require(futimes_nid_postfix(descriptor, negative) == -1 && *__error_nid_postfix() == 22);
+    Require(sceKernelClose(descriptor) == 0);
     Require(std::fclose(native) == 0);
     Require(std::filesystem::file_size(sized) == 3);
     Require(sceKernelFchmod(descriptor, 0600) == static_cast<int>(0x80020009u));

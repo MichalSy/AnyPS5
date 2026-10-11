@@ -37,8 +37,8 @@ static void ExpectException(TAction action) {
 
 int main(int argc, char** argv) {
     Require(argc == 2);
-    Require(_Stdout_nid_postfix.GetHandle() == stdout);
-    Require(_Stderr_nid_postfix.GetHandle() == stderr);
+    Require(_Stdout_nid_postfix.GetHandle() != nullptr && _Stdout_nid_postfix.Descriptor() == 1);
+    Require(_Stderr_nid_postfix.GetHandle() != nullptr && _Stderr_nid_postfix.Descriptor() == 2);
     Require(fputs_nid_postfix("stdout object works\n", &_Stdout_nid_postfix) >= 0);
     Require(fputs_nid_postfix("stderr object works\n", &_Stderr_nid_postfix) >= 0);
     Require(fflush_nid_postfix(nullptr) == 0);
@@ -56,17 +56,21 @@ int main(int argc, char** argv) {
     Require(fread_nid_postfix(buffer.data(), 1, buffer.size(), stream) == buffer.size());
     Require(std::strcmp(buffer.data(), payload) == 0);
     Require(fread_nid_postfix(buffer.data(), 1, buffer.size(), stream) == 0);
-    ExpectException([&] { fputs_nid_postfix(nullptr, stream); });
+    errno = 0;
+    Require(fputs_nid_postfix(nullptr, stream) == EOF && errno == EINVAL);
     ExpectException([&] { fwrite_nid_postfix(nullptr, 1, sizeof(payload), stream); });
     errno = 0;
     Require(fseek_nid_postfix(stream, 0, -1) == -1);
     Require(errno == EINVAL);
     Require(fclose_nid_postfix(stream) == 0);
-    ExpectException([] { fputs_nid_postfix("invalid stream", nullptr); });
-    ExpectException([] { fopen_nid_postfix(nullptr, "r"); });
+    errno = 0;
+    Require(fputs_nid_postfix("invalid stream", nullptr) == EOF && errno == EINVAL);
+    errno = 0;
+    Require(fopen_nid_postfix(nullptr, "r") == nullptr && errno == EINVAL);
     FileStream closed(std::tmpfile());
     closed.Close();
-    ExpectException([&] { fflush_nid_postfix(&closed); });
+    errno = 0;
+    Require(fflush_nid_postfix(&closed) == EOF && errno == EBADF);
     Require(std::remove(argv[1]) == 0);
     errno = 0;
     Require(fopen_nid_postfix(argv[1], "rb") == nullptr);

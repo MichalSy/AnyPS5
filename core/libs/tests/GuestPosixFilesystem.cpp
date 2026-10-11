@@ -1,4 +1,5 @@
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestFileDescriptors.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include <array>
 #include <cstdio>
@@ -52,7 +53,7 @@ int main() {
     Require(std::filesystem::file_size(ResolvePath_nid_no_patch(pattern.c_str())) == 0);
 #ifndef _WIN32
     struct stat status{};
-    Require(::fstat(descriptor, &status) == 0 && (status.st_mode & 0777) == 0600);
+    Require(::stat(ResolvePath_nid_no_patch(pattern.c_str()).c_str(), &status) == 0 && (status.st_mode & 0777) == 0600);
 #endif
     const char payload[] = {'a', '\0', '\r', '\n', '\x1a', 'z'};
     Require(write_nid_postfix(descriptor, payload, sizeof(payload)) == sizeof(payload));
@@ -118,22 +119,35 @@ int main() {
 #ifdef _WIN32
     const int nullDevice = ::_open("NUL", _O_RDWR);
     Require(nullDevice >= 0);
-    Require(isatty_nid_postfix(nullDevice) == 0 && *__error_nid_postfix() == 25);
-    Require(::_close(nullDevice) == 0);
+    auto nullLease = GuestFiles::GuestFileAdoptOwned_nid_no_patch(nullDevice, 2);
+    Require(nullLease != nullptr);
+    const int guestNull = GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(nullLease);
+    Require(isatty_nid_postfix(guestNull) == 0 && *__error_nid_postfix() == 25);
+    Require(close_nid_postfix(guestNull) == 0);
+    nullLease.reset();
     const int console = ::_open("CONIN$", _O_RDONLY);
     if (console >= 0) {
+        auto consoleLease = GuestFiles::GuestFileAdoptOwned_nid_no_patch(console, 0);
+        Require(consoleLease != nullptr);
+        const int guestConsole = GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(consoleLease);
         *__error_nid_postfix() = 123;
-        Require(isatty_nid_postfix(console) == 1 && *__error_nid_postfix() == 123);
-        Require(::_close(console) == 0);
+        Require(isatty_nid_postfix(guestConsole) == 1 && *__error_nid_postfix() == 123);
+        Require(close_nid_postfix(guestConsole) == 0);
+        consoleLease.reset();
     }
 #else
     const int terminal = ::posix_openpt(O_RDWR | O_NOCTTY);
     Require(terminal >= 0 && ::grantpt(terminal) == 0 && ::unlockpt(terminal) == 0);
     const int slave = ::open(::ptsname(terminal), O_RDWR | O_NOCTTY);
     Require(slave >= 0);
+    auto slaveLease = GuestFiles::GuestFileAdoptOwned_nid_no_patch(slave, 2);
+    Require(slaveLease != nullptr);
+    const int guestSlave = GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(slaveLease);
     *__error_nid_postfix() = 123;
-    Require(isatty_nid_postfix(slave) == 1 && *__error_nid_postfix() == 123);
-    Require(::close(slave) == 0 && ::close(terminal) == 0);
+    Require(isatty_nid_postfix(guestSlave) == 1 && *__error_nid_postfix() == 123);
+    Require(close_nid_postfix(guestSlave) == 0);
+    slaveLease.reset();
+    Require(::close(terminal) == 0);
 #endif
     RemovePathAlias_nid_no_patch("/anyps5-posix-test");
     Require(std::filesystem::remove_all(root) > 0);

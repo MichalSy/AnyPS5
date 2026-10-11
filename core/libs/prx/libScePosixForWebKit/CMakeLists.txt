@@ -1,4 +1,7 @@
 add_library(libScePosixForWebKit SHARED EXCLUDE_FROM_ALL Export.cpp Resolver.cpp Filesystem.cpp)
+target_sources(libScePosixForWebKit PRIVATE DescriptorHooks.cpp)
+set_property(SOURCE Filesystem.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+    "isatty_nid_postfix=isatty_nid_postfix_native_nid_no_patch")
 target_include_directories(libScePosixForWebKit PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(libScePosixForWebKit PRIVATE libSceNet)
 if(WIN32)
