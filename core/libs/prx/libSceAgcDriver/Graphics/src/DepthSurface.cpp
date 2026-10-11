@@ -154,7 +154,7 @@ public:
     }
 
     bool AcceptsHtileFill() const {
-        return !retired && htileAddress != 0 && !htileStencil && target.address != 0 && target.samples == VK_SAMPLE_COUNT_1_BIT &&
+        return !retired && htileAddress != 0 && (!htileStencil || target.stencilAddress != 0) && target.address != 0 && target.samples == VK_SAMPLE_COUNT_1_BIT &&
             target.mipCount == 1u && target.mip == 0u && htileRegistry == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     }
 
@@ -163,26 +163,29 @@ public:
         if (htileAddress == 0 || footprint == 0 || bytes == 0 ||
             (address >= htileAddress ? address - htileAddress >= footprint : htileAddress - address >= bytes)) return nullptr;
         pendingClear = false;
-        if (!AcceptsHtileFill() || !HtileFillCovers(htileAddress, surfaceExtent(target), address, bytes) || (pattern & 0xfu) != 0) return nullptr;
+        if (!AcceptsHtileFill() || !HtileFillCovers(htileAddress, surfaceExtent(target), address, bytes)) return nullptr;
+        const auto aspects = HtileFillClears(pattern, htileStencil);
+        if (aspects == 0) return nullptr;
         const auto generation = GuestMemory::CollectWritesUncached(htileAddress, static_cast<std::size_t>(footprint));
-        if (generation == 0 || !GuestMemory::Watched(htileAddress, static_cast<std::size_t>(footprint))) return nullptr;
         auto consumed = TakeWrites();
         pendingGeneration = generation;
-        pendingClear = true;
+        pendingClear = aspects;
+        pendingTracked = generation != 0 && GuestMemory::Watched(htileAddress, static_cast<std::size_t>(footprint));
         return consumed;
     }
 
     void ApplyFastClear() {
-        if (!pendingClear) return;
-        pendingClear = false;
+        const auto aspects = std::exchange(pendingClear, 0u);
+        if (aspects == 0) return;
         const auto footprint = static_cast<std::size_t>(HtileSliceBytes(surfaceExtent(target)));
-        if (!AcceptsHtileFill() || GuestMemory::CollectWritesUncached(htileAddress, footprint) == 0 ||
-            GuestMemory::StoredOver(htileAddress, footprint, pendingGeneration)) return;
+        if (!AcceptsHtileFill()) return;
+        if (pendingTracked && (GuestMemory::CollectWritesUncached(htileAddress, footprint) == 0 ||
+            GuestMemory::StoredOver(htileAddress, footprint, pendingGeneration))) return;
         auto* recorder = recorderFor(context);
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        const VkImageSubresourceRange range{aspects, 0, 1, 0, 1};
         constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -422,7 +425,8 @@ public:
     bool retired = false;
     bool mappingInvalidated = false;
     bool guestPublished = false;
-    bool pendingClear = false;
+    VkImageAspectFlags pendingClear = 0;
+    bool pendingTracked = false;
     std::uint64_t htileAddress = 0;
     bool htileStencil = false;
     std::uint64_t htileRegistry = 0;
@@ -490,6 +494,11 @@ std::mutex& surfacesMutex() {
 std::vector<std::shared_ptr<DepthSurface>>& surfaces() {
     static auto* list = new std::vector<std::shared_ptr<DepthSurface>>();
     return *list;
+}
+
+std::map<std::uint64_t, std::uint64_t>& clearedHtiles() {
+    static auto* cleared = new std::map<std::uint64_t, std::uint64_t>();
+    return *cleared;
 }
 
 bool registeredSurface(const std::shared_ptr<DepthSurface>& surface) {
@@ -584,6 +593,13 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     reloadPublishedDepth(lock, bound);
     bound->Bind(target);
     bound->retired = false;
+    if (const auto cleared = clearedHtiles().find(target.htileAddress); cleared != clearedHtiles().end()) {
+        if (cleared->second == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && bound->AcceptsHtileFill()) {
+            bound->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            bound->pendingTracked = false;
+        }
+        clearedHtiles().erase(cleared);
+    }
     for (const auto& surface : surfaces()) {
         if (surface != bound && surface->context.device == context.device && surface->Overlaps(*bound)) surface->Retire();
     }
@@ -605,22 +621,26 @@ std::uint64_t HtileSliceBytes(VkExtent2D extent) {
 
 bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t address, std::size_t bytes) {
     const auto footprint = HtileSliceBytes(extent);
-    return htile != 0 && (htile & 0x7fffu) == 0 && footprint != 0 && address <= htile &&
+    return htile != 0 && footprint != 0 && address <= htile &&
         bytes <= std::numeric_limits<std::uint64_t>::max() - address && htile - address <= bytes && footprint <= bytes - (htile - address);
 }
 
 void NoteDepthMetadataFill(VkDevice device, std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
+    // An SDK clear remembered before the first bind must not outlive a later metadata fill.
+    std::erase_if(clearedHtiles(), [&](const auto& clear) {
+        return bytes != 0 && (address >= clear.first ? address - clear.first < 32768u : clear.first - address < bytes);
+    });
     std::size_t candidates = 0;
     for (const auto& surface : surfaces()) {
-        if (surface->context.device == device && surface->AcceptsHtileFill() && HtileFillCovers(surface->htileAddress, surfaceExtent(surface->target), address, bytes)) ++candidates;
+        if ((device == VK_NULL_HANDLE || surface->context.device == device) && surface->AcceptsHtileFill() && HtileFillCovers(surface->htileAddress, surfaceExtent(surface->target), address, bytes)) ++candidates;
     }
     DepthSurface* owner = nullptr;
     std::shared_ptr<StorageTexture> consumed;
     std::uint32_t consumedLayer = 0;
     for (const auto& surface : surfaces()) {
-        if (surface->context.device != device) continue;
+        if (device != VK_NULL_HANDLE && surface->context.device != device) continue;
         if (auto writer = surface->NoteHtileFill(address, bytes, candidates == 1u ? pattern : 0xffffffffu)) {
             owner = surface.get();
             consumed = std::move(writer);
@@ -638,11 +658,30 @@ std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::s
     return userData[2] | (static_cast<std::uint64_t>(userData[3]) << 32u);
 }
 
+void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
+    NoteDepthMetadataFill(VK_NULL_HANDLE, address, bytes, pattern);
+}
+
+VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile) {
+    VkImageAspectFlags cleared = (pattern & 0xfu) == 0 ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u;
+    if (stencilInHtile && ((pattern >> 8u) & 0x3u) == 0) cleared |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    return cleared;
+}
+
+std::uint64_t HtileMetadataBytes(VkExtent2D extent) {
+    return HtileSliceBytes(extent);
+}
+
 void NoteHtileDepthClear(std::uint64_t htileAddress) {
     std::lock_guard lock(surfacesMutex());
+    bool existing = false;
     for (const auto& surface : surfaces()) {
-        if (surface->htileAddress == htileAddress) surface->pendingClear = false;
+        if (surface->htileAddress != htileAddress || !surface->AcceptsHtileFill()) continue;
+        surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        surface->pendingTracked = false;
+        existing = true;
     }
+    if (!existing) clearedHtiles()[htileAddress] = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
 }
 
 void ClearDepthSurfaces(VkDevice device) {

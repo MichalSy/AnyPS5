@@ -40,8 +40,8 @@ struct Case {
             {0x2dcu, 0xaa00u}, {0x30eu, 0xffffffffu}, {0x30fu, 0xffffffffu}, {0x29bu, 3u}};
         vertex = std::make_shared<ShaderSnapshot>(ShaderSnapshot{VertexAddress, 0u, 2u, {Vertex.begin(), Vertex.end()}, {}});
         fragment = std::make_shared<ShaderSnapshot>(ShaderSnapshot{FragmentAddress, 0u, 1u, {Fragment.begin(), Fragment.end()}, {}});
-        registry.emplace(VertexAddress, vertex);
-        registry.emplace(FragmentAddress, fragment);
+        registry.emplace(VertexAddress, std::vector<std::shared_ptr<const ShaderSnapshot>>{vertex});
+        registry.emplace(FragmentAddress, std::vector<std::shared_ptr<const ShaderSnapshot>>{fragment});
     }
 
     void Check() const { RequireFixedColorResolvePrograms(queue, registry, draw); }
@@ -133,18 +133,37 @@ void RegisteredBounds() {
         { Case example; (front ? example.vertex : example.fragment)->code.pop_back(); Reject([&] { example.Check(); }, "truncated"); }
         { Case example; example.queue.shader[base + 1u] = 0x100u; Reject([&] { example.Check(); }, "reserved program"); }
         { Case example; example.queue.shader[base] = 0u; Reject([&] { example.Check(); }, "registered shader"); }
-        { Case example; example.registry[address].reset(); Reject([&] { example.Check(); }, "null registered"); }
+        { Case example; example.registry[address].back().reset(); Reject([&] { example.Check(); }, "null registered"); }
         { Case example; (front ? example.vertex : example.fragment)->codeAddress -= 4u;
           Reject([&] { example.Check(); }, "inconsistent registered"); }
         { Case example; auto snapshot = front ? example.vertex : example.fragment; example.registry.erase(address);
-          snapshot->codeAddress = address - 1u; example.registry.emplace(snapshot->codeAddress, snapshot);
+          snapshot->codeAddress = address - 1u; example.registry.emplace(snapshot->codeAddress, std::vector<std::shared_ptr<const ShaderSnapshot>>{snapshot});
           Reject([&] { example.Check(); }, "not dword aligned"); }
         { Case example; auto snapshot = front ? example.vertex : example.fragment; example.registry.erase(address);
           snapshot->codeAddress = address - 0x100u; snapshot->code.insert(snapshot->code.begin(), 64u, 0xffffffffu);
-          example.registry.emplace(snapshot->codeAddress, snapshot); example.Check(); }
+          example.registry.emplace(snapshot->codeAddress, std::vector<std::shared_ptr<const ShaderSnapshot>>{snapshot}); example.Check(); }
         { Case example; auto snapshot = front ? example.vertex : example.fragment; example.registry.erase(address);
-          snapshot->codeAddress = address - 0x100u; example.registry.emplace(snapshot->codeAddress, snapshot);
+          snapshot->codeAddress = address - 0x100u; example.registry.emplace(snapshot->codeAddress, std::vector<std::shared_ptr<const ShaderSnapshot>>{snapshot});
           Reject([&] { example.Check(); }, "outside registered"); }
+    }
+}
+
+void RegisteredAliases() {
+    for (const bool front : {false, true}) {
+        Case example;
+        const auto original = front ? example.vertex : example.fragment;
+        auto incompatible = std::make_shared<ShaderSnapshot>(*original);
+        incompatible->headerAddress = 0x300000u;
+        incompatible->type = front ? 1u : 2u;
+        incompatible->code[0] ^= 1u;
+        example.registry[original->codeAddress].push_back(incompatible);
+        example.Check();
+
+        auto latest = std::make_shared<ShaderSnapshot>(*original);
+        latest->headerAddress = 0x400000u;
+        latest->code[0] ^= 1u;
+        example.registry[original->codeAddress].push_back(latest);
+        Reject([&] { example.Check(); }, front ? "vertex instructions or coverage" : "fragment instructions or effects");
     }
 }
 
@@ -178,6 +197,7 @@ int main() {
         CoverageAndInputs();
         DrawAndRouting();
         RegisteredBounds();
+        RegisteredAliases();
         InstructionEffects();
         std::cout << "Fixed color resolve shader guard tests passed\n";
         return 0;

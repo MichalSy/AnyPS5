@@ -3280,6 +3280,10 @@ void Recorder::Sync() {
     activeSyncSite = previousSite;
 }
 
+void Recorder::FlushDeferredReleases() {
+    ReleaseDeferredKeeps();
+}
+
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
     if (bytes == 0) return;
     const auto end = address + bytes;

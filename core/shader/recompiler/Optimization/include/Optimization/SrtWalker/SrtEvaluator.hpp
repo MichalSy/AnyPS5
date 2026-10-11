@@ -174,6 +174,7 @@ public:
     bool Evaluate(TNode value, std::uint32_t& result);
     bool EvaluateWide(TNode value, std::uint64_t& result);
     void ReportInaccessibleReads(InaccessibleRead* sink) { _inaccessible = sink; }
+    void ReportNullRootReads(std::uint32_t* sink) { _nullRoots = sink; }
 
 private:
     static float Float32(std::uint64_t bits);
@@ -192,6 +193,7 @@ private:
     TNode _activeMask;
     bool _masked = false;
     InaccessibleRead* _inaccessible = nullptr;
+    std::uint32_t* _nullRoots = nullptr;
     EvaluatedValues _cache;
     std::vector<IrValue*> _visiting;
     DenseValues _dense;

@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <limits>
 #include <new>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -213,6 +215,17 @@ int APS5_VABI sysctl_nid_postfix(const int* name, unsigned nameLength, void* old
 int APS5_VABI sysctlbyname_nid_postfix(const char* name, void* oldValue, std::size_t* oldLength, const void* newValue, std::size_t newLength) {
     if (!name) return Failure(14);
     const std::string_view text(name);
+    if (text == "kern.rng_pseudo") {
+        if (newValue != nullptr) return Failure(1);
+        if (oldValue == nullptr || oldLength == nullptr)
+            throw std::runtime_error(std::string(__func__) + ": kern.rng_pseudo without an output buffer");
+        const int saved = *__error_nid_postfix();
+        static std::random_device device;
+        auto* bytes = static_cast<std::uint8_t*>(oldValue);
+        for (std::size_t i = 0; i < *oldLength; ++i) bytes[i] = static_cast<std::uint8_t>(device());
+        *__error_nid_postfix() = saved;
+        return 0;
+    }
     int key = 0;
     if (text == "hw.machine") key = 1;
     else if (text == "hw.machine_arch") key = 11;

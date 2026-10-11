@@ -12,6 +12,7 @@
 #include "SceTypes.hpp"
 
 #include <cerrno>
+#include <cstdarg>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -36,17 +37,15 @@ static std::int64_t NativeLseek(int fd, std::int64_t offset, int whence) {
     return result;
 }
 static int NativeRead(int fd, void* buf, std::size_t n) {
-    if (n > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-        errno = EINVAL;
-        return -1;
+    if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
+        throw std::runtime_error("sceKernelRead: nbytes exceeds platform limit");
     }
     char empty = 0;
     return ::_read(fd, buf == nullptr ? &empty : buf, static_cast<unsigned int>(n));
 }
 static int NativeWrite(int fd, const void* buf, std::size_t n) {
-    if (n > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-        errno = EINVAL;
-        return -1;
+    if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
+        throw std::runtime_error("sceKernelWrite: nbytes exceeds platform limit");
     }
     const char empty = 0;
     return ::_write(fd, buf == nullptr ? &empty : buf, static_cast<unsigned int>(n));
@@ -124,10 +123,13 @@ static int SceErrorFromGuest(int error) {
     return static_cast<int>(0x80020000u | static_cast<unsigned>(error));
 }
 extern "C" int* APS5_VABI __error_nid_postfix();
+extern "C" int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...);
+static constexpr int GuestSetFlags = 4;
 
 static int SceErrorFromErrno(int error) {
     return SceErrorFromGuest(GuestFiles::GuestFileNativeError_nid_no_patch(error));
 }
+
 
 extern "C" {
 
@@ -147,6 +149,13 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
         return lease ? GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(lease) : SceErrorFromGuest(errno);
     }
     auto native = ResolvePath_nid_no_patch(path);
+#ifdef _WIN32
+    if ((flags & (SCE_KERNEL_O_DIRECTORY | SCE_KERNEL_O_CREAT)) == SCE_KERNEL_O_DIRECTORY) {
+        std::error_code error;
+        const auto status = std::filesystem::status(native, error);
+        if (std::filesystem::exists(status) && !std::filesystem::is_directory(status)) return SceErrorFromErrno(ENOTDIR);
+    }
+#endif
     int fd = NativeOpen(native, nativeFlags, mode);
 #ifdef _WIN32
     if (fd < 0 && errno != ENOENT && (flags & SCE_KERNEL_O_ACCMODE) == SCE_KERNEL_O_RDONLY) {
@@ -249,9 +258,30 @@ int APS5_VABI sceKernelUnlink(const char* path) {
     return 0;
 }
 
-int APS5_VABI sceKernelFcntl() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceKernelFcntl(int d, int command, ...) {
+    if (d < GuestSockets::FirstDescriptor) {
+        const auto lease = GuestFiles::GuestFileAcquire_nid_no_patch(d);
+        if (!lease) return SCE_KERNEL_ERROR_EBADF;
+        throw std::runtime_error(std::string(__func__) + ": file descriptors are not implemented, fd=" + std::to_string(d));
+    }
+    int result;
+    if (command == GuestSetFlags) {
+#ifdef _WIN32
+        __builtin_sysv_va_list arguments;
+        __builtin_sysv_va_start(arguments, command);
+        const int flags = __builtin_va_arg(arguments, int);
+        __builtin_sysv_va_end(arguments);
+#else
+        std::va_list arguments;
+        va_start(arguments, command);
+        const int flags = va_arg(arguments, int);
+        va_end(arguments);
+#endif
+        result = fcntl_nid_postfix(d, command, flags);
+    } else {
+        result = fcntl_nid_postfix(d, command);
+    }
+    return result < 0 ? SceKernelError(*__error_nid_postfix()) : result;
 }
 
 }

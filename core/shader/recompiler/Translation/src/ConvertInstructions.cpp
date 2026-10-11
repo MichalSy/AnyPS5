@@ -52,15 +52,56 @@ void TranslationContext::vCvtF32Ubyte(const RdnaInstruction& inst, std::uint32_t
     writeOperand(inst.destination, &result.Value());
 }
 
+bool TranslationContext::directedF32Rounding() const {
+    return floatMode.has_value() && (floatMode->floatMode & 3u) != 0u;
+}
+
+IrF32 TranslationContext::convertMagnitudeToF32Directed(IrU32 magnitude, IrU32 signBits, std::uint32_t rounding, IrF32 native) {
+    const IrU32 msb(ir.Emit(IrOpcode::FindUMsb32, IrType::U32, {&magnitude.Value()}));
+    const IrU1 inexact(ir.UGreaterThan(msb.Value(), ir.Constant(23u)));
+    const IrU32 shift(ir.ISub(msb.Value(), ir.Constant(23u)));
+    const IrU32 top24(ir.ShiftRightLogical(magnitude.Value(), shift.Value()));
+    const IrU32 discarded(ir.BitwiseAnd(magnitude.Value(), ir.ISub(ir.ShiftLeftLogical(ir.Constant(1u), shift.Value()), ir.Constant(1u))));
+    const IrU1 positive(ir.IEqual(signBits.Value(), ir.Constant(0u)));
+    const IrU1 away(rounding == 1u ? positive : rounding == 2u ? IrU1(ir.LogicalNot(positive.Value())) : IrU1(ir.ConstantBool(false)));
+    const IrU1 increment(ir.LogicalAnd(away.Value(), ir.INotEqual(discarded.Value(), ir.Constant(0u))));
+    const IrU32 rounded(ir.IAdd(top24.Value(), ir.Select(increment.Value(), ir.Constant(1u), ir.Constant(0u))));
+    const IrU1 overflow(ir.Emit(IrOpcode::UGreaterThanEqual32, IrType::U1, {&rounded.Value(), &ir.Constant(0x1000000u)}));
+    const IrU32 finalMsb(ir.Select(overflow.Value(), ir.IAdd(msb.Value(), ir.Constant(1u)), msb.Value()));
+    const IrU32 finalTop(ir.Select(overflow.Value(), ir.Constant(0x800000u), rounded.Value()));
+    const IrU32 bits(ir.BitwiseOr(signBits.Value(), ir.BitwiseOr(ir.ShiftLeftLogical(ir.IAdd(finalMsb.Value(), ir.Constant(127u)), ir.Constant(23u)), ir.BitwiseAnd(finalTop.Value(), ir.Constant(0x7fffffu)))));
+    const IrF32 directed(ir.BitCastF32(bits.Value()));
+    const IrU1 useNative(ir.LogicalOr(ir.IEqual(magnitude.Value(), ir.Constant(0u)), ir.LogicalNot(inexact.Value())));
+    return selectF32(useNative, native, directed);
+}
+
+IrF32 TranslationContext::convertU32ToF32(IrU32 source) {
+    const IrF32 native(ir.Emit(IrOpcode::ConvertF32U32, IrType::F32, {&source.Value()}));
+    if (!directedF32Rounding()) {
+        return native;
+    }
+    return convertMagnitudeToF32Directed(source, IrU32(ir.Constant(0u)), floatMode->floatMode & 3u, native);
+}
+
+IrF32 TranslationContext::convertS32ToF32(IrU32 source) {
+    const IrF32 native(ir.Emit(IrOpcode::ConvertF32S32, IrType::F32, {&source.Value()}));
+    if (!directedF32Rounding()) {
+        return native;
+    }
+    const IrU32 signBits(ir.BitwiseAnd(source.Value(), ir.Constant(0x80000000u)));
+    const IrU32 magnitude(ir.Emit(IrOpcode::IAbs32, IrType::U32, {&source.Value()}));
+    return convertMagnitudeToF32Directed(magnitude, signBits, floatMode->floatMode & 3u, native);
+}
+
 void TranslationContext::vCvtF32U32(const RdnaInstruction& inst) {
     const IrU32 source = readU32(sourceAt(inst, 0u));
-    const IrF32 result(ir.Emit(IrOpcode::ConvertF32U32, IrType::F32, {&source.Value()}));
+    const IrF32 result = convertU32ToF32(source);
     writeOperand(inst.destination, &result.Value());
 }
 
 void TranslationContext::vCvtF32I32(const RdnaInstruction& inst) {
     const IrU32 source = readU32(sourceAt(inst, 0u));
-    const IrF32 result(ir.Emit(IrOpcode::ConvertF32S32, IrType::F32, {&source.Value()}));
+    const IrF32 result = convertS32ToF32(source);
     writeOperand(inst.destination, &result.Value());
 }
 
@@ -78,7 +119,7 @@ void TranslationContext::vCvtI32F32(const RdnaInstruction& inst) {
 
 void TranslationContext::vCvtF16F32(const RdnaInstruction& inst) {
     const IrF32 value(*readOperand(sourceAt(inst, 0u), IrType::F32));
-    writeF16(inst.destination, value, {&value.Value()});
+    writeF16Conversion(inst.destination, value, {&value.Value()});
 }
 
 void TranslationContext::vCvtF32F16(const RdnaInstruction& inst) {
@@ -90,7 +131,7 @@ void TranslationContext::vCvtF1616(const RdnaInstruction& inst, bool signedValue
     const IrU32 source = readU16AsU32(sourceAt(inst, 0u), signedValue);
     const IrOpcode opcode = signedValue ? IrOpcode::ConvertF32S32 : IrOpcode::ConvertF32U32;
     const IrF32 value(ir.Emit(opcode, IrType::F32, {&source.Value()}));
-    writeF16(inst.destination, value, {});
+    writeF16Conversion(inst.destination, value, {});
 }
 
 void TranslationContext::vCvt16F16(const RdnaInstruction& inst, bool signedValue) {

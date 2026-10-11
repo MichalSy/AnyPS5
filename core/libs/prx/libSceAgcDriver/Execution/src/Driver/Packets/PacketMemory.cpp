@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include <cstdlib>
@@ -133,6 +135,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                     drained = false;
                 }
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+                if (wroteOnGpu && opcode == 0x50 && Pm4::DmaSource(packet) == 2 && Pm4::DmaDestination(packet) != 1)
+                    Graphics::NoteDepthMetadataFill(store->address, bytes.size(), packet[2]);
             }
         }
         if (drained && opcode == 0x50) {
@@ -145,6 +149,12 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                     const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
                     if (outcome.path == 1 || outcome.path == 3) {
                         wroteOnGpu = true;
+                        drained = false;
+                    } else if (outcome.path == 2 && !Graphics::RegisteredReadableCovers(copy->destination, copy->bytes) && !localDevice->StoresPendingOver(copy->destination, copy->bytes)) {
+                        Graphics::StorageTexture::FlushPending(copy->source, copy->bytes, nullptr, "buffer copy source", Graphics::PublishScope::Whole);
+                        if (auto* recorder = Graphics::Recorder::Active()) recorder->SyncThrough(copy->source, copy->bytes);
+                        ++copiesToHostMemory;
+                        orderedAlready = true;
                         drained = false;
                     }
                 }
@@ -243,9 +253,11 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
         const auto address = store->address;
         std::vector<std::byte> bytes(store->Bytes().begin(), store->Bytes().end());
         const auto size = bytes.size();
-        DrawPipeline::Queue0().Enqueue([this, queue, address, bytes = std::move(bytes)] {
+        const auto pattern = packet[2];
+        DrawPipeline::Queue0().Enqueue([this, queue, address, pattern, bytes = std::move(bytes)] {
             GuestMemory::SetCurrentPacket(0x50, queue);
             commitDmaStore(queue, address, bytes);
+            Graphics::NoteDepthMetadataFill(address, bytes.size(), pattern);
         }, {{address, address + size}});
         return true;
     }

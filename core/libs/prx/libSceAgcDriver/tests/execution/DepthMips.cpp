@@ -477,6 +477,13 @@ void HtileClearTests(const Device& device, SampleProgram& sampler) {
     RetireDepthSurfaces(device.GetContext().device, target.address, Block);
     DepthSurfaceView(device.GetContext(), target);
     ExpectValue(sampler, *sampled, 0, 0.625f, "retired surface does not revive an old clear");
+    RetireDepthSurfaces(device.GetContext().device, target.address, Block);
+    NoteHtileDepthClear(originalMetadata);
+    fill(originalMetadata, metadataBytes, 0xffffffffu);
+    DepthSurfaceView(device.GetContext(), target);
+    sampled = Sample(device.GetContext(), target, 0, 0);
+    Require(sampled != nullptr, "rebound HTILE target cannot be sampled");
+    ExpectValue(sampler, *sampled, 0, 0.625f, "expanded metadata cancels a remembered HTILE clear");
     fill(originalMetadata, metadataBytes, 0x0003fff0u);
     { GuestAllocations::Mutation mutation; }
     DepthSurfaceView(device.GetContext(), target);

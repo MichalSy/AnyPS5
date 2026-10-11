@@ -236,13 +236,17 @@ void HtileTests() {
     unsupported = queue;
     unsupported.context[0x002] = View(0, 1);
     Require(DecodeState(unsupported).depth->htileAddress == 0, "array-slice HTILE enabled clears");
-    unsupported = queue;
-    unsupported.context[0x011] = 1u | (24u << 4u);
-    unsupported.context[0x013] = unsupported.context[0x015] = 0x2000;
-    Require(DecodeState(unsupported).depth->htileAddress == 0 && DecodeState(unsupported).depth->htileStencil,
-        "stencil-in-HTILE was silently accepted by the depth-only path");
-    unsupported.context[0x011] |= 1u << 29u;
-    Require(DecodeState(unsupported).depth->htileAddress != 0 && !DecodeState(unsupported).depth->htileStencil,
+    auto stencilQueue = queue;
+    stencilQueue.context[0x011] = 1u | (24u << 4u);
+    stencilQueue.context[0x013] = stencilQueue.context[0x015] = 0x2000;
+    const auto stencilTiled = *DecodeState(stencilQueue).depth;
+    Require(stencilTiled.htileAddress == (1ull << 40u) + metadata && stencilTiled.htileStencil &&
+        stencilTiled.stencilAddress == 0x200000 && stencilTiled.format == VK_FORMAT_D32_SFLOAT_S8_UINT,
+        "supported depth/stencil HTILE lost its metadata address or stencil plane");
+    stencilQueue.context[0x011] |= 1u << 29u;
+    const auto depthOnlyTiled = *DecodeState(stencilQueue).depth;
+    Require(depthOnlyTiled.htileAddress == (1ull << 40u) + metadata && !depthOnlyTiled.htileStencil &&
+        depthOnlyTiled.stencilAddress == stencilTiled.stencilAddress,
         "TILE_STENCIL_DISABLE prevented depth-only HTILE clears");
 }
 

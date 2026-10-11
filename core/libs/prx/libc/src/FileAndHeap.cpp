@@ -274,6 +274,12 @@ int APS5_VABI fsetpos_nid_postfix(FileStream* stream, const std::int64_t* positi
     return fseeko_nid_postfix(stream, *position, SEEK_SET);
 }
 
+void APS5_VABI rewind_nid_postfix(FileStream* stream) {
+    const int saved = errno;
+    if (fseeko_nid_postfix(stream, 0, SEEK_SET) == 0) errno = saved;
+    stream->ClearError();
+}
+
 int APS5_VABI fputs_nid_postfix(const char* str, FileStream* stream) {
     if (!str) { errno = 22; return EOF; }
     auto* handle = GetNativeStream(stream);
@@ -295,6 +301,10 @@ int APS5_VABI fflush_nid_postfix(FileStream* stream) {
 
 int APS5_VABI malloc_stats_fast_nid_postfix(void* stats) {
     return ApplicationHeapStatsFast_nid_no_patch(stats);
+}
+
+size_t APS5_VABI malloc_usable_size_nid_postfix(void* pointer) {
+    return ApplicationHeapUsableSize_nid_no_patch(pointer);
 }
 
 void* APS5_VABI malloc_nid_postfix(size_t size) {

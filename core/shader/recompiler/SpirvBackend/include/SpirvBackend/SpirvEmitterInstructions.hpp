@@ -64,6 +64,7 @@ void EmitVoid(SpirvValueEmitContext& context);
 void EmitBarrier(SpirvValueEmitContext& ctx, const IrValue& inst);
 std::uint32_t EmitMeshDrawParameter(SpirvValueEmitContext& ctx, const IrValue& inst);
 std::uint32_t EmitMeshArgument(SpirvValueEmitContext& ctx, const IrValue& inst);
+std::uint32_t EmitMeshRestartStart(SpirvValueEmitContext& ctx, const IrValue& inst);
 std::uint32_t EmitGetTessellationAttribute(SpirvValueEmitContext& ctx, const IrValue& inst);
 void EmitSetTessellationAttribute(SpirvValueEmitContext& ctx, const IrValue& inst);
 std::uint32_t EmitGetUserData(SpirvEmitterState& state, ScalarReg reg);
@@ -167,7 +168,6 @@ std::uint32_t EmitAndU32(SpirvEmitterState& state, std::uint32_t arg0, std::uint
 std::uint32_t EmitLogicalAndBool(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitLogicalOrBool(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitLogicalNotBool(SpirvEmitterState& state, std::uint32_t arg0);
-std::uint32_t EmitTruncF32Value(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitFNegateValue(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitFAbsValue(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitPackHalf2x16(SpirvEmitterState& state, std::uint32_t arg0);

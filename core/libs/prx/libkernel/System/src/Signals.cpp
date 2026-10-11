@@ -1,17 +1,29 @@
+#include "SceTypes.hpp"
+#include "prx/libc/include/General.hpp"
+#include "prx/libkernel/Pthread/Posix/Common.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cerrno>
 #include <cstddef>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #ifndef _WIN32
 #include <pthread.h>
+#include <unistd.h>
 #endif
+#include <string>
+#include <thread>
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 extern "C" int APS5_VABI getpid_nid_postfix(void);
+extern "C" Pthread APS5_VABI scePthreadSelf(void);
 
 using GuestHandler = void (APS5_VABI *)(int);
 struct GuestSignalSet {
@@ -261,6 +273,82 @@ extern "C" void CopyGuestSignalMask_nid_no_patch(const void* nativeMask, std::ui
 }
 #endif
 
+#ifdef _WIN32
+namespace {
+constexpr int GuestSigalrm = 14;
+struct AlarmState {
+    std::mutex lock;
+    std::condition_variable changed;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    bool threadStarted = false;
+};
+
+AlarmState& Alarms() {
+    static auto* state = new AlarmState();
+    return *state;
+}
+
+void ExpireAlarm() {
+    std::uintptr_t handler = 0;
+    {
+        std::lock_guard lock(registration);
+        handler = reinterpret_cast<std::uintptr_t>(dispositions[GuestSigalrm].handler);
+    }
+    if (handler == 1) return;
+    if (handler == 0) {
+        std::fprintf(stderr, "SIGALRM: the alarm expired with the default disposition; the process terminates\n");
+        std::fflush(stderr);
+        std::_Exit(128 + GuestSigalrm);
+    }
+    throw std::runtime_error("alarm: delivering SIGALRM to a guest handler is not implemented");
+}
+
+void RunAlarms() {
+    auto& alarms = Alarms();
+    std::unique_lock lock(alarms.lock);
+    for (;;) {
+        if (!alarms.deadline) {
+            alarms.changed.wait(lock);
+            continue;
+        }
+        const auto deadline = *alarms.deadline;
+        if (alarms.changed.wait_until(lock, deadline) != std::cv_status::timeout || alarms.deadline != deadline) continue;
+        alarms.deadline.reset();
+        lock.unlock();
+        ExpireAlarm();
+        lock.lock();
+    }
+}
+}
+
+#endif
+
+extern "C" unsigned int APS5_VABI GuestAlarm_nid_no_patch(unsigned int seconds) {
+#ifndef _WIN32
+    const int savedError = *__error_nid_postfix();
+    const auto remaining = ::alarm(seconds);
+    *__error_nid_postfix() = savedError;
+    return remaining;
+#else
+    auto& alarms = Alarms();
+    std::lock_guard lock(alarms.lock);
+    const auto now = std::chrono::steady_clock::now();
+    unsigned int remaining = 0;
+    if (alarms.deadline && *alarms.deadline > now) {
+        const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(*alarms.deadline - now).count();
+        remaining = static_cast<unsigned int>((micros + 999999) / 1000000);
+    }
+    if (seconds == 0) alarms.deadline.reset();
+    else alarms.deadline = now + std::chrono::seconds(seconds);
+    if (!alarms.threadStarted) {
+        std::thread(RunAlarms).detach();
+        alarms.threadStarted = true;
+    }
+    alarms.changed.notify_all();
+    return remaining;
+#endif
+}
+
 struct GuestStack {
     void* sp;
     std::size_t size;
@@ -342,6 +430,16 @@ int APS5_VABI kill_nid_postfix(int pid, int guest) {
     const int self = getpid_nid_postfix();
     if (pid != self && pid != 0 && pid != -self) { *__error_nid_postfix() = 3; return -1; }
     return guest == 0 ? 0 : raise_nid_postfix(guest);
+}
+int APS5_VABI pthread_kill_nid_postfix(Pthread thread, int guest) {
+    if (guest != 0 && !ValidSetSignal(guest)) return PosixThread::GUEST_EINVAL;
+    if (thread == nullptr) return PosixThread::GUEST_ESRCH;
+    if (guest == 0) return 0;
+    if (thread != scePthreadSelf()) NotImplemented_nid_no_patch(("pthread_kill signal " + std::to_string(guest) + " to another thread").c_str());
+    const int savedError = *__error_nid_postfix();
+    const int result = raise_nid_postfix(guest) == 0 ? 0 : *__error_nid_postfix();
+    *__error_nid_postfix() = savedError;
+    return result;
 }
 int APS5_VABI sigaltstack_nid_postfix(const GuestStack* stack, GuestStack* previous) {
     GuestStack replacement = alternateStack;

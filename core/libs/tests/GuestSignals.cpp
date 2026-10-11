@@ -5,9 +5,10 @@
 #include <cstring>
 #include <stdexcept>
 #include <initializer_list>
+#include <chrono>
+#include <thread>
 #ifndef _WIN32
 #include <pthread.h>
-#include <thread>
 #endif
 
 using Handler = void (APS5_VABI *)(int);
@@ -22,6 +23,9 @@ struct GuestSignalAction {
 extern "C" {
 Handler APS5_VABI signal_nid_postfix(int, Handler);
 int APS5_VABI raise_nid_postfix(int);
+int APS5_VABI pthread_kill_nid_postfix(void*, int);
+void* APS5_VABI scePthreadSelf();
+unsigned int APS5_VABI GuestAlarm_nid_no_patch(unsigned int);
 int APS5_VABI sigprocmask_nid_postfix(int, const void*, void*);
 int APS5_VABI sigemptyset_nid_postfix(GuestSignalSet*);
 int APS5_VABI sigfillset_nid_postfix(GuestSignalSet*);
@@ -242,6 +246,21 @@ int main() {
     Require(_is_signal_return_nid_postfix(0) == 0);
     received = 0;
     Require(raise_nid_postfix(15) == 0 && received == 15);
+    received = 0;
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), 15) == 0 && received == 15);
+    received = 0;
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), 0) == 0 && received == 0);
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), 200) == 22);
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), -1) == 22);
+    *__error_nid_postfix() = 79;
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), 128) == 22 && *__error_nid_postfix() == 79);
+    Require(pthread_kill_nid_postfix(nullptr, 15) == 3);
+    Require(pthread_kill_nid_postfix(nullptr, 128) == 3);
+    Require(pthread_kill_nid_postfix(nullptr, 129) == 22);
+    bool threw = false;
+    try { pthread_kill_nid_postfix(reinterpret_cast<void*>(std::uintptr_t{0x10}), 15); }
+    catch (const std::runtime_error&) { threw = true; }
+    Require(threw && received == 0);
     Require(signal_nid_postfix(15, ignore) != invalid);
     received = 0;
     Require(raise_nid_postfix(15) == 0 && received == 0);
@@ -272,4 +291,16 @@ int main() {
 #else
     TestWindowsSigaction();
 #endif
+    Require(GuestAlarm_nid_no_patch(0) == 0);
+    Require(GuestAlarm_nid_no_patch(5) == 0);
+    Require(GuestAlarm_nid_no_patch(3) == 5);
+    Require(GuestAlarm_nid_no_patch(0) == 3);
+    Require(GuestAlarm_nid_no_patch(0) == 0);
+    const GuestSignalAction ignoreAlarm{reinterpret_cast<Handler>(std::uintptr_t{1}), 0, {}};
+    GuestSignalAction originalAlarm{};
+    Require(sigaction_nid_postfix(14, &ignoreAlarm, &originalAlarm) == 0);
+    Require(GuestAlarm_nid_no_patch(1) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    Require(GuestAlarm_nid_no_patch(0) == 0);
+    Require(sigaction_nid_postfix(14, &originalAlarm, nullptr) == 0);
 }

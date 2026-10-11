@@ -1,6 +1,7 @@
 #include <relinker/guest/GuestImage.hpp>
 #include <relinker/parsing/ElfReader.hpp>
 #include <io/BufferUtils.hpp>
+#include <io/NativePath.hpp>
 #include <algorithm>
 #include <bit>
 #include <limits>
@@ -88,7 +89,7 @@ std::vector<std::string> GuestImageReader::ReadModuleNames(const std::vector<std
 }
 
 GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector<std::uint8_t> bytes) const {
-    const auto fail = [&](const std::string& message) { throw Domain::RelinkerException(path.string() + ": " + message); };
+    const auto fail = [&](const std::string& message) { throw Domain::RelinkerException(Io::Utf8Path(path) + ": " + message); };
     const auto range = [&](std::uint64_t offset, std::uint64_t size) {
         if (offset > bytes.size() || size > bytes.size() - offset) {
             std::ostringstream message;
@@ -104,7 +105,7 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
     range(Io::ReadU64(bytes, 32), static_cast<std::uint64_t>(Io::ReadU16(bytes, 56)) * 56);
     GuestImage image;
     image.SourcePath = path;
-    image.OutputName = path.filename().string() + GuestModuleSuffix;
+    image.OutputName = Io::Utf8Path(path.filename()) + GuestModuleSuffix;
     image.Headers = ElfReader(bytes).ReadProgramHeaders();
     const Domain::ProgramHeader* dynamic = nullptr;
     const Domain::ProgramHeader* dynlib = nullptr;
@@ -208,6 +209,9 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
     for (std::uint64_t offset = 0; offset < symSize; offset += 24) {
         auto name = string(Io::ReadU32(bytes, symOffset + offset));
         const auto library = Io::ReadU16(bytes, symOffset + offset + 6) == 0 ? Domain::ImportModule(name, importModules, neededLibraries) : std::string{};
+        if (Io::ReadU16(bytes, symOffset + offset + 6) == 0 && library.empty()) {
+            if (auto declared = Domain::DeclaredImportModule(name, importModules); !declared.empty()) image.Dynamic.UnmatchedImportModules.insert(std::move(declared));
+        }
         name = name.substr(0, name.find('#'));
         const auto info = bytes[symOffset + offset + 4];
         const auto visibility = bytes[symOffset + offset + 5];

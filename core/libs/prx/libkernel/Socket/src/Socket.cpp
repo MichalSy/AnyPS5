@@ -5,6 +5,7 @@
 #include "prx/libc/include/GuestFileDescriptors.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
+#include "prx/libkernel/Socket/include/SocketSelectDeadline.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -145,13 +146,8 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         return fail(GuestEinval);
     }
     const auto start = std::chrono::steady_clock::now();
-    auto deadline = std::chrono::steady_clock::time_point::max();
-    if (limit != nullptr) {
-        const auto maximum = std::chrono::duration_cast<std::chrono::microseconds>(deadline - start).count();
-        if (limit->seconds > maximum / 1000000 ||
-            (limit->seconds == maximum / 1000000 && limit->microseconds > maximum % 1000000)) return fail(GuestEinval);
-        deadline = start + std::chrono::microseconds(limit->seconds * 1000000 + limit->microseconds);
-    }
+    const auto deadline = limit == nullptr ? std::chrono::steady_clock::time_point::max()
+        : KernelSocketSelect::DeadlineAfter(start, limit->seconds, limit->microseconds);
     std::vector<KernelSocketPoll::Entry> entries;
     for (int descriptor = 0; descriptor < nfds; ++descriptor) {
         short events = 0;
@@ -214,7 +210,8 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         int waitMilliseconds = 100;
         if (limit != nullptr) {
             const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
-            waitMilliseconds = static_cast<int>(std::clamp<std::int64_t>((remaining + 999) / 1000, 0, 100));
+            const auto roundedMilliseconds = remaining > 0 ? remaining / 1000 + (remaining % 1000 != 0) : 0;
+            waitMilliseconds = static_cast<int>(std::clamp<std::int64_t>(roundedMilliseconds, 0, 100));
         }
         if (!virtualEntries.empty() && nativeEntries.empty()) {
             const auto waitStart = std::chrono::steady_clock::now();

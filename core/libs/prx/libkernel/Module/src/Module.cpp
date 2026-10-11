@@ -9,6 +9,7 @@
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Module/EhFrame.hpp"
+#include "prx/libkernel/Module/ModuleArgs.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
@@ -17,7 +18,7 @@
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #else
-#include <fstream>
+#include "prx/libc/include/specifics/linux/HostMapping.hpp"
 #endif
 
 #ifdef __linux__
@@ -127,34 +128,37 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
 #ifdef __linux__
   if (FillModuleUnwindInfo_nid_no_patch(addr, info)) return 0;
 #endif
-  std::ifstream maps("/proc/self/maps");
-  if (!maps) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: failed to open /proc/self/maps");
-  std::string line;
-  while (std::getline(maps, line)) {
-    std::uint64_t start = 0;
-    std::uint64_t end = 0;
-    char perms[8] = {};
-    std::uint64_t offset = 0;
-    unsigned int devMajor = 0;
-    unsigned int devMinor = 0;
-    std::uint64_t inode = 0;
-    char path[4096] = {};
-    int parsed = std::sscanf(line.c_str(), "%llx-%llx %7s %llx %x:%x %llu %4095s",
-      (unsigned long long*)&start, (unsigned long long*)&end, perms,
-      (unsigned long long*)&offset, &devMajor, &devMinor, (unsigned long long*)&inode, path);
-    if (parsed < 7 || addr < start || addr >= end) continue;
-    info->st_size = sizeof(ModuleInfoForUnwind);
-    std::strncpy(info->name, parsed >= 8 ? path : "", sizeof(info->name) - 1);
-    info->name[sizeof(info->name) - 1] = '\0';
-    info->eh_frame_hdr_addr = 0;
-    info->eh_frame_addr = 0;
-    info->eh_frame_size = 0;
-    info->seg0_addr = start;
-    info->seg0_size = end - start;
-    return 0;
-  }
-  return SCE_KERNEL_ERROR_ESRCH;
+  const auto mapping = HostMapping::Find(addr, "sceKernelGetModuleInfoForUnwind");
+  if (!mapping) return SCE_KERNEL_ERROR_ESRCH;
+  info->st_size = sizeof(ModuleInfoForUnwind);
+  std::strncpy(info->name, mapping->path.c_str(), sizeof(info->name) - 1);
+  info->name[sizeof(info->name) - 1] = '\0';
+  info->eh_frame_hdr_addr = 0;
+  info->eh_frame_addr = 0;
+  info->eh_frame_size = 0;
+  info->seg0_addr = mapping->start;
+  info->seg0_size = mapping->end - mapping->start;
+  return 0;
 #endif
+}
+
+namespace {
+
+thread_local PendingModuleArgs pendingModuleArgs;
+thread_local int pendingModuleInitResult = 0;
+
+}
+
+extern "C" {
+
+const void* __aps5_get_pending_module_args_nid_no_patch() {
+    return &pendingModuleArgs;
+}
+
+void __aps5_set_module_init_result_nid_no_patch(int result) {
+    pendingModuleInitResult = result;
+}
+
 }
 
 KernelModule APS5_VABI sceKernelLoadStartModule(const char* module_file_name, size_t args, const void* argp, uint32_t flags, const KernelLoadModuleOpt* opt, int* res) {
@@ -162,7 +166,19 @@ KernelModule APS5_VABI sceKernelLoadStartModule(const char* module_file_name, si
  (void)opt;
  if (res) *res = 0;
  if (!module_file_name) return static_cast<KernelModule>(SCE_KERNEL_ERROR_EFAULT);
+#ifdef _WIN32
+ const auto previousArgs = pendingModuleArgs;
+ const int previousResult = pendingModuleInitResult;
+ pendingModuleArgs = {args, argp};
+ pendingModuleInitResult = 0;
+ void* handle = LoadStartModule_nid_no_patch(module_file_name, args, argp, nullptr);
+ const int started = pendingModuleInitResult;
+ pendingModuleArgs = previousArgs;
+ pendingModuleInitResult = previousResult;
+ if (res) *res = started;
+#else
  void* handle = LoadStartModule_nid_no_patch(module_file_name, args, argp, res);
+#endif
  if (!handle) return static_cast<KernelModule>(SCE_KERNEL_ERROR_ENOENT);
  return static_cast<KernelModule>(reinterpret_cast<intptr_t>(handle));
 }

@@ -39,9 +39,13 @@ inline std::span<const std::uint32_t> RegisteredCode(const QueueState& queue, co
     auto found = registry.upper_bound(address);
     Graphics::Require(address != 0u && found != registry.begin(), "fixed color resolve program does not belong to a registered shader");
     --found;
-    Graphics::Require(found->second != nullptr, "fixed color resolve has a null registered shader");
-    const auto& snapshot = *found->second;
-    Graphics::Require(found->first == snapshot.codeAddress, "fixed color resolve has inconsistent registered shader identity");
+    for (const auto& candidate : found->second) {
+        Graphics::Require(candidate != nullptr, "fixed color resolve has a null registered shader");
+        Graphics::Require(found->first == candidate->codeAddress, "fixed color resolve has inconsistent registered shader identity");
+    }
+    const auto program = RegisteredProgram(registry, address, {type});
+    Graphics::Require(program != nullptr, "fixed color resolve program is outside registered shader code");
+    const auto& snapshot = *program;
     Graphics::Require(address >= snapshot.codeAddress && (address - snapshot.codeAddress) / sizeof(std::uint32_t) < snapshot.code.size(),
         "fixed color resolve program is outside registered shader code");
     Graphics::Require((address - snapshot.codeAddress) % sizeof(std::uint32_t) == 0u, "fixed color resolve entry point is not dword aligned");

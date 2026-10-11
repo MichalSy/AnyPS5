@@ -84,25 +84,27 @@ void StateAndInvocation(AgcDriver::VulkanDevice& device) {
     replacedCode[0] = 0xbe8e0306u;
     auto replacedRequest = request;
     replacedRequest.shader.code = replacedCode;
-    ExpectFailure([&] { static_cast<void>(SourceHandleFor(snapshot, 0, replacedRequest)); }, "artifact is missing");
+    ExpectFailure([&] { static_cast<void>(SourceHandleFor(snapshot, 0, replacedRequest)); }, "prepared shader request does not refer to registered code");
     Require(snapshot.prepared->entries.empty() && snapshot.prepared->deferredCompute.size() == 1, "different code with the same static ABI changed the deferred snapshot");
-    const auto failure = ExpectFailure([&] { static_cast<void>(InvocationFor(snapshot, 0, request)); }, "program counter 0x00000008 is not statically resolvable");
-    Require(failure.find("RecompileRequest:") != std::string::npos, "first used deferred shader lost its full runtime request diagnostic");
-    ExpectFailure([&] { static_cast<void>(SourceHandleFor(snapshot, 0, request)); }, "program counter 0x00000008 is not statically resolvable");
+    const auto failure = ExpectFailure([&] { static_cast<void>(InvocationFor(snapshot, 0, request)); }, "callee at 0x4212345678 is not readable");
+    Require(failure.find("calls user data s[4:5] at program counter 0x8") != std::string::npos, "first used deferred shader lost its call-site diagnostic");
+    const auto staticFailure = ExpectFailure([&] { static_cast<void>(SourceHandleFor(snapshot, 0, request)); }, "program counter 0x00000008 is not statically resolvable");
+    Require(staticFailure.find("RecompileRequest:") != std::string::npos, "static deferred shader preparation lost its full runtime request diagnostic");
     Require(snapshot.prepared->entries.empty() && snapshot.prepared->deferredCompute.size() == 1, "failed deferred invocation published a ready artifact or lost its requirement");
     request.context.compute->partialThreads = {1, 1, 1};
-    ExpectFailure([&] { static_cast<void>(InvocationFor(snapshot, 0, request)); }, "artifact is missing");
+    ExpectFailure([&] { static_cast<void>(InvocationFor(snapshot, 0, request)); }, "callee at 0x4212345678 is not readable");
     BuildPreparedShaderKey(request, key);
     snapshot.prepared->deferredCompute.push_back({0, key, {8, 14, 14}});
-    ExpectFailure([&] { static_cast<void>(InvocationFor(snapshot, 0, request)); }, "program counter 0x00000008 is not statically resolvable");
+    ExpectFailure([&] { static_cast<void>(InvocationFor(snapshot, 0, request)); }, "callee at 0x4212345678 is not readable");
     request.context.waveSize = 64;
-    ExpectFailure([&] { static_cast<void>(InvocationFor(snapshot, 0, request)); }, "artifact is missing");
+    ExpectFailure([&] { static_cast<void>(InvocationFor(snapshot, 0, request)); }, "callee at 0x4212345678 is not readable");
     request.context.waveSize = 32;
     request.context.floatMode = ShaderFloatMode{192, true, false, false};
-    ExpectFailure([&] { static_cast<void>(InvocationFor(snapshot, 0, request)); }, "artifact is missing");
+    ExpectFailure([&] { static_cast<void>(InvocationFor(snapshot, 0, request)); }, "callee at 0x4212345678 is not readable");
     request.context.floatMode = {};
     snapshot.type = 1;
-    ExpectFailure([&] { static_cast<void>(InvocationFor(snapshot, 0, request)); }, "artifact is missing");
+    snapshot.header.clear();
+    ExpectFailure([&] { static_cast<void>(SourceHandleFor(snapshot, 0, request)); }, "unregistered program is not a compute shader");
     Require(snapshot.prepared->entries.empty() && snapshot.prepared->deferredCompute.size() == 2, "static ABI mismatch altered deferred shader state");
 }
 
@@ -132,7 +134,7 @@ void RegistrationAndDispatch() {
     --external.registers[0].value;
     AgcDriverRegisterShader_nid_postfix(&external.shader);
     Header invalid(InvalidCode, 15);
-    ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&invalid.shader); }, "");
+    ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&invalid.shader); }, "unknown RDNA instruction family at program counter 0x00000004 raw word 0xffffffff");
     Header normal(StoreCode, 4);
     AgcDriverRegisterShader_nid_postfix(&normal.shader);
     AgcDriverResolveShaderAbi_nid_postfix(&normal.shader, {}, {});
@@ -155,8 +157,8 @@ void RegistrationAndDispatch() {
     commands.insert(commands.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(afterAddress), static_cast<std::uint32_t>(afterAddress >> 32u), 7});
     packet = {commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     sceAgcDriverSubmitAcb(0x20, &packet);
-    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, "program counter 0x00000008 is not statically resolvable");
-    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "program counter 0x00000008 is not statically resolvable");
+    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, "callee at 0x4212345678 is not readable");
+    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "callee at 0x4212345678 is not readable");
     Require(afterDispatch == 0 && Output[0] == 0x13579bdfu, "unresolved dispatched shader was skipped or executed subsequent writes");
 }
 

@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
 #include <functional>
@@ -365,6 +366,8 @@ void Driver::execute(const Submission& submission) {
             if (!wroteOnGpu) {
                 if (Pm4::IndirectRegisterOpcode(opcode)) Pm4::ExecuteIndirectRegisters(packet, submission.registerLists.at(cursor), queue);
                 else Pm4::Execute(packet, queue);
+                if (opcode == 0x50 && packet.size() >= 7 && Pm4::DmaSource(packet) == 2 && Pm4::DmaDestination(packet) != 1)
+                    Graphics::NoteDepthMetadataFill(packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u), packet[6] & 0x3ffffffu, packet[2]);
                 if (opcode == 0x49 || opcode == 0x37) {
                     if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial, submission.queue);
                 }

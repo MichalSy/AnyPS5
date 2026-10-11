@@ -60,4 +60,9 @@ std::string Driver::profileDrawCacheLines(const DrawEntryCounters& counters) {
     return text;
 }
 
+DrawEntryCounters Driver::DrawCacheCounters() {
+    std::lock_guard cacheLock(drawCacheMutex);
+    return drawEntryCounters;
+}
+
 }

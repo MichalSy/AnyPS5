@@ -1,6 +1,9 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -9,6 +12,12 @@
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
+
+struct SceKernelSystemSwVersion {
+    std::uint64_t size;
+    char versionString[0x1C];
+    std::uint32_t version;
+};
 
 extern "C" {
 // Guest long is 64 bits, including when the Windows host long is 32 bits.
@@ -47,5 +56,17 @@ std::int64_t APS5_VABI sysconf_nid_postfix(int name) {
     if (result <= 0) { *__error_nid_postfix() = 5; return -1; }
     *__error_nid_postfix() = saved;
     return result;
+}
+int APS5_VABI sceKernelGetSystemSwVersion_nid_postfix(SceKernelSystemSwVersion* version) {
+    if (version == nullptr) {
+        return SCE_KERNEL_ERROR_EFAULT;
+    }
+    if (version->size != sizeof(SceKernelSystemSwVersion)) {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
+    std::memset(version->versionString, 0, sizeof(version->versionString));
+    std::memcpy(version->versionString, "01.000.000", sizeof("01.000.000"));
+    version->version = 0x01000000;
+    return 0;
 }
 }

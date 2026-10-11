@@ -1,6 +1,7 @@
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/tests/AlignedByteArray.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -54,7 +55,7 @@ void CheckDecodedAbi(AgcDriver::VulkanDevice& device) {
     auto vertex = Snapshot(0x10000u, 2);
     auto fragment = Snapshot(0x20000u, 1);
     auto null = Snapshot(NullPixelProgramAddress(), 1);
-    ShaderRegistry registry{{vertex->codeAddress, vertex}, {fragment->codeAddress, fragment}, {null->codeAddress, null}};
+    ShaderRegistry registry{{vertex->codeAddress, {vertex}}, {fragment->codeAddress, {fragment}}, {null->codeAddress, {null}}};
     AgcDriver::QueueState queue;
     queue.context[0x2d5] = 0x2000;
     queue.userConfig[0x242] = 4;
@@ -253,6 +254,7 @@ void CheckRegisteredDraw(bool rectangleOnly = false, bool pairAbi = false) {
             verify.context[0x10b] = 0;
             verify.context[0x10c] = verify.context[0x10d] = 0x00ffff07;
             Submit(verify);
+            AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Pixels.data()), Pixels.size());
             for (std::uint32_t y = 0; y < Height; ++y) {
                 for (std::uint32_t x = 0; x < Width; ++x) {
                     for (std::uint32_t channel = 0; channel < 4; ++channel) {
@@ -309,6 +311,7 @@ void CheckDepthOnly(std::uint32_t primitiveType, bool explicitNull) {
     const auto initial = AgcDriver::Graphics::DecodeState(depthOnly);
     Require(!initial.hasColorTarget && initial.depth && initial.depthWrite && initial.stencilTest, "depth-only fixture lost its depth/stencil target or retained a color target");
     const auto unchanged = [] {
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Pixels.data()), Pixels.size());
         Require(std::all_of(Pixels.begin(), Pixels.end(), [](std::byte value) { return value == std::byte{0x40}; }), "depth/stencil-only draw changed color memory");
     };
     Pixels.fill(std::byte{0x40});
@@ -335,6 +338,7 @@ void CheckDepthOnly(std::uint32_t primitiveType, bool explicitNull) {
         verify.context[0x10b] = 0;
         verify.context[0x10c] = verify.context[0x10d] = 0x00ffff00u | reference;
         Submit(verify);
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Pixels.data()), Pixels.size());
         for (std::uint32_t y = 0; y < Height; ++y) {
             for (std::uint32_t x = 0; x < Width; ++x) {
                 const auto stencil = x < Width / 2u ? 7u : x < Width * 3u / 4u ? 9u : 3u;
@@ -389,14 +393,20 @@ void CheckDepthExportAbi(AgcDriver::VulkanDevice& device) {
         Require(!disabled.depthExportEnable && disabled.earlyZ == (zOrder == 1u), "disabling depth export did not recompute early fragment tests");
         request.context.pixel = disabled;
         request.layout = {0, 0, 0, 128};
-        bool rejected = false;
-        try {
-            static_cast<void>(SourceHandleFor(*snapshot, 0, request));
-        } catch (const std::exception& error) {
-            Require(std::string_view(error.what()).find("prepared shader artifact is missing") != std::string_view::npos, "disabled depth ABI failed for an unrelated reason");
-            rejected = true;
-        }
-        Require(rejected, "enabled depth artifact accepted a different static depth ABI");
+        const auto prepareNewAbi = [&] {
+            const auto previous = snapshot->prepared->entries;
+            for (const auto& entry : previous) Require(!MatchesPreparedShader(request, *entry.handle), "an existing pixel artifact matched a different static ABI");
+            const auto handle = SourceHandleFor(*snapshot, 0, request);
+            Require(snapshot->prepared->entries.size() == previous.size() + 1u && snapshot->prepared->entries.back().handle == handle && MatchesPreparedShader(request, *handle), "a new static pixel ABI did not publish its matching artifact");
+            for (std::size_t index = 0; index < previous.size(); ++index) {
+                Require(snapshot->prepared->entries[index].handle == previous[index].handle && !MatchesPreparedShader(request, *previous[index].handle), "preparing a new pixel ABI changed an existing artifact");
+            }
+            Require(SourceHandleFor(*snapshot, 0, request) == handle && snapshot->prepared->entries.size() == previous.size() + 1u, "a pixel artifact prepared at use was not reused");
+            return handle;
+        };
+        const auto disabledHandle = prepareNewAbi();
+        const auto& disabledWords = GetPreparedArtifact(*disabledHandle).spirv.Words();
+        Require(!HasExecutionMode(disabledWords, spv::ExecutionModeDepthReplacing) && HasExecutionMode(disabledWords, spv::ExecutionModeEarlyFragmentTests) == (zOrder == 1u), "a pixel artifact prepared at use retained the enabled depth ABI");
         for (const std::uint32_t drawZOrder : {0u, 1u}) {
             context[0x203] = (context[0x203] & ~0x30u) | (drawZOrder << 4u);
             request.context.pixel = AgcDriver::Graphics::DecodePixelStageInfo(context, {});
@@ -421,23 +431,16 @@ void CheckDepthExportAbi(AgcDriver::VulkanDevice& device) {
             }
         }
         for (const bool changeInterpolator : {true, false}) {
-            auto invalid = context;
-            invalid[0x203] = (invalid[0x203] & ~0x31u) | (zOrder << 4u);
-            if (changeInterpolator) invalid[0x191] = 0;
-            else invalid[0x203] |= 0x40u;
-            request.context.pixel = AgcDriver::Graphics::DecodePixelStageInfo(invalid, {});
+            auto changed = context;
+            changed[0x203] = (changed[0x203] & ~0x31u) | (zOrder << 4u);
+            if (changeInterpolator) changed[0x191] = 0;
+            else changed[0x203] |= 0x40u;
+            request.context.pixel = AgcDriver::Graphics::DecodePixelStageInfo(changed, {});
             request.layout = {0, 0, 0, 128};
-            rejected = false;
-            try {
-                static_cast<void>(SourceHandleFor(*snapshot, 0, request));
-            } catch (const std::exception& error) {
-                Require(std::string_view(error.what()).find("prepared shader artifact is missing") != std::string_view::npos, "unprepared pixel ABI failed for an unrelated reason");
-                rejected = true;
-            }
-            Require(rejected, "preparing depth variants relaxed an unrelated static pixel ABI");
+            static_cast<void>(prepareNewAbi());
         }
     }
-    std::cout << "prepared depth export, early fragment tests, push offsets and strict pixel ABI passed\n";
+    std::cout << "prepared depth export, early fragment tests, push offsets and pixel ABI variant isolation passed\n";
 }
 
 void CheckRegisteredDepthExport(std::uint32_t zOrder, bool registeredDepth = true) {
@@ -483,6 +486,7 @@ void CheckRegisteredDepthExport(std::uint32_t zOrder, bool registeredDepth = tru
         auto verify = queue;
         verify.context[0x200] = (static_cast<std::uint32_t>(compare) << 4u) | 2u;
         Submit(verify);
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Pixels.data()), Pixels.size());
         const auto expected = expectedPass ? std::byte{255} : std::byte{0x40};
         Require(std::all_of(Pixels.begin(), Pixels.begin() + Width * Height * 4u, [&](std::byte value) { return value == expected; }), "registered depth variant produced the wrong stored depth");
         Require(std::all_of(Pixels.begin() + Width * Height * 4u, Pixels.end(), [](std::byte value) { return value == std::byte{0x40}; }), "depth verification draw changed color padding");

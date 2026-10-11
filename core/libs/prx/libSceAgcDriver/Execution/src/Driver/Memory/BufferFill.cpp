@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include <bit>
 #include <cstdlib>
 #include <optional>
@@ -269,6 +270,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
                 Graphics::NoteDepthMetadataFill(localDevice->Device(), base, bytes, pattern[0]);
             phase(FillCpu);
         }
+        if (pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3]) Graphics::NoteDepthMetadataFill(base, bytes, pattern[0]);
         if (profile) {
             const auto now = std::chrono::steady_clock::now();
             const auto cover = static_cast<std::size_t>(coverage.cover);

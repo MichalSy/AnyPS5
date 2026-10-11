@@ -119,16 +119,18 @@ def main():
             result, output = convert(case, windows)
             assert result.returncode == 0, result.stderr
             assert {path.name for path in (case / "app0").rglob("*.guest.prx")} == {"static.prx.guest.prx"}
-            previous = output.read_bytes()
             result, output = convert(case, windows, ("--recursive-module-search",))
             artifacts = {path.relative_to(case / "app0").as_posix() for path in (case / "app0").rglob("*.guest.prx")}
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert artifacts == {"sce_module/static.prx.guest.prx", "Media/Modules/Shared.prx.guest.prx",
+                                 "Media/Plugins/Dynamic.prx.guest.prx"}, artifacts
             if windows:
-                assert result.returncode == 2 and "Dynamically loaded guest modules are unsupported on Windows" in result.stderr, result.stderr
-                assert output.read_bytes() == previous and artifacts == {"sce_module/static.prx.guest.prx"}
+                from test_guest_module_dir import pe_export_names
+                shared = case / "app0/Media/Modules/Shared.prx.guest.prx"
+                plugin = case / "app0/Media/Plugins/Dynamic.prx.guest.prx"
+                assert "__aps5_guest_initialize" not in pe_export_names(shared.read_bytes())
+                assert "__aps5_guest_initialize" in pe_export_names(plugin.read_bytes())
             else:
-                assert result.returncode == 0, (result.stdout, result.stderr)
-                assert artifacts == {"sce_module/static.prx.guest.prx", "Media/Modules/Shared.prx.guest.prx",
-                                     "Media/Plugins/Dynamic.prx.guest.prx"}, artifacts
                 assert needed_libraries(output.read_bytes()) == ["$ORIGIN/app0/sce_module/static.prx.guest.prx"]
                 assert needed_libraries((case / "app0/sce_module/static.prx.guest.prx").read_bytes()) == []
                 assert needed_libraries((case / "app0/Media/Modules/Shared.prx.guest.prx").read_bytes()) == []

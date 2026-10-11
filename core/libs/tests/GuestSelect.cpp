@@ -84,7 +84,7 @@ int main() {
     const Timeval negativeSeconds{-1, 0};
     const Timeval negativeMicroseconds{0, -1};
     const Timeval excessiveSeconds{std::numeric_limits<std::int64_t>::max(), 0};
-    for (const auto& timeout : {badMicroseconds, negativeSeconds, negativeMicroseconds, excessiveSeconds}) {
+    for (const auto& timeout : {badMicroseconds, negativeSeconds, negativeMicroseconds}) {
         Require(select_nid_postfix(1024, reads.data(), nullptr, nullptr, timeout.data()) == -1 &&
             *__error_nid_postfix() == 22 && reads == original, "invalid timeout preserves descriptor set");
     }
@@ -123,6 +123,12 @@ int main() {
     const int result = select_nid_postfix(pipe[0] + 1, reads.data(), nullptr, nullptr, second.data());
     writer.join();
     Require(result == 1 && IsSet(reads, pipe[0]) && second == Timeval{1, 0}, "pipe becomes readable during wait");
+    reads = {};
+    Set(reads, pipe[0]);
+    *__error_nid_postfix() = 13;
+    Require(select_nid_postfix(pipe[0] + 1, reads.data(), nullptr, nullptr, excessiveSeconds.data()) == 1 &&
+        IsSet(reads, pipe[0]) && *__error_nid_postfix() == 13,
+        "a large valid timeout saturates without losing ready logical descriptors");
     char received = 0;
     Require(sceKernelRead(pipe[0], &received, 1) == 1 && received == message, "read guest pipe");
 
