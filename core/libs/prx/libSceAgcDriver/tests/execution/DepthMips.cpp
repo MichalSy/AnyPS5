@@ -117,7 +117,9 @@ public:
             function<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(context.physical, &extended);
             context.geometryShader = features.geometryShader;
             context.sampleRateShading = features.sampleRateShading;
+            context.shaderClipDistance = features.shaderClipDistance;
             capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityShader));
+            if (features.shaderClipDistance) capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityClipDistance));
             if (features.shaderInt64) capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityInt64));
             if (context.subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityGroupNonUniform));
             if (context.subgroup.supportedOperations & VK_SUBGROUP_FEATURE_VOTE_BIT) capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityGroupNonUniformVote));
