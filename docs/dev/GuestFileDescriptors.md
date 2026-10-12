@@ -29,6 +29,24 @@ The libc stream implementation shares the descriptor table. `fopen`, `fdopen`,
 native `FILE*` handles cannot represent guest stream lifetime and descriptor
 reuse safely.
 
+## Integration gaps
+
+The descriptor table and leases remain necessary: upstream file APIs still use
+native descriptor numbers, and upstream streams still expose native ownership.
+Keep those operation bodies behind the guest boundary rather than replacing the
+ownership layer with them.
+
+The POSIX `fcntl_nid_postfix` file branch in `Socket/src/Udp.cpp` currently calls
+`File::Fcntl` with the guest number without translation. It can modify a host-only
+file descriptor. The kernel `sceKernelFcntl` hook also only forwards the argument
+for command 4; the new integer, pointer and duplication commands need explicit
+translation and ownership handling. The `guest_dup` shared-status-flags check
+exposes the POSIX translation gap.
+
+The standard-stream mode fixture still passes a native `dup(fileno(...))` result
+to guest `fdopen`; adapt that fixture to use a guest-owned descriptor. Host-only
+descriptors must continue to be rejected.
+
 ## Upstream updates and verification
 
 Add changed or new file entry points to the manifest. CMake rejects unlisted
