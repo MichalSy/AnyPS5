@@ -143,6 +143,12 @@ bool Replay(const char* path) {
             std::ofstream(name, std::ios::binary).write(reinterpret_cast<const char*>(result.spirv.data()), static_cast<std::streamsize>(result.spirv.size() * sizeof(result.spirv[0])));
         }
         if (g_memory) {
+            for (const auto& attribute : result.vertexAttributes) {
+                const auto& words = attribute.resource.fields;
+                std::printf("  vertex location %u: components=%u formatComponents=%u fetchIndex=%u V# %08x %08x %08x %08x\n",
+                    attribute.location, attribute.components, attribute.formatComponents, attribute.fetchIndex,
+                    words[0], words[1], words[2], words[3]);
+            }
             for (const auto& binding : result.bindings) {
                 if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
                 for (std::size_t i = 0; i + 4 <= binding.guestDescriptor.size(); i += 4) {
