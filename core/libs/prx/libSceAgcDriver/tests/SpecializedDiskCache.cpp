@@ -89,6 +89,24 @@ void SpilledImageInterface() {
     for (const auto& binding : compiled.bindings) Require(std::find(interface.bindings.begin(), interface.bindings.end(), binding.binding) != interface.bindings.end(), "image-only LDS interface omitted a runtime binding");
 }
 
+void SplitDescriptorInterface() {
+    // Interface-only fixture: set 1 is a fragment binding or compute workgroup memory.
+    const auto words = [](spv::ExecutionModel stage) {
+        return std::vector<std::uint32_t>{spv::MagicNumber, 0x00010300u, 0u, 8u, 0u,
+            (5u << 16u) | spv::OpEntryPoint, static_cast<std::uint32_t>(stage), 1u, 0x6e69616du, 0u,
+            (4u << 16u) | spv::OpDecorate, 4u, spv::DecorationDescriptorSet, RuntimeAbi::DescriptorSet,
+            (4u << 16u) | spv::OpDecorate, 4u, spv::DecorationBinding, 2u,
+            (4u << 16u) | spv::OpDecorate, 5u, spv::DecorationDescriptorSet, RuntimeAbi::FragmentDescriptorSet,
+            (4u << 16u) | spv::OpDecorate, 5u, spv::DecorationBinding, 63u,
+            (4u << 16u) | spv::OpVariable, 3u, 4u, spv::StorageClassStorageBuffer,
+            (4u << 16u) | spv::OpVariable, 3u, 5u, spv::StorageClassStorageBuffer};
+    };
+    const auto fragment = SpecializedDiskCache::ReadInterface(words(spv::ExecutionModelFragment));
+    Require(fragment.bindings == std::vector<std::uint32_t>{2u, 63u}, "split fragment interface lost descriptor set 1");
+    const auto compute = SpecializedDiskCache::ReadInterface(words(spv::ExecutionModelGLCompute));
+    Require(compute.bindings == std::vector<std::uint32_t>{2u}, "compute workgroup memory became a runtime descriptor");
+}
+
 void SameInvocation(const RecompileResult& left, const RecompileResult& right) {
     Require(left.spirv.Words() == right.spirv.Words(), "loaded specialized SPIR-V differs from uncached compilation");
     Require(left.pushConstants == right.pushConstants, "loaded module retained stale push data");
@@ -282,6 +300,7 @@ int main(int argc, char** argv) {
         child("--load");
         child("--disabled");
         child("--specialized-disabled");
+        SplitDescriptorInterface();
         KeyCoverage(compiled, fixture.request.target);
         const auto directory = SpecializedDiskCache::EntryDirectory();
         auto entries = std::filesystem::directory_iterator(directory);

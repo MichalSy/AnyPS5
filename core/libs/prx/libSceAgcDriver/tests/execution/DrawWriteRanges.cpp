@@ -54,12 +54,13 @@ int main() {
         ShaderRecompiler::DescriptorBinding images;
         images.kind = ShaderRecompiler::DescriptorKind::StorageImage;
         images.role = ShaderRecompiler::DescriptorRole::GuestImages;
-        images.count = 2;
+        images.count = 3;
         for (const auto base : {written, readOnly}) {
             const auto words = ImageWords(base, 256, 128);
             images.guestDescriptor.insert(images.guestDescriptor.end(), words.begin(), words.end());
         }
-        images.imageWritten = {true, false};
+        images.guestDescriptor.insert(images.guestDescriptor.end(), 8u, 0u);
+        images.imageWritten = {true, false, true};
         program.bindings.push_back(images);
         const std::array<AgcDriver::Graphics::CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Fragment, &program, 0}}};
         AgcDriver::Graphics::State state{};

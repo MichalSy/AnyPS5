@@ -110,10 +110,12 @@ Module ReadInterface(std::vector<std::uint32_t> words) {
     if (words.size() < 5 || words[0] != spv::MagicNumber || words[3] == 0 || words[4] != 0) throw std::runtime_error("invalid specialized module header");
     std::map<std::uint32_t, std::uint32_t> bindingNumbers;
     std::map<std::uint32_t, std::uint32_t> descriptorSets;
+    bool fragment = false;
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
         if (count == 0 || count > words.size() - cursor) throw std::runtime_error("truncated specialized module instruction");
+        if (op == spv::OpEntryPoint && count >= 4 && words[cursor + 1] == spv::ExecutionModelFragment) fragment = true;
         if (op == spv::OpDecorate && count == 4 && words[cursor + 2] == spv::DecorationSpecId) throw std::runtime_error("specialized module retains a specialization ID");
         if (op == spv::OpDecorate && count == 4 && words[cursor + 2] == spv::DecorationBinding) bindingNumbers.emplace(words[cursor + 1], words[cursor + 3]);
         if (op == spv::OpDecorate && count == 4 && words[cursor + 2] == spv::DecorationDescriptorSet) descriptorSets.emplace(words[cursor + 1], words[cursor + 3]);
@@ -128,7 +130,9 @@ Module ReadInterface(std::vector<std::uint32_t> words) {
             if (const auto found = bindingNumbers.find(words[cursor + 2]); found != bindingNumbers.end()) {
                 const auto descriptorSet = descriptorSets.find(words[cursor + 2]);
                 if (descriptorSet == descriptorSets.end()) throw std::runtime_error("specialized descriptor variable has no descriptor set");
-                if (descriptorSet->second == RuntimeAbi::DescriptorSet) result.bindings.push_back(found->second);
+                // Set 1 is the fragment interface for graphics, but workgroup memory for compute.
+                if (descriptorSet->second == RuntimeAbi::DescriptorSet ||
+                    (fragment && descriptorSet->second == RuntimeAbi::FragmentDescriptorSet)) result.bindings.push_back(found->second);
             }
             result.pushData |= words[cursor + 3] == spv::StorageClassPushConstant;
         }
