@@ -181,6 +181,19 @@ void Driver::run(std::uint32_t id) noexcept {
                     if (!completionWork()) {
                         const auto idleEpochAtCheck = idleEpoch.load(std::memory_order_acquire);
                         const bool storeIdleResults = id == 0 && allQueuesIdle() && !completionsPending();
+                        if (storeIdleResults) {
+                            // Empty queues between frames are not the end of a workload. Keep
+                            // resident render targets until a consumer needs them, or until all
+                            // queues stay quiet long enough for an otherwise unobserved CPU read.
+                            // Completion labels and hooked reads still publish without this delay.
+                            if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
+                            const bool interrupted = changed.wait_for(lock, std::chrono::milliseconds(100), [&] {
+                                return ready() || completionWork() || !allQueuesIdle()
+                                    || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck;
+                            });
+                            if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
+                            if (interrupted) continue;
+                        }
                         lock.unlock();
                         if (storeIdleResults) {
                             if (const auto localDevice = device.Load()) localDevice->StoreIdleResults();

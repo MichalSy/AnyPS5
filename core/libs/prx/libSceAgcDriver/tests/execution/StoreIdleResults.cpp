@@ -81,16 +81,15 @@ int main() {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
         }
-        std::vector<std::uint32_t> storage((BlockBytes + 0x10000u) / 4u);
+        std::vector<std::uint32_t> storage((2 * BlockBytes + 0x10000u) / 4u);
         auto* texels = reinterpret_cast<std::uint32_t*>((reinterpret_cast<std::uintptr_t>(storage.data()) + 0xffffu) & ~std::uintptr_t{0xffffu});
-        std::fill(texels, texels + BlockBytes / 4u, Untouched);
+        std::fill(texels, texels + 2 * BlockBytes / 4u, Untouched);
         {
             GuestAllocations::Mutation mutation;
-            mutation.Add(texels, BlockBytes, true, true, true);
+            mutation.Add(texels, 2 * BlockBytes, true, true, true);
         }
         const auto bytes = AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(texels))).guestBytes;
-        const volatile std::uint32_t* cpu = texels;
-        const auto stored = [&] {
+        const auto stored = [&](const volatile std::uint32_t* cpu) {
             for (std::size_t index = 0; index < bytes / 4u; ++index) {
                 if (cpu[index] == 0x12345678u) return true;
             }
@@ -99,8 +98,21 @@ int main() {
 
         Store(texels);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (!stored() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        Require(stored(), "the queue-idle store did not bring the result to guest memory without a direct flush or further submission");
+        while (!stored(texels) && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Require(stored(texels), "the queue-idle store did not bring the result to guest memory without a direct flush or further submission");
+
+        // A frame stream repeatedly leaves the queues empty. Those short gaps must
+        // not publish intermediate images; the final result still reaches a raw CPU
+        // reader once submissions stop, without an explicit flush or another packet.
+        auto* frameTexels = texels + BlockBytes / 4u;
+        for (unsigned frame = 0; frame < 25; ++frame) {
+            Store(frameTexels);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            Require(!stored(frameTexels), "a transient gap between submissions published a resident image");
+        }
+        const auto quietDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!stored(frameTexels) && std::chrono::steady_clock::now() < quietDeadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Require(stored(frameTexels), "sustained queue idle did not publish the final frame result");
 
         AgcDriverShutdown_nid_postfix();
         {
