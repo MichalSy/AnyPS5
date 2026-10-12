@@ -157,7 +157,13 @@ void invalidCode(AgcDriver::VulkanDevice& device) {
     try {
         eliminate(device, color);
     } catch (const std::runtime_error& error) {
-        Require(std::string(error.what()).find("were recorded, which are not a single-sample fast-clear code") != std::string::npos, std::string("unexpected failure: ") + error.what());
+        const std::string message(error.what());
+        Require(message.find("were recorded, which are not a single-sample fast-clear code") != std::string::npos, std::string("unexpected failure: ") + error.what());
+        const CmaskLayout layout(Width, Height);
+        char source[64];
+        std::snprintf(source, sizeof(source), "source=0x%016llx", static_cast<unsigned long long>(color.cmaskAddress + layout.Nibble(2, 0) / 2u));
+        Require(message.find(source) != std::string::npos && message.find("target=61x13") != std::string::npos,
+            "the GPU CMASK error did not identify its original metadata and target: " + message);
         return;
     }
     throw std::runtime_error("a CMASK code 3 read by the GPU pass did not throw");

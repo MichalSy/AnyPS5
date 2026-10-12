@@ -231,14 +231,17 @@ std::string hexAddress(std::uint64_t address) {
     return text;
 }
 
-void requireCmaskCodes(std::uint32_t codes) {
+void requireCmaskCodes(const std::array<std::uint32_t, 7>& error) {
+    const auto codes = error[0];
     if (codes == 0) return;
     Require((codes & 1u) == 0, "a CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys, was recorded");
     std::string listed;
     for (std::uint32_t code = 1; code < 15; ++code) {
         if ((codes >> code) & 1u) listed += (listed.empty() ? "" : ", ") + std::to_string(code);
     }
-    Require(false, "CMASK codes " + listed + " were recorded, which are not a single-sample fast-clear code (0 cleared, 15 expanded)");
+    char source[160];
+    std::snprintf(source, sizeof(source), " (source=0x%08x%08x word=0x%08x target=%ux%u)", error[3], error[2], error[4], error[5], error[6]);
+    Require(false, "CMASK codes " + listed + " were recorded, which are not a single-sample fast-clear code (0 cleared, 15 expanded)" + source);
 }
 
 CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::vector<std::uint32_t>& cleared) {
@@ -305,7 +308,7 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     recorder.FlushKeyStoresOverlapping(address, bytes);
     const auto commands = recorder.Commands();
     recorder.Keep(resident);
-    context.detiler->DispatchCmaskClear(commands, import.buffer, address - import.base, bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0);
+    context.detiler->DispatchCmaskClear(commands, import.buffer, address - import.base, bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0, color.cmaskAddress);
     recorder.NotePendingWrite(address, bytes);
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
 }

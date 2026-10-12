@@ -3,7 +3,7 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Cmask { uint words[]; } cmask;
-layout(set = 0, binding = 1, std430) buffer Errors { uint codes; } errors;
+layout(set = 0, binding = 1, std430) buffer Errors { uint codes; uint claimed; uint sourceLow; uint sourceHigh; uint sourceWord; uint width; uint height; } errors;
 layout(set = 0, binding = 2) writeonly uniform uimage2D target;
 
 layout(push_constant) uniform Push {
@@ -14,6 +14,8 @@ layout(push_constant) uniform Push {
     uint clear0;
     uint clear1;
     uint write;
+    uint sourceLow;
+    uint sourceHigh;
 } push;
 
 const uint xMasks[13] = uint[](0x008u, 0x000u, 0x040u, 0x000u, 0x080u, 0x000u, 0x100u, 0x000u, 0x200u, 0x008u, 0x010u, 0x040u, 0x020u);
@@ -34,5 +36,15 @@ void main() {
         imageStore(target, ivec2(pixel), uvec4(push.clear0, push.clear1, 0u, 0u));
         return;
     }
-    if ((pixel.x & 7u) == 0u && (pixel.y & 7u) == 0u) atomicOr(errors.codes, 1u << code);
+    if ((pixel.x & 7u) == 0u && (pixel.y & 7u) == 0u) {
+        if (atomicCompSwap(errors.claimed, 0u, 1u) == 0u) {
+            uint source = push.sourceLow + nibble / 2u;
+            errors.sourceLow = source;
+            errors.sourceHigh = push.sourceHigh + uint(source < push.sourceLow);
+            errors.sourceWord = cmask.words[byteAddress / 4u];
+            errors.width = push.width;
+            errors.height = push.height;
+        }
+        atomicOr(errors.codes, 1u << code);
+    }
 }
