@@ -27,7 +27,6 @@ static constexpr int SCE_PLAYGO_ERROR_BAD_LOCUS = static_cast<int>(0x80B20010);
 
 struct ChunkTable {
     std::set<uint16_t> ids{0};
-    bool defined = false;
 };
 
 static bool ReadPackageChunks(ChunkTable& table) {
@@ -39,7 +38,6 @@ static bool ReadPackageChunks(ChunkTable& table) {
     std::memcpy(&count, header + CountOffset, sizeof(count));
     if (count == 0) return false;
     for (uint32_t id = 0; id < count; ++id) table.ids.insert(static_cast<uint16_t>(id));
-    table.defined = true;
     return true;
 }
 
@@ -51,7 +49,6 @@ static const ChunkTable& Chunks() {
             ReadPackageChunks(table);
             return table;
         }
-        table.defined = true;
         auto& result = table.ids;
         const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         static const std::regex chunk(R"re(<chunk\s+id="(\d+)")re");
@@ -70,7 +67,7 @@ static const ChunkTable& Chunks() {
 
 static bool IsKnownChunk(uint16_t id) {
     const auto& chunks = Chunks();
-    return !chunks.defined || chunks.ids.contains(id);
+    return chunks.ids.contains(id);
 }
 
 static int ValidateChunks(const uint16_t* chunk_ids, uint32_t number_of_entries) {

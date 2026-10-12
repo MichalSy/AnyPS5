@@ -64,6 +64,7 @@ int main(int argc, char** argv) {
     constexpr int badPointer = static_cast<int>(0x80B2000A);
     constexpr int badSize = static_cast<int>(0x80B2000B);
     constexpr int badLocus = static_cast<int>(0x80B20010);
+    constexpr int badChunkId = static_cast<int>(0x80B2000C);
 
     PlayGoInitParams init{};
     int handle = 0;
@@ -85,7 +86,7 @@ int main(int argc, char** argv) {
     todo[1].locus = 1;
     Require(scePlayGoSetToDoList(handle, todo, 2) == badLocus);
     todo[1] = {0xFFFF, 3, 0};
-    Require(scePlayGoSetToDoList(handle, todo, 2) == 0);
+    Require(scePlayGoSetToDoList(handle, todo, 2) == badChunkId);
 
     std::uint32_t entries = 1;
     Require(scePlayGoGetToDoList(handle, todo, 2, &entries) == 0 && entries == 0);
@@ -95,9 +96,19 @@ int main(int argc, char** argv) {
     Require(scePlayGoGetLocus(handle, &chunk, 1, &locus) == 0 && locus == 3);
     const std::uint16_t undeclared[2] = {1, 10};
     std::int8_t loci[2] = {0, 0};
-    Require(scePlayGoGetLocus(handle, undeclared, 2, loci) == 0 && loci[0] == 3 && loci[1] == 3);
+    Require(scePlayGoGetLocus(handle, undeclared, 2, loci) == badChunkId);
     std::uint32_t chunkCount = 0;
     Require(scePlayGoGetChunkId(handle, nullptr, 0, &chunkCount) == 0 && chunkCount == 1);
+    // UE4 probes consecutive IDs until BAD_CHUNK_ID. Even without package
+    // metadata this must terminate at the end of the same set GetChunkId lists.
+    std::uint32_t probed = 0;
+    for (; probed < 0x10000; ++probed) {
+        const auto id = static_cast<std::uint16_t>(probed);
+        const auto result = scePlayGoGetLocus(handle, &id, 1, &locus);
+        if (result == badChunkId) break;
+        Require(result == 0 && locus == 3);
+    }
+    Require(probed == chunkCount);
     Require(scePlayGoClose(handle + 1) == badHandle);
     Require(scePlayGoClose(handle) == 0);
 }
