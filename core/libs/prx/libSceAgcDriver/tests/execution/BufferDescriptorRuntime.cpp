@@ -152,17 +152,22 @@ void ConditionalDescriptor(AgcDriver::VulkanDevice& device) {
         {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))},
         {tableAddress, std::as_bytes(std::span(table, 4))},
     }};
-    for (const auto mode : {0u, 1u, 2u, 3u}) {
+    std::vector<ShaderRecompiler::PipelineSpecializationConstant> skippedSpecialization;
+    for (const auto mode : {0u, 1u, 4u, 2u, 3u}) {
         std::fill_n(output, Lanes, Fill);
         auto descriptor = BufferDescriptor(input, Lanes * 4u);
-        if (mode == 1u || mode == 3u) descriptor = {0x25f72f5du, 0x3c00345fu, 0x25f22f55u, 0x3c00345du};
+        if (mode == 1u || mode == 3u || mode == 4u) descriptor = {0x25f72f5du, 0x3c00345fu, 0x25f22f55u, 0x3c00345du};
+        if (mode == 4u) descriptor[3] ^= 0x00400000u;
         if (mode == 3u) descriptor[3] = (descriptor[3] & ~7u) | 2u;
         if (mode == 2u) descriptor = {0x11u, 0x20000180u, 0x12u, 0u};
         std::copy(descriptor.begin(), descriptor.end(), table);
-        userData[10] = mode == 1u ? 0u : 1u;
+        userData[10] = mode == 1u || mode == 4u ? 0u : 1u;
         auto request = Request(userData, device.ComputeTarget(Lanes), memory, code);
         request.useCache = false;
         const auto shader = ShaderRecompiler::Recompile(request);
+        if (mode == 1u) skippedSpecialization = shader.specialization;
+        if (mode == 4u) Require(shader.specialization == skippedSpecialization,
+            "unused conditional descriptor fields created a new specialization");
         bool faulted = false;
         try {
             device.Dispatch(shader, 1, 1, 1);

@@ -275,8 +275,18 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if (descriptor.dwordCount != 4u) fail("buffer specialization requires four descriptor words");
         const auto& buffer = info.buffers[index];
         if (buffer.gpuDescriptorOnly) {
-            // The immutable SRT snapshot proves the format, but execution decides whether to access it.
-            plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, descriptor.dwords[3]});
+            // Only the format switch is specialized; all other descriptor fields stay GPU values.
+            if (buffer.descriptorFormatted) {
+                auto format = (descriptor.dwords[3] >> 12u) & 0x7fu;
+                bool invalid = (descriptor.dwords[3] >> 30u) != 0u || format > static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float);
+                for (std::uint32_t component = 0; component < 4u; ++component) {
+                    if ((buffer.formattedReadMask & (1u << component)) == 0u) continue;
+                    const auto selector = (descriptor.dwords[3] >> (component * 3u)) & 7u;
+                    invalid = invalid || selector == 2u || selector == 3u;
+                }
+                if (invalid) format = static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float) + 1u;
+                plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, format});
+            }
             continue;
         }
         const auto format = (descriptor.dwords[3] >> 12u) & 0x7fu;
