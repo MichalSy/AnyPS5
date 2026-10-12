@@ -142,12 +142,14 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        constexpr std::array<Case, 7> cases{{
+        constexpr std::array<Case, 9> cases{{
             {2u, 1u, true, "OOB_SELECT 2, one record"},
             {2u, 0u, false, "OOB_SELECT 2, no records"},
             {3u, 16u, true, "OOB_SELECT 3, whole element in range"},
             {3u, 0u, false, "OOB_SELECT 3, no records"},
-            {0u, 16u, true, "OOB_SELECT 0, whole element in range"},
+            {0u, 16u, false, "OOB_SELECT 0, zero stride rejects offset zero"},
+            {0u, 1u, false, "Sackboy OOB_SELECT 0, one byte and zero stride"},
+            {0u, 1u, false, "OOB_SELECT 0, selectors W Z 1 0", 7u | (6u << 3u) | (1u << 6u)},
             {3u, 16u, true, "OOB_SELECT 3, selectors W Z 1 0", 7u | (6u << 3u) | (1u << 6u) | (0u << 9u)},
             {3u, 0u, false, "OOB_SELECT 3, no records, selectors W Z 1 0", 7u | (6u << 3u) | (1u << 6u) | (0u << 9u)},
         }};

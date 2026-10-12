@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <set>
@@ -141,7 +142,8 @@ inline std::uint32_t VertexBufferOutOfBoundsSelect(const ShaderRecompiler::Verte
 inline bool VertexFetchOutOfRange(const ShaderRecompiler::VertexAttribute& attribute) {
     const auto stride = (attribute.resource.fields[1] >> 16u) & 0x3fffu;
     const auto select = VertexBufferOutOfBoundsSelect(attribute);
-    return stride == 0 && (select == 2u || select == 3u) && attribute.resource.fields[2] == 0;
+    // Structured bounds reject offset 0 when STRIDE is 0, regardless of NUM_RECORDS.
+    return stride == 0 && (select == 0u || ((select == 2u || select == 3u) && attribute.resource.fields[2] == 0));
 }
 
 inline std::uint64_t ZeroStrideAvailableBytes(const ShaderRecompiler::VertexAttribute& attribute) {
@@ -151,7 +153,7 @@ inline std::uint64_t ZeroStrideAvailableBytes(const ShaderRecompiler::VertexAttr
 }
 
 inline std::size_t VertexBufferExtent(const ShaderRecompiler::VertexAttribute& attribute) {
-    if (NullVertexDescriptor(attribute)) return DecodeVertexFormat(attribute).bytes;
+    if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) return DecodeVertexFormat(attribute).bytes;
     const auto stride = (attribute.resource.fields[1] >> 16u) & 0x3fffu;
     const auto records = attribute.resource.fields[2];
     Require(attribute.fetchIndex <= 1, "unsupported vertex fetch index");
@@ -165,7 +167,7 @@ inline std::size_t VertexBufferExtent(const ShaderRecompiler::VertexAttribute& a
 inline std::size_t VertexBufferReadSize(const ShaderRecompiler::VertexAttribute& attribute, std::uint32_t maxIndex, std::uint32_t instances, std::uint32_t firstInstance = 0) {
     Require(instances != 0, "vertex input requires nonzero instance count");
     Require(firstInstance <= std::numeric_limits<std::uint32_t>::max() - (instances - 1u), "vertex input instance range overflow");
-    if (NullVertexDescriptor(attribute)) return DecodeVertexFormat(attribute).bytes;
+    if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) return DecodeVertexFormat(attribute).bytes;
     const auto stride = (attribute.resource.fields[1] >> 16u) & 0x3fffu;
     const auto records = attribute.resource.fields[2];
     Require(attribute.fetchIndex <= 1, "unsupported vertex fetch index");
@@ -173,7 +175,13 @@ inline std::size_t VertexBufferReadSize(const ShaderRecompiler::VertexAttribute&
     const auto bytes = DecodeVertexFormat(attribute).bytes;
     Require(stride == 0 || VertexBufferOutOfBoundsSelect(attribute) <= 1u || index < records, "vertex fetch exceeds descriptor record count");
     const auto required = static_cast<std::uint64_t>(stride) * index + bytes;
-    Require(stride != 0 || required <= ZeroStrideAvailableBytes(attribute), "vertex fetch exceeds descriptor byte range");
+    if (stride == 0 && required > ZeroStrideAvailableBytes(attribute)) {
+        char detail[256];
+        std::snprintf(detail, sizeof(detail), "vertex fetch exceeds descriptor byte range: location=%u components=%u formatComponents=%u required=%llu descriptor=%08x %08x %08x %08x",
+            attribute.location, attribute.components, attribute.formatComponents, static_cast<unsigned long long>(required),
+            attribute.resource.fields[0], attribute.resource.fields[1], records, attribute.resource.fields[3]);
+        Require(false, detail);
+    }
     Require(required <= std::numeric_limits<std::size_t>::max(), "vertex fetch exceeds addressable byte range");
     const auto address = attribute.resource.fields[0] | (static_cast<std::uint64_t>(attribute.resource.fields[1] & 0xffffu) << 32u);
     Require(address != 0 && required <= std::numeric_limits<std::uint64_t>::max() - address, "invalid vertex buffer address range");

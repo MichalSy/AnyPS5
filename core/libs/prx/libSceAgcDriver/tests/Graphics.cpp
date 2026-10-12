@@ -4709,8 +4709,8 @@ void validationTests() {
         attribute.resource.fields[2] = 16;
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 100, 2) == 16, "zero stride must repeat one value");
         attribute.resource.fields[2] = 8;
-        expectFailure([&] { AgcDriver::Graphics::VertexBufferReadSize(attribute, 0, 1); }, "byte range");
-        Require(!AgcDriver::Graphics::VertexFetchOutOfRange(attribute), "a structured zero-stride fetch was treated as out of range");
+        Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 0, 1) == 16, "a structured zero-stride fetch needs a complete zero element");
+        Require(AgcDriver::Graphics::VertexFetchOutOfRange(attribute), "a structured zero-stride fetch must reject offset zero");
         attribute.resource.fields[3] = (77u << 12u) | (2u << 28u);
         attribute.resource.fields[2] = 1;
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 100, 2) == 16, "OOB_SELECT 2 must read a zero-stride fetch whole while NUM_RECORDS is nonzero");
