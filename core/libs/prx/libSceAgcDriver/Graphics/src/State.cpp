@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleColorLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleColorSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
@@ -865,13 +866,6 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     }
     APS5_LOG_OUT_DEBUG("Topology=%u", static_cast<unsigned>(result.topology));
     result.primitiveRestart = read(queue.userConfig, 0x24b, RegisterBank::UserConfig) != 0 && !result.rectList && result.topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
-    if ((read(cx, 0x207) & LayerExports) != 0) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
-        }
-    }
     zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
     result.samples = decodeSamples(cx);
     decodeSampleLocations(cx, result);
@@ -970,12 +964,15 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         APS5_LOG_OUT_DEBUG("Color %u address=0x%llx extent=%ux%u bytes=%llu VkFormat=%u", slot, static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.bytes), static_cast<unsigned>(color.format));
         if (result.colors.empty()) {
             result.renderExtent = color.extent;
+            result.renderLayers = color.layerCount;
         } else {
             result.renderExtent = {std::min(result.renderExtent.width, color.extent.width), std::min(result.renderExtent.height, color.extent.height)};
         }
+        result.renderLayers = std::min(result.renderLayers, color.layerCount);
         result.colors.push_back(color);
     }
     if (result.hasColorTarget) {
+        Require(!result.depth || result.renderLayers == 1, "layered color rendering with a single-layer depth attachment is unsupported");
         result.color = result.colors.front();
         if (result.depth) result.renderExtent = {std::min(result.renderExtent.width, result.depth->extent.width), std::min(result.renderExtent.height, result.depth->extent.height)};
     } else if (result.depth) {
@@ -1157,7 +1154,8 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto view = read(cx, 0x31b + stride);
     Require((view & ~0x3fffffffu) == 0, "reserved CB_COLOR_VIEW bits are set");
     const auto slice = view & 0x1fffu;
-    Require(slice == ((view >> 13u) & 0x1fffu), "color views of several array slices are unsupported");
+    const auto lastSlice = (view >> 13u) & 0x1fffu;
+    Require(lastSlice >= slice, "color view ends before its first slice");
     const auto viewMip = (view >> 26u) & 0xfu;
     const auto attrib = read(cx, 0x31d + stride);
     Require((attrib & ~0x0003f000u) == 0, "unsupported color attribute flags");
@@ -1173,7 +1171,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     color.tileMode = DecodeColorTileMode(attrib3);
     const bool volume = ((attrib3 >> 24u) & 3u) == 2u;
     if (color.samples != VK_SAMPLE_COUNT_1_BIT) {
-        Require(!volume && maxMip == 0u && viewMip == 0u && slice == 0u, "multisampled mipmapped, array or volume color views are unsupported");
+        Require(!volume && maxMip == 0u && viewMip == 0u && slice == 0u && lastSlice == 0u, "multisampled mipmapped, array or volume color views are unsupported");
         Require((info & 0x10000000u) == 0u, "multisampled DCC color metadata is unsupported");
     }
     Require(((attrib3 >> 24u) & 3u) != 0u || (attrib2 & 0x3fffu) == 0u, "1D color targets taller than one row are unsupported");
@@ -1187,6 +1185,10 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
         color.arrayLastSlice = attrib3 & 0x1fffu;
         color.arraySlice = slice;
     }
+    const auto surfaceLastSlice = volume ? color.depth - 1u : color.arrayLastSlice;
+    Require(slice <= surfaceLastSlice, "color view starts beyond its surface");
+    // SLICE_MAX bounds shader-selected indices; the resource depth can be smaller.
+    color.layerCount = std::min(lastSlice, surfaceLastSlice) - slice + 1u;
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
     color.elementBytes = decoded.elementBytes;
     std::uint64_t mipOffset = 0;
@@ -1213,6 +1215,25 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     if (slice != 0 && !volume) color.surfaceAddress += slice * ComputeSurfaceSize(ComputeElementMipLayout(ColorTextureTileMode(color.tileMode), color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount), 1);
     color.address = color.surfaceAddress + mipOffset;
     color.bytes = (color.samples == VK_SAMPLE_COUNT_1_BIT || color.resolveOnlyMultisample) ? colorLayout.Bytes() : MultisampleColorLayout(color.extent.width, color.extent.height, color.elementBytes, static_cast<std::uint32_t>(color.samples), color.pipeBankXor).Bytes();
+    if (color.layerCount > 1) {
+        if (volume) {
+            GuestTextureResource surface{};
+            surface.baseAddress = color.surfaceAddress;
+            surface.width = color.surfaceExtent.width;
+            surface.height = color.surfaceExtent.height;
+            surface.depthOrLastArray = color.depth - 1u;
+            surface.mipCount = color.mipCount;
+            surface.lastLevel = color.mipCount - 1u;
+            surface.dimension = TextureDimension::k3D;
+            surface.tileMode = ColorTextureTileMode(color.tileMode);
+            const auto guestFormat = FindGuestColorTargetFormat(decoded.format, decoded.elementBytes);
+            Require(guestFormat.has_value(), "layered color target has no guest texture format");
+            surface.format = *guestFormat;
+            color.bytes = DescribeSurface(surface).guestBytes;
+        } else {
+            color.bytes = color.layerCount * ComputeSurfaceSize(ComputeElementMipLayout(ColorTextureTileMode(color.tileMode), color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount), 1);
+        }
+    }
     GuestMemory::CheckRange(reinterpret_cast<const void*>(color.address), color.bytes, colorLayout.Alignment(), true);
     color.format = decoded.format;
     color.componentMapping = decoded.componentMapping;

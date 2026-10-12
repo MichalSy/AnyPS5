@@ -132,6 +132,7 @@ struct MeshDraw {
     bool restart = false;
     std::uint32_t waveSize = 64u;
     VkCullModeFlags cull = VK_CULL_MODE_NONE;
+    bool layerExport = false;
 };
 
 bool ReadsNumWorkgroups(const std::vector<std::uint32_t>& words) {
@@ -160,7 +161,24 @@ void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
     const auto index = AgcDriver::Graphics::MeshIndexBufferDescriptor(setup.draw);
     std::copy(index.begin(), index.end(), userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
     std::copy(setup.vertexBuffer.begin(), setup.vertexBuffer.end(), userData.begin() + 8);
-    const auto& code = setup.waveSize == 32u ? Wave32GeometryCode : GeometryCode;
+    const auto& source = setup.waveSize == 32u ? Wave32GeometryCode : GeometryCode;
+    std::vector<std::uint32_t> code(source.begin(), source.end());
+    if (setup.layerExport) {
+        const auto position = std::find(code.begin(), code.end(), 0xf80008cfu);
+        Require(position != code.end(), "mesh layer fixture has no position export");
+        // Export layer zero in POS1.z before the final position export.
+        const auto insertion = static_cast<std::int32_t>(position - code.begin());
+        for (std::int32_t at = 0; at < static_cast<std::int32_t>(code.size()); ++at) {
+            const auto opcode = code[at] >> 16u;
+            if (opcode < 0xbf82u || opcode > 0xbf89u) continue;
+            auto displacement = static_cast<std::int16_t>(code[at]);
+            const auto destination = at + 1 + displacement;
+            if (at < insertion && destination >= insertion) displacement += 3;
+            else if (at >= insertion && destination < insertion) displacement -= 3;
+            code[at] = (code[at] & 0xffff0000u) | static_cast<std::uint16_t>(displacement);
+        }
+        code.insert(code.begin() + insertion, {0x7e680280u, 0xf80000d4u, 0x00340000u});
+    }
     const std::array<ShaderRecompiler::MemoryRegion, 1> geometryMemory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))}}};
     ShaderRecompiler::RecompileRequest geometry{
         {ShaderStage::Mesh, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
@@ -169,6 +187,7 @@ void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
         {0, 0, 0, setup.geometryPushBytes},
         ShaderRecompiler::GraphicsCompileContext{0, {}, setup.mesh, std::nullopt, {setup.draw.indexAddress, setup.draw.indexCount, setup.draw.indexSize, setup.draw.instanceCount}}
     };
+    if (setup.layerExport) geometry.context.vertex->paClVsOutCntl = (1u << 18u) | (1u << 21u);
     const auto meshResult = ShaderRecompiler::Recompile(geometry);
     Require(ReadsNumWorkgroups(meshResult.spirv), "the mesh program does not read NumWorkgroups, so RADV can keep a previous vertex pipeline's user SGPR count for its dispatch");
     const auto meshPush = static_cast<std::uint32_t>(meshResult.pushConstants.size());
@@ -332,6 +351,10 @@ int main() {
             DrawMesh(device, {subgroup, {0, static_cast<std::uint32_t>(Ordered.size()), 0, 1, 0, false}, VertexBufferDescriptor(Ordered.data(), static_cast<std::uint32_t>(Ordered.size()))});
             CheckTriangles((std::string("non-indexed triangle list, ") + name).c_str());
         }
+
+        ClearPixels();
+        DrawMesh(device, {SmallSubgroup, {0, static_cast<std::uint32_t>(Ordered.size()), 0, 1, 0, false}, VertexBufferDescriptor(Ordered.data(), static_cast<std::uint32_t>(Ordered.size())), ShaderRecompiler::MeshDrawPushOffsetBytes, false, 64u, VK_CULL_MODE_NONE, true});
+        CheckTriangles("mesh per-primitive layer export");
 
         auto wave32Subgroup = SmallSubgroup;
         wave32Subgroup.threadsPerGroup = 32u;

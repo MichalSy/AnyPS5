@@ -58,6 +58,7 @@ struct ColorTarget {
     std::uint64_t arrayAddress = 0;
     std::uint32_t arrayLastSlice = 0;
     std::uint32_t arraySlice = 0;
+    std::uint32_t layerCount = 1;
     std::uint32_t exportIndex = 0;
     bool uintExport = false;
     std::uint32_t pipeBankXor = 0;
@@ -114,6 +115,7 @@ struct State {
     bool rectList = false;
     bool dualSourceBlend = false;
     VkExtent2D renderExtent;
+    std::uint32_t renderLayers = 1;
     VkPrimitiveTopology topology;
     bool primitiveRestart = false;
     VkViewport viewport;

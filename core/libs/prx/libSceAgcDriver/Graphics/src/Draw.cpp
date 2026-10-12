@@ -50,6 +50,7 @@ std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std:
         mix(state.blends.size());
         for (const auto& color : state.colors) mix(color.exportIndex);
     }
+    mix(state.renderLayers);
     mix(state.renderExtent.width);
     mix(state.renderExtent.height);
     mix(state.samples);
@@ -2051,7 +2052,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
-            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.arraySlice));
+            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.arraySlice, color.layerCount));
             continue;
         }
         materializeCmaskClear(context, color, nullptr);
@@ -2063,7 +2064,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             if (traced.insert(color.address).second) std::fprintf(stderr, "[sync-target] 0x%llx %ux%u tile %d format %d element %u bytes 0x%llx gpuTiling %d detiler %d\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.tileMode), static_cast<int>(color.format), color.elementBytes, static_cast<unsigned long long>(color.bytes), binding.gpuTiling ? 1 : 0, context.detiler != nullptr ? 1 : 0);
         }
         Require(!color.mipTail || binding.gpuTiling, "rendering into a packed mip tail requires the GPU tiled fallback");
-        Require(color.depth == 1, "rendering into a 3D color target needs the resident image of its surface");
+        Require(color.depth == 1 && color.layerCount == 1, "rendering into a layered color target needs the resident image of its surface");
         Require(color.arraySlice == 0 || !ColorTileModeIsXor(color.tileMode), "rendering into a slice of a 2D array color target with an XOR tile mode needs the resident image of its array");
         if (binding.gpuTiling) {
             binding.mip = color.mipTail ? ComputeColorTargetMipLayout(color.tileMode, color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount, color.mip) : ColorTargetMip(color, colorLayout);
@@ -2248,7 +2249,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.multisample != nullptr) multisamples.push_back(binding.multisample);
         persistent.push_back(binding.multisampled ? 1u : 0u);
     }
-    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, persistent);
+    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, persistent, state.renderLayers);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -2640,7 +2641,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
     auto framebuffer = recipe.framebuffer.lock();
-    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent);
+    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent, {}, state.renderLayers);
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;

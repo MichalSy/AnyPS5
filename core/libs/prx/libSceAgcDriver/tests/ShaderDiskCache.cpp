@@ -460,6 +460,13 @@ void verifyKeySensitivity() {
     input.resourcesDst[0] = {0u, 4u, 0u, 0u};
     const auto vertexKey = vertex.Key();
     const auto contextKey = RecompileCacheKey::ContextHash(vertex.request);
+    input.paClVsOutCntl = (1u << 18u) | (1u << 21u);
+    require(vertex.Key() != vertexKey && RecompileCacheKey::ContextHash(vertex.request) != contextKey, "layer exports reused a non-layered vertex interface");
+    const RequestSerializer serializer;
+    const auto layerRoundTrip = serializer.Deserialize(serializer.Serialize(vertex.request));
+    require(layerRoundTrip.request.context.vertex->paClVsOutCntl == input.paClVsOutCntl, "layer export control was lost in request serialization");
+    input.paClVsOutCntl = 0;
+
     input.resources[0].fields = {0x20000u, 32u << 16u, 128u, (77u << 12u) | 0xfa9u};
     require(vertex.Key() == vertexKey && RecompileCacheKey::ContextHash(vertex.request) == contextKey, "runtime vertex format, stride, swizzle or address changed the static interface key");
     input.resources[0].fields[3] = (20u << 12u) | 0xfacu;

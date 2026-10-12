@@ -1058,6 +1058,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     }
     if (request.context.vertex) {
         const auto& vertex = *request.context.vertex;
+        mix(vertex.paClVsOutCntl);
         const auto count = std::min<std::uint32_t>(vertex.resourcesNum, ShaderVertexStageInfo::MaxResources);
         mix(count);
         for (std::uint32_t i = 0; i < count; ++i) {

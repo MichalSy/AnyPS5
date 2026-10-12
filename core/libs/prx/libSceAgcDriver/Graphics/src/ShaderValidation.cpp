@@ -127,7 +127,7 @@ struct Module {
                 return;
             }
             if (!input && value == spv::BuiltInPrimitiveTriangleIndicesEXT) primitiveIndices = true;
-            Require((input && ((value == spv::BuiltInWorkgroupId || value == spv::BuiltInLocalInvocationId || value == spv::BuiltInGlobalInvocationId || value == spv::BuiltInNumWorkgroups) && signature == "u32x3")) || (input && value == spv::BuiltInLocalInvocationIndex && signature == "u32") || (!input && value == spv::BuiltInPrimitiveTriangleIndicesEXT && signature == "u32x3") || (!input && value == spv::BuiltInCullPrimitiveEXT && signature == "bool"), "unsupported mesh built-in");
+            Require((input && ((value == spv::BuiltInWorkgroupId || value == spv::BuiltInLocalInvocationId || value == spv::BuiltInGlobalInvocationId || value == spv::BuiltInNumWorkgroups) && signature == "u32x3")) || (input && value == spv::BuiltInLocalInvocationIndex && signature == "u32") || (!input && value == spv::BuiltInPrimitiveTriangleIndicesEXT && signature == "u32x3") || (!input && value == spv::BuiltInCullPrimitiveEXT && signature == "bool") || (!input && value == spv::BuiltInLayer && signature == "u32"), "unsupported mesh built-in");
             return;
         }
         const auto signature = Signature(type);
@@ -480,6 +480,9 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                 auto& locations = variable.storage == spv::StorageClassInput ? module.inputs : module.outputs;
                 module.AddLocations(locations, *decoration.location, typeId, decoration.patch);
             } else if (decoration.builtin) {
+                if (mesh && *decoration.builtin == spv::BuiltInLayer) {
+                    Require(output && decoration.perPrimitive, "mesh layer output must be per-primitive");
+                }
                 module.Builtin(*decoration.builtin, typeId, variable.storage, stage, subgroup);
             } else {
                 Require((type[0] & 0xffffu) == spv::OpTypeStruct, "shader interface lacks a location or built-in");

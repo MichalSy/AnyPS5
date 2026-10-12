@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
@@ -27,6 +28,12 @@
 #include <span>
 #include <string>
 #include <vector>
+
+namespace AgcDriver {
+struct VulkanDeviceTestAccess {
+    static Graphics::Context Context(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+}
 
 namespace {
 
@@ -165,17 +172,18 @@ void RequireOutput(std::uint32_t inside, std::uint32_t outside, const std::strin
     }
 }
 
-AgcDriver::Graphics::ColorTarget DecodeTarget(std::uint64_t address, std::uint32_t slice) {
+AgcDriver::Graphics::ColorTarget DecodeTarget(std::uint64_t address, std::uint32_t slice, std::uint32_t last = ~0u) {
     AgcDriver::Registers cx;
     cx[0x318] = static_cast<std::uint32_t>(address >> 8u);
-    cx[0x31b] = slice | (slice << 13u);
+    if (last == ~0u) last = slice;
+    cx[0x31b] = slice | (last << 13u);
     cx[0x31c] = Color32FloatInfo;
     cx[0x31d] = 0;
     cx[0x3b0] = ((Side - 1u) << 14u) | (Side - 1u);
     cx[0x3b8] = TiledAttrib3 | (Layers - 1u);
     cx[0x390] = static_cast<std::uint32_t>(address >> 40u);
     const auto color = AgcDriver::Graphics::DecodeColorBuffer(cx, 0);
-    Require(color.format == VK_FORMAT_R32_SFLOAT && color.bytes == LayerBytes && color.address == address + slice * LayerBytes, "the COLOR_32 float view did not decode as a 128x128 R32 slice of the array");
+    Require(color.format == VK_FORMAT_R32_SFLOAT && color.bytes == LayerBytes * (last - slice + 1u) && color.layerCount == last - slice + 1u && color.address == address + slice * LayerBytes, "the COLOR_32 float view did not decode as a 128x128 R32 slice of the array");
     Require(color.arrayAddress == address && color.arrayLastSlice == Layers - 1u && color.arraySlice == slice, "the color view did not keep its array and slice");
     return color;
 }
@@ -246,6 +254,54 @@ void DrawSlice(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint
     device.WaitIdle();
 }
 
+void ClearLayers(AgcDriver::VulkanDevice& device, StorageTexture& image) {
+    using namespace AgcDriver::Graphics;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::Context(device);
+    device.WaitIdle();
+    const auto view = image.AttachmentView(VK_FORMAT_R32_SFLOAT, 0, 0, 1, 2);
+    Require(view != image.AttachmentView(VK_FORMAT_R32_SFLOAT, 0, 0, 1), "layered attachment reused a single-layer view");
+    VkAttachmentDescription attachment{};
+    attachment.format = VK_FORMAT_R32_SFLOAT;
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.initialLayout = attachment.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    const VkAttachmentReference reference{0, VK_IMAGE_LAYOUT_GENERAL};
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &reference;
+    VkRenderPassCreateInfo create{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    create.attachmentCount = 1;
+    create.pAttachments = &attachment;
+    create.subpassCount = 1;
+    create.pSubpasses = &subpass;
+    VkRenderPass pass = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &create, nullptr, &pass), "create layered test pass");
+    {
+        const std::array<VkImageView, 1> views{view};
+        Framebuffer framebuffer(context, pass, views, {Side, Side}, 2);
+        CommandBatch batch(context);
+        const auto commands = batch.Handle();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        begin.renderPass = pass;
+        begin.framebuffer = framebuffer.Handle();
+        begin.renderArea = {{0, 0}, {Side, Side}};
+        context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
+        VkClearAttachment clear{};
+        clear.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        clear.clearValue.color.float32[0] = 0.75f;
+        const VkClearRect rect{{{0, 0}, {ScissorWidth, Side}}, 0, 2};
+        context.Function<PFN_vkCmdClearAttachments>("vkCmdClearAttachments")(commands, 1, &clear, 1, &rect);
+        context.Function<PFN_vkCmdEndRenderPass>("vkCmdEndRenderPass")(commands);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        batch.SubmitAndWait();
+    }
+    context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, pass, nullptr);
+    image.MarkDirty();
+}
+
 void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
     const auto surface = AddressOf(texels);
     std::fill_n(reinterpret_cast<std::uint32_t*>(texels), SurfaceBytes / 4u, Initial);
@@ -262,13 +318,24 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
         LoadLayer(device, surface, other);
         RequireOutput(Initial, Initial, "slice " + std::to_string(other) + " after the draw into slice 1");
     }
+    const auto layered = DecodeTarget(surface, 1, 2);
+    Require(layered.layerCount == 2 && layered.arraySlice == 1, "the layered color view did not retain its subrange");
+    ClearLayers(device, *pending);
+    for (const std::uint32_t layer : {1u, 2u}) {
+        LoadLayer(device, surface, layer);
+        RequireOutput(std::bit_cast<std::uint32_t>(0.75f), Initial, "layered clear slice " + std::to_string(layer));
+    }
+    for (const std::uint32_t layer : {0u, 3u}) {
+        LoadLayer(device, surface, layer);
+        RequireOutput(Initial, Initial, "slice outside the layered view " + std::to_string(layer));
+    }
     StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
     device.WaitIdle();
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
     AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
     AgcDriver::GuestMemory::BumpCollectEpoch();
     LoadLayer(device, surface, 1);
-    RequireOutput(drawn, Initial, "slice 1 uploaded again from guest memory");
+    RequireOutput(std::bit_cast<std::uint32_t>(0.75f), Initial, "slice 1 uploaded again from guest memory");
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
 }
 
