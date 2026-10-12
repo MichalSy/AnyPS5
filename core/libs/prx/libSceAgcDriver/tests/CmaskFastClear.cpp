@@ -145,6 +145,25 @@ void run(AgcDriver::VulkanDevice& device, ColorTileMode mode, const std::string&
     expect(device, color, [](std::uint32_t x, std::uint32_t y) { return y < 4 ? Drawn : y >= 8 && x >= 24 ? Clear : Stale; }, name + " fast-cleared bottom edge tiles under a draw of the top rows");
 }
 
+void queuedCmaskInitialization(AgcDriver::VulkanDevice& device) {
+    const auto color = target(ColorTileMode::RenderTarget);
+    prepare(color, [](std::uint32_t, std::uint32_t) { return true; }, 3);
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "the CMASK test has no active recorder");
+        recorder->Commands();
+        const std::array<std::byte, 4096> cleared{};
+        Require(device.WriteLabelOnGpu(color.cmaskAddress, cleared, 1, 0) == 0,
+            "the CMASK initialization was not queued on the GPU");
+        Require(recorder->QueuedStoreOverlaps(color.cmaskAddress, cleared.size()),
+            "the CMASK initialization was executed before its consumer");
+    }
+    eliminate(device, color);
+    expect(device, color, [](std::uint32_t, std::uint32_t) { return Clear; },
+        "CMASK initialization queued before its fast-clear consumer");
+}
+
 void invalidCode(AgcDriver::VulkanDevice& device) {
     const auto color = target(ColorTileMode::RenderTarget);
     prepare(color, [](std::uint32_t tileX, std::uint32_t tileY) { return tileX == 2 && tileY == 0; }, 3);
@@ -164,6 +183,8 @@ void invalidCode(AgcDriver::VulkanDevice& device) {
         std::snprintf(source, sizeof(source), "source=0x%016llx", static_cast<unsigned long long>(color.cmaskAddress + layout.Nibble(2, 0) / 2u));
         Require(message.find(source) != std::string::npos && message.find("target=61x13") != std::string::npos,
             "the GPU CMASK error did not identify its original metadata and target: " + message);
+        std::snprintf(source, sizeof(source), "base=0x%016llx", static_cast<unsigned long long>(color.cmaskAddress));
+        Require(message.find(source) != std::string::npos, "the GPU CMASK error lost the original metadata base: " + message);
         return;
     }
     throw std::runtime_error("a CMASK code 3 read by the GPU pass did not throw");
@@ -188,6 +209,7 @@ int main() {
         }
         run(*device, ColorTileMode::Linear, "linear");
         run(*device, ColorTileMode::RenderTarget, "SW_64KB_R_X");
+        queuedCmaskInitialization(*device);
         invalidCode(*device);
         device->WaitIdle();
         device.reset();

@@ -239,8 +239,9 @@ void requireCmaskCodes(const std::array<std::uint32_t, 7>& error) {
     for (std::uint32_t code = 1; code < 15; ++code) {
         if ((codes >> code) & 1u) listed += (listed.empty() ? "" : ", ") + std::to_string(code);
     }
-    char source[160];
-    std::snprintf(source, sizeof(source), " (source=0x%08x%08x word=0x%08x target=%ux%u)", error[3], error[2], error[4], error[5], error[6]);
+    char source[192];
+    const auto baseHigh = error[3] - static_cast<std::uint32_t>(error[6] > error[2]);
+    std::snprintf(source, sizeof(source), " (source=0x%08x%08x base=0x%08x%08x word=0x%08x target=%ux%u dcc=%u colorAlias=%u)", error[3], error[2], baseHigh, error[6], error[4], error[5] & 0xffffu, error[5] >> 16u, (error[1] >> 1u) & 1u, (error[1] >> 2u) & 1u);
     Require(false, "CMASK codes " + listed + " were recorded, which are not a single-sample fast-clear code (0 cleared, 15 expanded)" + source);
 }
 
@@ -271,7 +272,7 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
             const auto nibble = layout.Nibble(tileX, tileY);
             const auto code = (std::to_integer<std::uint32_t>(mask[nibble / 2u]) >> ((nibble % 2u) * 4u)) & 0xfu;
             if (code == 0u) cleared.push_back(tileY * layout.TilesX() + tileX);
-            else Require(code == 0xfu, "CMASK code " + std::to_string(code) + " of color target " + hexAddress(color.address) + " is not a single-sample fast-clear code (0 cleared, 15 expanded)");
+            else Require(code == 0xfu, "CMASK code " + std::to_string(code) + " of color target " + hexAddress(color.address) + " is not a single-sample fast-clear code (0 cleared, 15 expanded); CPU source=" + hexAddress(address + nibble / 2u) + " byte=" + std::to_string(std::to_integer<unsigned>(mask[nibble / 2u])));
         }
     }
     if (cleared.empty()) return CmaskState::Expanded;
@@ -300,17 +301,27 @@ void storeCmaskClearTexels(const ColorTarget& color, const CmaskLayout& layout, 
     GuestMemory::Write(color.address, texels, surface.Alignment());
 }
 
-void recordCmaskClear(const Context& context, Recorder& recorder, const HostImport& import, const ColorTarget& color, const CmaskLayout& layout, const std::shared_ptr<StorageTexture>& resident, VkImageView view) {
+bool recordCmaskClear(const Context& context, Recorder& recorder, const ColorTarget& color, const CmaskLayout& layout, const std::shared_ptr<StorageTexture>& resident, VkImageView view) {
     const auto address = color.cmaskAddress;
     const auto bytes = layout.Bytes();
     StorageTexture::FlushPending(address, bytes, nullptr, "fast-clear materialization");
     if (AnyShadowedOverlaps(address, bytes)) PublishShadow(address, bytes, PublishScope::Whole, PublishReason::Keys);
     recorder.FlushKeyStoresOverlapping(address, bytes);
+    recorder.FlushStoresOverlapping(address, bytes);
+    // Pending publication can replace imports; acquire a stable snapshot after it completes.
+    const auto* currentImport = HostImportFor(context, address, bytes);
+    if (currentImport == nullptr) return false;
+    const auto import = std::make_shared<HostImport>(*currentImport);
     const auto commands = recorder.Commands();
+    recorder.Keep(import);
     recorder.Keep(resident);
-    context.detiler->DispatchCmaskClear(commands, import.buffer, address - import.base, bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0, color.cmaskAddress);
+    recorder.NotePendingRead(address, bytes, Recorder::ReadKind::StorageUpload);
+    const auto contextFlags = (color.dccAddress != 0 ? 2u : 0u) |
+        (color.cmaskAddress == color.address || color.cmaskAddress == (color.address | color.pipeBankXor) ? 4u : 0u);
+    context.detiler->DispatchCmaskClear(commands, import->buffer, address - import->base, bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0, color.cmaskAddress, contextFlags);
     recorder.NotePendingWrite(address, bytes);
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
+    return true;
 }
 
 bool materializeCmaskClear(const Context& context, const ColorTarget& color, const std::shared_ptr<StorageTexture>& resident) {
@@ -322,12 +333,8 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
     if (cmaskProved(color.cmaskAddress, bytes)) return false;
     auto* recorder = Recorder::Active();
     if (resident != nullptr && context.detiler != nullptr && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) {
-        const auto* import = HostImportFor(context, color.cmaskAddress, bytes);
-        const auto view = import != nullptr ? resident->ElementView() : VK_NULL_HANDLE;
-        if (view != VK_NULL_HANDLE) {
-            recordCmaskClear(context, *recorder, *import, color, layout, resident, view);
-            return true;
-        }
+        const auto view = resident->ElementView();
+        if (view != VK_NULL_HANDLE && recordCmaskClear(context, *recorder, color, layout, resident, view)) return true;
     }
     const auto collected = GuestMemory::CollectWrites(color.cmaskAddress, bytes);
     std::vector<std::uint32_t> cleared;

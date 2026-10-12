@@ -52,7 +52,7 @@ namespace AgcDriver::Graphics {
         static VkFormat ImageElementFormat(std::uint32_t elementBytes);
         // Recycles the descriptor sets of the previous batch; call before recording a new command batch.
         void BeginBatch();
-        void DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask, std::uint64_t cmaskOffset, std::size_t cmaskBytes, VkImageView view, std::uint32_t width, std::uint32_t height, std::uint32_t elementBytes, const std::array<std::uint32_t, 2>& clearWords, bool write, std::uint64_t guestAddress);
+        void DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask, std::uint64_t cmaskOffset, std::size_t cmaskBytes, VkImageView view, std::uint32_t width, std::uint32_t height, std::uint32_t elementBytes, const std::array<std::uint32_t, 2>& clearWords, bool write, std::uint64_t guestAddress, std::uint32_t contextFlags);
         std::array<std::uint32_t, 7> CmaskErrors();
 
     private:
