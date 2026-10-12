@@ -275,8 +275,13 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if (descriptor.dwordCount != 4u) fail("buffer specialization requires four descriptor words");
         const auto& buffer = info.buffers[index];
         const auto format = (descriptor.dwords[3] >> 12u) & 0x7fu;
-        const bool present = descriptor.dwords[2] != 0u && (descriptor.dwords[0] != 0u || (descriptor.dwords[1] & 0xffffu) != 0u);
-        if (buffer.descriptorFormatted && (format > static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float) || (present && format == 0u))) fail("buffer specialization has an unsupported format");
+        const bool present = (format != 0u || (descriptor.dwords[3] & (1u << 23u)) != 0u) &&
+            descriptor.dwords[2] != 0u && (descriptor.dwords[0] != 0u || (descriptor.dwords[1] & 0xffffu) != 0u);
+        if (buffer.descriptorFormatted && (format > static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float) || (present && format == 0u))) {
+            char message[192];
+            std::snprintf(message, sizeof(message), "buffer specialization has an unsupported format (index=%u format=%u present=%u descriptor=%08x %08x %08x %08x)", index, format, present ? 1u : 0u, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3]);
+            fail(message);
+        }
         const auto misalignment = present ? descriptor.dwords[0] & 3u : 0u;
         if (buffer.atomic && misalignment != 0u) fail("buffer atomic on a V# whose base is not DWORD aligned");
         auto alignment = static_cast<std::uint32_t>(buffer.typedAlignment);
@@ -291,11 +296,15 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
             plan.specialization.push_back({first + 2u, present ? 1u : 0u});
             plan.specialization.push_back({first + 3u, misalignment});
         }
-        if (buffer.formattedReadMask != 0u) {
+        if (present && buffer.formattedReadMask != 0u) {
             for (std::uint32_t component = 0; component < 4u; ++component) {
                 if ((buffer.formattedReadMask & (1u << component)) == 0u) continue;
                 const auto selector = (descriptor.dwords[3] >> (component * 3u)) & 7u;
-                if (selector == 2u || selector == 3u) fail("buffer specialization has a reserved component selector");
+                if (selector == 2u || selector == 3u) {
+                    char message[192];
+                    std::snprintf(message, sizeof(message), "buffer specialization has a reserved component selector (index=%u component=%u format=%u descriptor=%08x %08x %08x %08x)", index, component, format, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3]);
+                    fail(message);
+                }
             }
         }
     }

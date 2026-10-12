@@ -90,10 +90,11 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
             invalid = Binary(state, spv::OpLogicalOr, TypeBool(state), invalid, addTid);
         }
     }
-    if (memory.gpuDescriptor) faultIf(context, instruction, invalid, base, 0u, BdaAbi::FaultReason::InvalidDescriptor);
+    const auto boundFormat = Binary(state, spv::OpLogicalOr, TypeBool(state), nonzero(state, field(state, word3, 12u, 7u)), nonzero(state, field(state, word3, 23u, 1u)));
+    if (memory.gpuDescriptor) faultIf(context, instruction, both(state, boundFormat, invalid), base, 0u, BdaAbi::FaultReason::InvalidDescriptor);
     const auto stride = field(state, word1, 16u, 14u);
-    const auto present = runtime ? both(state, nonzero(state, context.Arg(*handle, 2u)), Binary(state, spv::OpLogicalOr, TypeBool(state), nonzero(state, context.Arg(*handle, 0u)), nonzero(state, field(state, word1, 0u, 16u)))) : nonzero(state, state.module.SpecializationConstant(u32, first + 2u, 0u));
-    const auto valid = memory.gpuDescriptor ? both(state, Unary(state, spv::OpLogicalNot, TypeBool(state), invalid), Binary(state, spv::OpINotEqual, TypeBool(state), base, BdaConstant(state, 0u))) : present;
+    const auto present = runtime ? both(state, boundFormat, both(state, nonzero(state, context.Arg(*handle, 2u)), Binary(state, spv::OpLogicalOr, TypeBool(state), nonzero(state, context.Arg(*handle, 0u)), nonzero(state, field(state, word1, 0u, 16u))))) : nonzero(state, state.module.SpecializationConstant(u32, first + 2u, 0u));
+    const auto valid = memory.gpuDescriptor ? both(state, present, Unary(state, spv::OpLogicalNot, TypeBool(state), invalid)) : present;
     return {base, context.Arg(*handle, 2u), stride, word3, both(state, nonzero(state, stride), nonzero(state, field(state, word1, 31u, 1u))), index, valid};
 }
 
@@ -347,12 +348,15 @@ std::uint32_t formattedDispatch(SpirvValueEmitContext& context, const IrValue& i
             const auto selector = field(state, resource.word3, component * 3u, 3u);
             invalid = Binary(state, spv::OpLogicalOr, TypeBool(state), invalid, Binary(state, spv::OpLogicalOr, TypeBool(state), equal(state, selector, ConstantU32(state, 2u)), equal(state, selector, ConstantU32(state, 3u))));
         }
-        faultIf(context, instruction, invalid, resource.base, 0u, BdaAbi::FaultReason::InvalidDescriptor);
+        faultIf(context, instruction, both(state, resource.valid, invalid), resource.base, 0u, BdaAbi::FaultReason::InvalidDescriptor);
     }
     const auto* word = instruction.Argument(0)->Resolve()->Argument(3)->Resolve();
     if (memory.gpuDescriptor && word->HasImmediate()) {
         const auto format = static_cast<IrBufferFormat>((word->ImmediateU32() >> 12u) & 0x7fu);
-        if (format == IrBufferFormat::Invalid) context.Fail(instruction, "formatted buffer instruction has an invalid constant format");
+        if (format == IrBufferFormat::Invalid) {
+            if ((word->ImmediateU32() & (1u << 23u)) != 0u) context.Fail(instruction, "formatted buffer instruction has an invalid constant format");
+            return store || components == 1u ? ConstantU32(state, 0u) : ConstantU32CompositeZero(state, components);
+        }
         return formatted(context, instruction, resource, GetFormatInfo(format), components, store, data);
     }
     if (!memory.gpuDescriptor) return formattedCall(context, instruction, resource, components, store, data);
@@ -387,7 +391,7 @@ std::uint32_t formatSwitch(SpirvValueEmitContext& context, const IrValue& instru
         phi.insert(phi.end(), {value, exit});
     }
     EmitLabel(state, invalid);
-    if (memory.gpuDescriptor) RecordBdaFault(state, resource.base, ConstantU32(state, 0u), BdaInstructionPc(state, instruction), BdaAbi::FaultReason::InvalidDescriptor);
+    if (memory.gpuDescriptor) faultIf(context, instruction, Binary(state, spv::OpLogicalOr, TypeBool(state), nonzero(state, format), nonzero(state, field(state, resource.word3, 23u, 1u))), resource.base, 0u, BdaAbi::FaultReason::InvalidDescriptor);
     const auto zero = store || components == 1u ? ConstantU32(state, 0u) : ConstantU32CompositeZero(state, components);
     const auto invalidExit = state.module.AllocateId();
     state.module.AddFunction(spv::OpBranch, invalidExit);
