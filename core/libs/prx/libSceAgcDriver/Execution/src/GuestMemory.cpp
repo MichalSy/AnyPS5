@@ -794,7 +794,7 @@ struct WriteTracker {
 
     bool covers(std::uint64_t address, std::size_t bytes) const {
 #ifdef _WIN32
-        return coverage.Covers(address, bytes);
+        return coverage.Covers(address, bytes) && !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
 #else
         return address + bytes <= LeafCount * LeafBlocks * WriteBlockBytes && GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
 #endif
@@ -871,6 +871,40 @@ struct WriteTracker {
         const auto& leaf = leaves[block / LeafBlocks];
         return leaf != nullptr ? leaf->blocks[block % LeafBlocks] : 0;
 #endif
+    }
+
+    static constexpr std::size_t UnstampedSlots = 1u << 16;
+    std::vector<std::uint32_t> unstampedStores;
+
+    void noteUnstampedStore(std::uint64_t address, std::uint64_t end) {
+        if (unstampedStores.empty()) unstampedStores.assign(UnstampedSlots, 0);
+        const auto first = address / WriteBlockBytes;
+        const auto last = (end - 1) / WriteBlockBytes;
+        if (last - first >= UnstampedSlots) {
+            std::fill(unstampedStores.begin(), unstampedStores.end(), generation);
+            return;
+        }
+        for (auto block = first; block <= last; ++block) unstampedStores[block % UnstampedSlots] = generation;
+    }
+
+    std::uint32_t newestStamp(std::uint64_t address, std::uint64_t end) const {
+        std::uint32_t newest = 0;
+        if (!unstampedStores.empty()) {
+            const auto first = address / WriteBlockBytes;
+            const auto last = (end - 1) / WriteBlockBytes;
+            if (last - first >= UnstampedSlots) newest = *std::max_element(unstampedStores.begin(), unstampedStores.end());
+            else for (auto block = first; block <= last; ++block) newest = std::max(newest, unstampedStores[block % UnstampedSlots]);
+        }
+        if (!watched) return newest;
+#ifdef _WIN32
+        address = std::max<std::uint64_t>(address, base);
+        end = std::min<std::uint64_t>(end, base + size);
+#else
+        end = std::min<std::uint64_t>(end, LeafCount * LeafBlocks * WriteBlockBytes);
+#endif
+        if (address >= end) return newest;
+        for (auto block = blockOf(address); block <= blockOf(end - 1); ++block) newest = std::max(newest, stampOf(block));
+        return newest;
     }
 
     bool unchanged(std::uint64_t first, std::uint64_t last, std::uint64_t since) const {
@@ -1092,6 +1126,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 }
 
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
@@ -1240,6 +1275,7 @@ bool WriteWatched() {
 }
 
 bool Watched(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -1247,6 +1283,7 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
 }
 
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -1275,7 +1312,10 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
-        if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) return 0;
+        if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) {
+            tracker.noteUnstampedStore(stored.first, stored.second);
+            return 0;
+        }
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
             tracker.stamp(block, tracker.generation, StampKind::Driver);
             tracker.noteDriverStore(block, stored.first, stored.second, tracker.generation);
@@ -1289,9 +1329,6 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     constexpr std::uint64_t page = 4096;
     const auto first = address & ~(page - 1);
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
-#ifdef _WIN32
-    if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(first, static_cast<std::size_t>(stop - first))) return stampStored(tracker, store());
-#endif
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return stampStored(tracker, store());
     const auto stored = store();
     walkWrites(tracker, first, stop, StampKind::Driver);
@@ -1320,7 +1357,10 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     tracker.initialize();
     if (bytes == 0) return 0;
     ++tracker.generation;
-    if (!tracker.watched || !tracker.covers(address, bytes)) return 0;
+    if (!tracker.watched || !tracker.covers(address, bytes)) {
+        tracker.noteUnstampedStore(address, address + bytes);
+        return 0;
+    }
 #ifndef _WIN32
     {
         const auto blockFirst = address & ~(std::uint64_t{WriteBlockBytes} - 1);
@@ -1328,6 +1368,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         StampRuns runs{tracker, StampKind::Fresh};
         if (!GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs)) {
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
+            tracker.noteUnstampedStore(address, address + bytes);
             return 0;
         }
         if (runs.stamped != 0) ++tracker.generation;
@@ -1347,6 +1388,9 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return true;
+#ifdef _WIN32
+    if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes)) return true;
+#endif
     const auto end = address + bytes;
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(end - 1);
@@ -1382,6 +1426,13 @@ std::uint64_t TrackerGeneration() {
     // when the value is read absorbs stores made after it with a stamp not newer than the value.
     const auto lock = lockTracker(tracker);
     return tracker.generation;
+}
+
+std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    return bytes == 0 ? 0 : tracker.newestStamp(address, address + bytes);
 }
 
 bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
@@ -1791,12 +1842,19 @@ void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
     flushHook.store(hook, std::memory_order_release);
 }
 
+std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
+
+void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
+    readGuard.store(guard, std::memory_order_release);
+}
+
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
+    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
@@ -1813,6 +1871,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
+    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));

@@ -64,6 +64,10 @@ bool sameTarget(const ColorTarget& first, const ColorTarget& second) {
 
 }
 
+bool MultisampleColorSurface::SupportsFormat(VkFormat format, std::uint32_t elementBytes) {
+    return supportedFormat(format) && elementBytes == (format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8u : 4u);
+}
+
 MultisampleColorSurface::MultisampleColorSurface(const Context& context, const ColorTarget& target)
     : context(context), target(target), geometry(target.extent.width, target.extent.height, target.elementBytes, static_cast<std::uint32_t>(target.samples), target.pipeBankXor) {
     this->context.bufferPool.reset();
@@ -96,7 +100,7 @@ MultisampleColorSurface::MultisampleColorSurface(const Context& context, const C
         info.extent = {target.extent.width, target.extent.height, 1};
         info.mipLevels = 1;
         info.arrayLayers = 1;
-        info.samples = target.samples;
+        info.samples = static_cast<VkSampleCountFlagBits>(target.samples);
         info.tiling = VK_IMAGE_TILING_OPTIMAL;
         info.usage = usage;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;

@@ -267,7 +267,7 @@ void RunMsaaStateTests() {
     const auto queue = reference();
     const auto state = DecodeState(queue);
     Require(DrawRejection(queue,false).empty(), "precheck rejected the actual MSAA reference");
-    Require(state.rasterizationSamples == VK_SAMPLE_COUNT_8_BIT && state.sampleMask == 0xffffffffu, "actual coverage count or full sample mask changed");
+    Require(state.samples == VK_SAMPLE_COUNT_8_BIT && state.sampleMask == 0xffffffffu, "actual coverage count or full sample mask changed");
     Require(state.depth && state.depth->samples == VK_SAMPLE_COUNT_8_BIT && state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT, "actual eight-sample depth/stencil attachment changed");
     Require(!state.depthTest && !state.depthWrite && state.stencilTest && state.stencilFront.passOp == VK_STENCIL_OP_REPLACE, "actual stencil clear did not preserve depth");
     Require(state.colors.size() == 1u && state.color.samples == VK_SAMPLE_COUNT_8_BIT && state.color.format == VK_FORMAT_B8G8R8A8_SRGB, "actual eight-sample color format changed");
@@ -301,7 +301,7 @@ void RunMsaaStateTests() {
             decoded = DecodeState(smaller);
             Require(DrawRejection(smaller, false).empty(), "matching two or four-sample state was rejected");
         }
-        Require(decoded.rasterizationSamples == static_cast<VkSampleCountFlagBits>(samples) && decoded.depth->samples == decoded.rasterizationSamples && decoded.color.samples == decoded.rasterizationSamples, "small MSAA attachment sample counts differ");
+        Require(decoded.samples == static_cast<VkSampleCountFlagBits>(samples) && decoded.depth->samples == decoded.samples && decoded.color.samples == decoded.samples, "small MSAA attachment sample counts differ");
         for (const auto read : reads) Require(DrawKeyCovers(read), "small MSAA state reads an unkeyed register");
         if (samples == 4u) {
             Require(decoded.sampleLocations.size() == 4u && decoded.sampleLocations[0].x == 0.25f && decoded.sampleLocations[0].y == 0.25f && decoded.sampleLocations[3].x == 0.75f && decoded.sampleLocations[3].y == 0.75f, "Hades custom four-sample positions changed");
@@ -335,13 +335,13 @@ void RunMsaaStateTests() {
     single.context[0x292] = 2u;
     for (std::uint32_t offset = 0x2feu; offset <= 0x30du; ++offset) single.context[offset] = 0u;
     const auto one = DecodeState(single);
-    Require(DrawRejection(single,false).empty() && one.rasterizationSamples == VK_SAMPLE_COUNT_1_BIT && one.depth->samples == VK_SAMPLE_COUNT_1_BIT && one.color.samples == VK_SAMPLE_COUNT_1_BIT, "single-sample state regressed beside MSAA");
+    Require(DrawRejection(single,false).empty() && one.samples == VK_SAMPLE_COUNT_1_BIT && one.depth->samples == VK_SAMPLE_COUNT_1_BIT && one.color.samples == VK_SAMPLE_COUNT_1_BIT, "single-sample state regressed beside MSAA");
     Require(one.sampleLocations.empty() && one.depth->sampleLocations.empty() && one.color.bytes == 65536u, "single-sample state inherited multisample layout or locations");
     single.context[0x201] = queue.context.at(0x201);
     single.context[0x2f8] = queue.context.at(0x2f8);
     for (std::uint32_t offset = 0x2feu; offset <= 0x30du; ++offset) single.context[offset] = queue.context.at(offset);
     const auto retained = DecodeState(single);
-    Require(DrawRejection(single, false).empty() && retained.rasterizationSamples == VK_SAMPLE_COUNT_1_BIT &&
+    Require(DrawRejection(single, false).empty() && retained.samples == VK_SAMPLE_COUNT_1_BIT &&
         retained.sampleLocations.empty() && retained.depth->samples == VK_SAMPLE_COUNT_1_BIT && retained.color.samples == VK_SAMPLE_COUNT_1_BIT,
         "disabled MSAA scan conversion consumed retained coverage counts or sample locations");
 }

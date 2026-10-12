@@ -26,6 +26,8 @@ std::string normalizeRunPath(std::string path) {
         path = ".";
     if (path.starts_with("$ORIGIN\\"))
         path.erase(0, 8);
+    if (path.empty())
+        path = ".";
     if (path.find('$') != std::string::npos)
         throw Domain::RelinkerException("Unsupported variable in Windows run path");
     if (path.back() != '\\')

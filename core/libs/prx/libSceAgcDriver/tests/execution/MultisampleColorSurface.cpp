@@ -204,7 +204,7 @@ void Draw(AgcDriver::VulkanDevice& device, const ColorTarget& color, VkRect2D re
     state.colors = {color};
     state.color = color;
     state.hasColorTarget = true;
-    state.rasterizationSamples = color.samples;
+    state.samples = color.samples;
     state.sampleMask = sampleMask;
     if (color.samples == VK_SAMPLE_COUNT_8_BIT) state.sampleLocations.assign(Locations.begin(), Locations.end());
     if (color.samples == VK_SAMPLE_COUNT_4_BIT) state.sampleLocations = {{0.25f, 0.25f}, {0.75f, 0.25f}, {0.25f, 0.75f}, {0.75f, 0.75f}};

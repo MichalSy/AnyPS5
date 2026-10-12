@@ -12,6 +12,7 @@
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
+extern "C" int APS5_VABI getpid_nid_postfix();
 
 struct SceKernelSystemSwVersion {
     std::uint64_t size;

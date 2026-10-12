@@ -1,6 +1,7 @@
 #include <relinker/guest/GuestImage.hpp>
 #include <elfpatcher/general/GuestModuleWriter.hpp>
 #include <codegen/IAmd64OnlyConverter.hpp>
+#include <domain/ImportModule.hpp>
 #include <io/FileReader.hpp>
 #include <io/NativePath.hpp>
 #include <io/BufferUtils.hpp>
@@ -44,7 +45,7 @@ std::string FoldFilename(std::string name) {
 
 std::string ModuleStem(std::string name, const bool windows) {
     if (windows) name = FoldFilename(std::move(name));
-    for (const std::string_view suffix : {".debug_prx", ".sprx", ".prx"}) {
+    for (const std::string_view suffix : {".debug_prx", ".suprx", ".sprx", ".prx"}) {
         if (name.size() > suffix.size() && name.ends_with(suffix)) return name.substr(0, name.size() - suffix.size());
     }
     return {};
@@ -70,10 +71,11 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     if (hasPrx) directories.push_back(prx);
     std::vector<std::filesystem::path> runtimeDirectories;
     for (const auto& name : moduleDirectories) {
-        const auto relative = Io::NativePath(name);
-        if (relative.empty() || relative.is_absolute() || relative.lexically_normal().generic_string().starts_with(".."))
+        const auto relative = Io::NativePath(name).lexically_normal();
+        if (relative.empty() || relative.has_root_path() || *relative.begin() == "..")
             throw Domain::RelinkerException("--module-dir must be a directory inside the guest module parent directory: " + name);
-        const auto directory = (root / relative).lexically_normal();
+        auto directory = (root / relative).lexically_normal();
+        if (!directory.has_filename()) directory = directory.parent_path();
         if (!std::filesystem::is_directory(directory)) throw Domain::RelinkerException("Guest module path is not a directory: " + Io::Utf8Path(directory));
         if (std::find(directories.begin(), directories.end(), directory) != directories.end()) throw Domain::RelinkerException("Duplicate guest module directory: " + Io::Utf8Path(directory));
         directories.push_back(directory);
@@ -102,6 +104,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 continue;
             }
             if (!entry.is_regular_file()) continue;
+            if (std::filesystem::equivalent(entry.path(), inputPath)) continue;
             if (isGuestImage(entry.path())) {
                 paths.push_back(entry.path());
                 if (std::find(runtimeDirectories.begin(), runtimeDirectories.end(), directory) == runtimeDirectories.end()) startupPaths.insert(entry.path());
@@ -122,11 +125,10 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     Io::FileReader reader;
     std::map<std::filesystem::path, GuestImage> discovered;
     const auto matchesIdentity = [](const std::string& name, const std::vector<std::string>& identities) {
-        return std::any_of(identities.begin(), identities.end(), [&](const auto& identity) {
-            return name == identity || name == identity + ".prx" || name == identity + ".sprx" || name == identity + ".suprx";
-        });
+        const auto stem = std::string_view(name).substr(0, name.size() - Domain::ModuleSuffix(name).size());
+        return std::any_of(identities.begin(), identities.end(), [&](const auto& identity) { return name == identity || stem == identity; });
     };
-    for (const auto& path : paths) discovered.emplace(path, GuestImageReader().Read(path, reader.Read(Io::Utf8Path(path))));
+    for (const auto& path : paths) discovered.emplace(path, GuestImageReader().Read(path, reader.Read(Io::Utf8Path(path)), windows));
     if (recursiveModuleSearch) {
         std::set<std::string> unresolved;
         for (const auto& name : missingNeeded) {
@@ -159,7 +161,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 if (!inserted) throw Domain::RelinkerException("Ambiguous needed module: " + Io::Utf8Path(previous->second) + " and " + Io::Utf8Path(it->path()));
             }
             paths.push_back(it->path());
-            discovered.emplace(it->path(), GuestImageReader().Read(it->path(), std::move(bytes)));
+            discovered.emplace(it->path(), GuestImageReader().Read(it->path(), std::move(bytes), windows));
         }
     }
     if (!unmatchedExclusions.empty()) throw Domain::RelinkerException("Excluded guest module file not found: " + *unmatchedExclusions.begin());
@@ -378,9 +380,13 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         Io::AppendU64(dynamic.DynamicSegmentData, dynamic.DynStrData.size());
         Io::AppendString(dynamic.DynStrData, name);
     };
-    for (const auto index : order) if (!windows && !deferred(index)) addNeeded("$ORIGIN/app0/" + images[index].SourcePath.parent_path().lexically_relative(root).generic_string() + "/" + images[index].OutputName);
+    const auto appDirectory = [&](const GuestImage& image) {
+        const auto directory = image.SourcePath.parent_path().lexically_relative(root).generic_string();
+        return directory == "." ? std::string("app0") : "app0/" + directory;
+    };
+    for (const auto index : order) if (!windows && !deferred(index)) addNeeded("$ORIGIN/" + appDirectory(images[index]) + "/" + images[index].OutputName);
     for (const auto& name : hostLibraries) addNeeded(name);
-    if (!windows && runPath != "$ORIGIN" && !runPath.starts_with("$ORIGIN/") && !std::filesystem::path(runPath).is_absolute()) throw Domain::RelinkerException("Guest Linux run path must be absolute or begin with $ORIGIN");
+    if (!windows && runPath != "$ORIGIN" && !runPath.starts_with("$ORIGIN/") && !runPath.starts_with("$ORIGIN:") && !std::filesystem::path(runPath).is_absolute()) throw Domain::RelinkerException("Guest Linux run path must be absolute or begin with $ORIGIN");
     const auto outputDirectory = std::filesystem::absolute(outputPath).parent_path().lexically_normal();
     std::vector<GuestArtifact> artifacts;
     for (const auto index : order) {
@@ -397,9 +403,14 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         }
         for (const auto& header : codeHeaders) {
             const std::vector<std::uint8_t> code(image.Bytes.begin() + header.Offset, image.Bytes.begin() + header.Offset + header.FileSize);
-            syscallScanner.ScanCodeSectionForSyscalls(code, header.MappedAddress, header.FileSize);
+            for (const auto offset : syscallScanner.ScanCodeSectionForSyscalls(code, header.MappedAddress, header.FileSize)) {
+                if (offset > code.size() || code.size() - offset < 2u)
+                    throw Domain::RelinkerException("Syscall trap patch exceeds guest executable segment", header.MappedAddress + offset);
+                image.Bytes[header.Offset + offset] = 0x0F;
+                image.Bytes[header.Offset + offset + 1] = 0x0B;
+            }
         }
-        const auto relativeDirectory = "app0/" + image.SourcePath.parent_path().lexically_relative(root).generic_string();
+        const auto relativeDirectory = appDirectory(image);
         const auto destination = outputDirectory / relativeDirectory;
         const auto target = destination / image.OutputName;
         if (target.lexically_normal() == std::filesystem::absolute(outputPath).lexically_normal()) throw Domain::RelinkerException("Guest output collides with the executable output");
@@ -414,9 +425,12 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         if (windows) output = Elfpatcher::GuestModuleWriter().WriteWindows(image, runtime);
         else {
             std::string guestRunPath = runPath;
-            if (runPath == "$ORIGIN" || runPath.starts_with("$ORIGIN/")) {
-                const auto relativeRoot = outputDirectory.lexically_relative(destination.lexically_normal()).generic_string();
-                guestRunPath = "$ORIGIN/" + relativeRoot + runPath.substr(7);
+            const auto relativeRoot = outputDirectory.lexically_relative(destination.lexically_normal()).generic_string();
+            for (std::size_t position = 0; (position = guestRunPath.find("$ORIGIN", position)) != std::string::npos;) {
+                position += 7;
+                if (position != guestRunPath.size() && guestRunPath[position] != '/' && guestRunPath[position] != ':') continue;
+                guestRunPath.insert(position, "/" + relativeRoot);
+                position += relativeRoot.size() + 1;
             }
             std::vector<std::string> needed;
             for (const auto dependency : dependencies[index]) {

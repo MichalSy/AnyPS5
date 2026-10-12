@@ -41,7 +41,7 @@ BindingPlan::BindingPlan(const Context& context, std::span<const CompiledShader>
     using Role = ShaderRecompiler::DescriptorRole;
     using Kind = ShaderRecompiler::DescriptorKind;
     Require(!shaders.empty() && context.limits.maxBoundDescriptorSets >= 1, "shader descriptor set exceeds device limits");
-    std::set<std::uint32_t> occupied;
+    std::set<std::pair<std::uint32_t, std::uint32_t>> occupied;
     for (std::size_t shaderIndex = 0; shaderIndex < shaders.size(); ++shaderIndex) {
         const auto& shader = shaders[shaderIndex];
         Require(shader.program != nullptr, "missing compiled shader");
@@ -63,8 +63,8 @@ BindingPlan::BindingPlan(const Context& context, std::span<const CompiledShader>
         std::int64_t shaderData = -1;
         for (std::size_t source = 0; source < shader.program->bindings.size(); ++source) {
             const auto& binding = shader.program->bindings[source];
-            Require(binding.descriptorSet == 0, "unexpected descriptor set: every shader resource must use descriptor set zero");
-            Require(occupied.insert(binding.binding).second, "duplicate shader binding");
+            Require(binding.descriptorSet == ShaderRecompiler::RuntimeAbi::DescriptorSet || (shader.stage == ShaderRecompiler::ShaderStage::Fragment && binding.descriptorSet == ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet), "unexpected descriptor set: a shader resource must use its stage descriptor set");
+            Require(occupied.emplace(binding.descriptorSet, binding.binding).second, "duplicate shader binding");
             Require(binding.count != 0, "empty descriptor binding");
             Binding item{{binding.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, binding.count, flags, nullptr}, shaderIndex, source, binding.role, {}, {}};
             if (binding.role == Role::GuestImages || binding.role == Role::GuestSamplers) {

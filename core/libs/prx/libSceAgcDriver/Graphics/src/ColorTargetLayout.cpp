@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include <array>
 #include <bit>
@@ -50,6 +51,19 @@ ColorTileMode DecodeColorTileMode(std::uint32_t attrib3) {
     require(fmaskMode == 0 || fmaskMode == 0x18 || fmaskMode == (mode & ~3u), "AGC graphics: unsupported color FMASK swizzle mode");
     require(resourceType != 0 || mode == 0 || mode == 0x1b, "AGC graphics: 1D color targets with a standard swizzle mode are invalid");
     return static_cast<ColorTileMode>(mode);
+}
+
+TileMipLayout ComputeColorTargetMipLayout(ColorTileMode mode, std::uint32_t bytesPerElement, std::uint32_t surfaceWidth, std::uint32_t surfaceHeight, std::uint32_t mipCount, std::uint32_t mipLevel) {
+    auto mips = ComputeElementMipLayout(ColorTextureTileMode(mode), bytesPerElement, surfaceWidth, surfaceHeight, mipCount);
+    require(mipLevel < mips.size(), "AGC graphics: color target mip is outside its surface");
+    auto mip = mips[mipLevel];
+    const ColorTargetLayout target(mip.width, mip.height, mode, bytesPerElement);
+    require(mip.tiledSize == target.Bytes(), "AGC graphics: color target mip tiling differs from its surface layout");
+    mip.tiledOffset = 0;
+    mip.linearOffset = 0;
+    mip.pitchBytes = mip.width * bytesPerElement;
+    mip.linearSize = target.LinearBytes();
+    return mip;
 }
 
 namespace {

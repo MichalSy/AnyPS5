@@ -17,9 +17,21 @@ extern "C" int* APS5_VABI __error_nid_postfix();
 
 static constexpr int GUEST_EFAULT = 14;
 static constexpr int GUEST_EINVAL = 22;
+static constexpr int GUEST_RLIMIT_CPU = 0;
+static constexpr int GUEST_RLIMIT_FSIZE = 1;
 static constexpr int GUEST_RLIMIT_DATA = 2;
+static constexpr int GUEST_RLIMIT_STACK = 3;
+static constexpr int GUEST_RLIMIT_CORE = 4;
+static constexpr int GUEST_RLIMIT_RSS = 5;
+static constexpr int GUEST_RLIMIT_MEMLOCK = 6;
+static constexpr int GUEST_RLIMIT_NPROC = 7;
 static constexpr int GUEST_RLIMIT_NOFILE = 8;
+static constexpr int GUEST_RLIMIT_SBSIZE = 9;
 static constexpr int GUEST_RLIMIT_AS = 10;
+static constexpr int GUEST_RLIMIT_NPTS = 11;
+static constexpr int GUEST_RLIMIT_SWAP = 12;
+static constexpr int GUEST_RLIMIT_KQUEUES = 13;
+static constexpr int GUEST_RLIMIT_UMTXP = 14;
 static constexpr int GUEST_RLIM_NLIMITS = 15;
 static constexpr std::int64_t GUEST_RLIM_INFINITY = std::numeric_limits<std::int64_t>::max();
 
@@ -74,10 +86,27 @@ int main() {
     RequireHostLimit(GUEST_RLIMIT_DATA, RLIMIT_DATA);
     LoweredHostLimitIsReported();
 #endif
+    for (int resource : {
+             GUEST_RLIMIT_CPU,
+             GUEST_RLIMIT_FSIZE,
+             GUEST_RLIMIT_CORE,
+             GUEST_RLIMIT_SBSIZE,
+             GUEST_RLIMIT_AS,
+             GUEST_RLIMIT_NPTS,
+             GUEST_RLIMIT_SWAP,
+             GUEST_RLIMIT_KQUEUES,
+             GUEST_RLIMIT_UMTXP,
+         }) {
+        const ResourceLimit guest = GuestLimit(resource);
+        Require(guest.rlim_cur == GUEST_RLIM_INFINITY);
+        Require(guest.rlim_max == GUEST_RLIM_INFINITY);
+        RequireError(resource, nullptr, GUEST_EFAULT);
+    }
     ResourceLimit limit{};
     RequireError(GUEST_RLIM_NLIMITS, &limit, GUEST_EINVAL);
     RequireError(-1, &limit, GUEST_EINVAL);
     RequireError(GUEST_RLIM_NLIMITS, nullptr, GUEST_EINVAL);
+    RequireError(-1, nullptr, GUEST_EINVAL);
     RequireError(GUEST_RLIMIT_DATA, nullptr, GUEST_EFAULT);
 #ifdef _WIN32
     RequireUnsupported(GUEST_RLIMIT_NOFILE);

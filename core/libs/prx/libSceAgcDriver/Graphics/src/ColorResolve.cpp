@@ -67,7 +67,7 @@ void ResolveAttachment(const Context& context, const ColorResolvePass& pass, Mul
         for (std::size_t index = 0; index < attachments.size(); ++index) {
             auto& attachment = attachments[index];
             attachment.format = pass.source.format;
-            attachment.samples = index == 0u ? pass.source.samples : VK_SAMPLE_COUNT_1_BIT;
+            attachment.samples = index == 0u ? static_cast<VkSampleCountFlagBits>(pass.source.samples) : VK_SAMPLE_COUNT_1_BIT;
             attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;

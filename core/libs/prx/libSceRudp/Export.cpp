@@ -25,6 +25,7 @@ constexpr int RUDP_POOL_MIN_SIZE = 0xC58;
 constexpr std::uintptr_t RUDP_POOL_ALIGNMENT = 8;
 constexpr std::size_t RUDP_STATUS_SIZE = 0xF8;
 constexpr std::size_t RUDP_STATUS_CURRENT_CONTEXTS = 0x64;
+constexpr uint16_t RUDP_MAX_SEGMENT_SIZE = 1410;
 
 using GuestRudpEventHandler = void(APS5_VABI*)(int, int, int, void*);
 
@@ -229,6 +230,7 @@ int APS5_VABI sceRudpGetRemoteInfo(int ctx_id, void* address, uint32_t* address_
     return RUDP_ERROR_NOT_ACCEPTABLE;
 }
 
+
 int APS5_VABI sceRudpInitiate(int ctx_id, const void* to, uint32_t tolen, uint16_t vport) {
     (void)to;
     (void)tolen;
@@ -256,6 +258,7 @@ int APS5_VABI sceRudpGetContextStatus(int ctx_id, void* status, uint32_t size) {
     }
     return 0;
 }
+
 
 int APS5_VABI sceRudpGetNumberOfPacketsToRead(int ctx_id) {
     std::lock_guard<std::mutex> lk(g_mutex);
@@ -321,4 +324,24 @@ int APS5_VABI sceRudpRead(int ctx_id, void* data, uint32_t len, int flags, void*
     }
     return valid_ctx(ctx_id) ? RUDP_ERROR_CONN_RESET : RUDP_ERROR_INVALID_CONTEXT_ID;
 }
+
+int APS5_VABI sceRudpNetFlush(void) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_inited ? 0 : RUDP_ERROR_NOT_INITIALIZED;
+}
+
+
+
+int APS5_VABI sceRudpGetMaxSegmentSize(uint16_t* size) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_inited) {
+        return RUDP_ERROR_NOT_INITIALIZED;
+    }
+    if (size == nullptr) {
+        return RUDP_ERROR_INVALID_ARGUMENT;
+    }
+    *size = RUDP_MAX_SEGMENT_SIZE;
+    return 0;
+}
+
 }

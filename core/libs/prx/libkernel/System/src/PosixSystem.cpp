@@ -132,6 +132,17 @@ int ReadProcess(const int* name, void* oldValue, std::size_t* oldLength) {
 }
 
 int ReadSysctl(const int* name, unsigned nameLength, void* oldValue, std::size_t* oldLength) {
+    if (nameLength == 2 && name[0] == 1 && name[1] == 37) {
+        if (oldLength == nullptr) return 0;
+        const auto count = std::min(*oldLength, std::size_t{256});
+        if (oldValue != nullptr) {
+            static std::random_device device;
+            auto* bytes = static_cast<std::uint8_t*>(oldValue);
+            for (std::size_t i = 0; i < count; ++i) bytes[i] = static_cast<std::uint8_t>(device());
+        }
+        *oldLength = count;
+        return 0;
+    }
     if (nameLength == 2 && name[0] == 6) return ReadHardware(name[1], oldValue, oldLength);
     if (nameLength == 4 && name[0] == 1 && name[1] == 14) return ReadProcess(name, oldValue, oldLength);
     return Failure(2);
@@ -201,7 +212,7 @@ int APS5_VABI getrlimit_nid_postfix(int resource, GuestResourceLimit* limit) {
 int APS5_VABI sysctl_nid_postfix(const int* name, unsigned nameLength, void* oldValue, std::size_t* oldLength, const void* newValue, std::size_t newLength) {
     if (!name) return Failure(14);
     if (nameLength < 2 || nameLength > 24) return Failure(22);
-    if (newValue && nameLength == 2 && name[0] == 6 && name[1] == 3) return Failure(1);
+    if (newValue && nameLength == 2 && ((name[0] == 6 && name[1] == 3) || (name[0] == 1 && name[1] == 37))) return Failure(1);
     if (newValue || newLength) return Failure(45);
     const int saved = *__error_nid_postfix();
     try {
@@ -215,6 +226,14 @@ int APS5_VABI sysctl_nid_postfix(const int* name, unsigned nameLength, void* old
 int APS5_VABI sysctlbyname_nid_postfix(const char* name, void* oldValue, std::size_t* oldLength, const void* newValue, std::size_t newLength) {
     if (!name) return Failure(14);
     const std::string_view text(name);
+    if (text == "kern.arandom") {
+        const int mib[]{1, 37};
+        return sysctl_nid_postfix(mib, 2, oldValue, oldLength, newValue, newLength);
+    }
+    if (text == "kern.sdk_version") {
+        if (newValue != nullptr) return Failure(1);
+        return CopyScalar(std::uint32_t{0x01000000}, oldValue, oldLength);
+    }
     if (text == "kern.rng_pseudo") {
         if (newValue != nullptr) return Failure(1);
         if (oldValue == nullptr || oldLength == nullptr)

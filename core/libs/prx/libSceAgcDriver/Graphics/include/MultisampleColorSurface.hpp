@@ -12,6 +12,7 @@ namespace AgcDriver::Graphics {
 
 class MultisampleColorSurface {
 public:
+    static bool SupportsFormat(VkFormat format, std::uint32_t elementBytes);
     MultisampleColorSurface(const Context& context, const ColorTarget& target);
     ~MultisampleColorSurface();
     MultisampleColorSurface(const MultisampleColorSurface&) = delete;

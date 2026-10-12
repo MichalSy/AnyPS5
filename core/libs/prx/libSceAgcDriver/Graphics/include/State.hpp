@@ -45,6 +45,7 @@ struct ColorTarget {
     bool dccPipeAligned = false;
     std::uint64_t cmaskAddress = 0;
     std::size_t cmaskBytes = 0;
+    bool cmaskFastClear = false;
     std::uint64_t surfaceAddress = 0;
     VkExtent2D surfaceExtent{};
     std::uint32_t mipCount = 1;
@@ -54,10 +55,14 @@ struct ColorTarget {
     std::uint32_t slot = 0;
     std::uint32_t depth = 1;
     std::uint32_t depthSlice = 0;
+    std::uint64_t arrayAddress = 0;
+    std::uint32_t arrayLastSlice = 0;
+    std::uint32_t arraySlice = 0;
     std::uint32_t exportIndex = 0;
-    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool uintExport = false;
     std::uint32_t pipeBankXor = 0;
+    std::uint32_t samples = 1;
+    bool resolveOnlyMultisample = false;
 };
 
 struct DepthTarget {
@@ -67,7 +72,6 @@ struct DepthTarget {
     VkFormat format;
     float clearDepth;
     std::uint8_t clearStencil;
-    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     std::vector<VkSampleLocationEXT> sampleLocations;
     VkExtent2D sampleLocationsGrid{1, 1};
     VkExtent2D surfaceExtent{};
@@ -78,12 +82,12 @@ struct DepthTarget {
     std::uint32_t zInfo = 0;
     std::uint64_t encodedSurfaceAddress = 0;
     std::uint32_t depthSlice = 0;
+    std::uint32_t samples = 1;
 };
 
 struct State {
     ShaderStages stages;
     std::optional<DepthTarget> depth;
-    VkSampleCountFlagBits rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     std::uint32_t sampleMask = 0xffffffffu;
     std::vector<VkSampleLocationEXT> sampleLocations;
     VkExtent2D sampleLocationsGrid{1, 1};
@@ -123,10 +127,14 @@ struct State {
     VkProvokingVertexModeEXT provokingVertexMode = VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
     VkPipelineColorBlendAttachmentState blend;
     std::array<float, 4> blendConstants;
+    std::uint32_t samples = 1;
+    std::array<std::uint8_t, 8> sampleLocationWords{};
+    bool customSampleLocations = false;
 };
 
 ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false);
 State DecodeState(const QueueState& queue, bool vertexWorkgroup = false);
+std::array<VkSampleLocationEXT, 8> SampleLocations(const State& state);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
 std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& state);
 ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
@@ -141,12 +149,14 @@ struct ColorResolvePass {
 std::optional<ColorResolvePass> DecodeColorResolvePass(const QueueState& queue);
 
 struct ColorMetadataPass {
-    enum class Mode { EliminateFastClear, DccDecompress };
+    enum class Mode { EliminateFastClear, DccDecompress, Resolve };
     Mode mode;
     std::vector<ColorTarget> targets;
+    std::optional<ColorTarget> source;
 };
 std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue);
 std::string DepthMaintenanceRejection(const QueueState& queue);
+bool DepthResummarizeDrawsNothing(const QueueState& queue);
 // The message DecodeState (or the pixel stage decode after it) would throw for the register rules
 // this precheck covers, evaluated without exceptions before the draw is decoded; empty when they
 // pass (DecodeState still checks everything). A register a rule needs that is absent is no verdict.

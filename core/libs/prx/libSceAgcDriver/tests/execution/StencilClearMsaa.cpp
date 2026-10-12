@@ -172,7 +172,7 @@ void CheckState(const AgcDriver::Graphics::State& state, VkSampleCountFlagBits s
     Require(!state.hasColorTarget && state.colors.empty(), "MSAA stencil fixture must have no single-sample color attachments");
     Require(state.depth && state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT && state.depth->samples == samples,
         "decoded combined depth/stencil image must use the actual requested sample count");
-    Require(state.rasterizationSamples == samples && state.sampleMask == 0xffffffffu,
+    Require(state.samples == samples && state.sampleMask == 0xffffffffu,
         "decoded rasterization samples and full sample mask must match the attachment");
     if (samples == VK_SAMPLE_COUNT_8_BIT) {
         Require(state.sampleLocations.size() == 8u && state.sampleLocationsGrid.width == 1u && state.sampleLocationsGrid.height == 1u,

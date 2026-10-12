@@ -105,14 +105,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             ready = true;
             return;
         }
-        const auto allocationResult = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
-        if (allocationResult != VK_SUCCESS) {
-            const auto& memoryType = context.memory.memoryTypes[allocation.memoryTypeIndex];
-            const auto& memoryHeap = context.memory.memoryHeaps[memoryType.heapIndex];
-            std::fprintf(stderr, "[vulkan-memory] buffer allocation failed: result=%d requested=%zu capacity=%zu usage=0x%x properties=0x%x requirementSize=%llu requirementAlignment=%llu memoryTypeBits=0x%x memoryType=%u memoryTypeFlags=0x%x heap=%u heapSize=%llu heapFlags=0x%x maxMemoryAllocationCount=%u allocationFlags=0x%x\n", static_cast<int>(allocationResult), size, capacity, static_cast<unsigned int>(usage), static_cast<unsigned int>(properties), static_cast<unsigned long long>(requirements.size), static_cast<unsigned long long>(requirements.alignment), requirements.memoryTypeBits, allocation.memoryTypeIndex, static_cast<unsigned int>(memoryType.propertyFlags), memoryType.heapIndex, static_cast<unsigned long long>(memoryHeap.size), static_cast<unsigned int>(memoryHeap.flags), context.limits.maxMemoryAllocationCount, addressable ? static_cast<unsigned int>(flags.flags) : 0u);
-            std::fflush(stderr);
-        }
-        Check(allocationResult, "vkAllocateMemory buffer");
+        memory = cache->AllocateMemory(allocation, "vkAllocateMemory buffer");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
@@ -191,7 +184,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.allocationSize = ClassAllocationBytes(requirements, capacity);
         allocationBytes = allocation.allocationSize;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory device buffer");
+        memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
         release();

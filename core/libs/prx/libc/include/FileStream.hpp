@@ -68,6 +68,7 @@ public:
     void Lock();
     void Unlock();
     void SyncUnlockedStatus();
+    void SetError() { SetEncodingError(); }
 };
 static_assert(std::is_standard_layout_v<FileStream>);
 

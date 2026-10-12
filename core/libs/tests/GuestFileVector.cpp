@@ -22,6 +22,7 @@ int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
 int APS5_VABI sceKernelClose(int);
 int APS5_VABI pipe_nid_postfix(int*);
 int APS5_VABI close_nid_postfix(int);
+int APS5_VABI fcntl_nid_postfix(int, int, ...);
 std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
 std::int64_t APS5_VABI sceKernelPread(int, void*, std::size_t, std::int64_t);
 std::int64_t APS5_VABI sceKernelLseek(int, std::int64_t, int);
@@ -52,6 +53,7 @@ static constexpr std::int64_t ErrorEbadf = static_cast<int>(0x80020009u);
 static constexpr std::int64_t ErrorEfault = static_cast<int>(0x8002000Eu);
 static constexpr std::int64_t ErrorEinval = static_cast<int>(0x80020016u);
 static constexpr std::int64_t ErrorEspipe = static_cast<int>(0x8002001Du);
+static constexpr std::int64_t ErrorEagain = static_cast<int>(0x80020023u);
 
 static std::string Contents(const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary);
@@ -199,6 +201,11 @@ int main() {
     Require(std::memcmp(first, "xyz", 3) == 0);
     Require(sceKernelPreadv(ends[0], reads, 2, 0) == ErrorEspipe);
     Require(sceKernelPwritev(ends[1], message, 1, 0) == ErrorEspipe);
+#ifndef _WIN32
+    Require(fcntl_nid_postfix(ends[0], 4, static_cast<std::uintptr_t>(fcntl_nid_postfix(ends[0], 3) | 4)) == 0);
+    Require(sceKernelReadv(ends[0], reads, 2) == ErrorEagain);
+    Require(readv_nid_postfix(ends[0], reads, 2) == -1 && *__error_nid_postfix() == 35);
+#endif
     Require(close_nid_postfix(ends[0]) == 0 && close_nid_postfix(ends[1]) == 0);
 
     const int random = sceKernelOpen("/dev/urandom", 0, 0);

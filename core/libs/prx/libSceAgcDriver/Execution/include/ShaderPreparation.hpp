@@ -19,6 +19,7 @@ public:
     void Lock();
     PreparedShaderState& Edit(const ShaderSnapshot& snapshot);
     const PreparedShaderState& Read(const ShaderSnapshot& snapshot) const;
+    void Hold();
     void Commit();
 
 private:

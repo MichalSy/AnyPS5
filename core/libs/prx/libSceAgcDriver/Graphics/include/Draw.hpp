@@ -37,6 +37,11 @@ struct DrawInputMemoCounts {
 };
 DrawInputMemoCounts DrawInputMemoCounters();
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment);
+struct InPlaceIndices {
+    std::optional<std::uint32_t> highest;
+    bool reused = false;
+};
+InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart);
 
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw);
 
