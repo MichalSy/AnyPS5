@@ -115,8 +115,10 @@ public:
             VkPhysicalDeviceProperties2 extended{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &context.subgroup};
             function<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(context.physical, &extended);
             context.geometryShader = features.geometryShader;
+            context.shaderClipDistance = features.shaderClipDistance;
             context.sampleRateShading = features.sampleRateShading;
             capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityShader));
+            if (features.shaderClipDistance) capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityClipDistance));
             if (features.shaderInt64) capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityInt64));
             if (context.subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityGroupNonUniform));
             if (context.subgroup.supportedOperations & VK_SUBGROUP_FEATURE_VOTE_BIT) capabilities.push_back(static_cast<std::uint32_t>(spv::CapabilityGroupNonUniformVote));
@@ -561,7 +563,7 @@ void WriteStorageImage(const Context& context, StorageTexture& storage, Buffer& 
     storage.MarkDirty();
 }
 
-void CanonicalDepthAliasTest(const Context& context, bool d16, bool pendingAlias) {
+void CanonicalDepthAliasTest(const Context& context, bool d16, bool pendingAlias, bool combined = false, bool stencilAlias = false) {
     const VkExtent2D extent{d16 ? 272u : 144u, 144u};
     const auto elementBytes = d16 ? 2u : 4u;
     const auto sliceBytes = static_cast<std::size_t>(DepthSliceBytes(extent, elementBytes));
@@ -569,6 +571,9 @@ void CanonicalDepthAliasTest(const Context& context, bool d16, bool pendingAlias
     constexpr std::uint32_t xorBytes = 0x900u;
     const auto totalBytes = (slice + 1u) * sliceBytes;
     GuestBlock memory(totalBytes);
+    const auto stencilSliceBytes = static_cast<std::size_t>(DepthSliceBytes(extent, 1u));
+    GuestBlock stencilMemory(combined ? (slice + 1u) * stencilSliceBytes : Block);
+    std::vector<std::byte> expectedStencil((slice + 1u) * stencilSliceBytes, std::byte{0xcd});
     struct Cleanup {
         VkDevice device;
         ~Cleanup() { ClearCachedTextures(device); ClearDepthSurfaces(device); }
@@ -607,7 +612,33 @@ void CanonicalDepthAliasTest(const Context& context, bool d16, bool pendingAlias
     target.zInfo = (24u << 4u) | (d16 ? 1u : 3u);
     target.encodedSurfaceAddress = memory.Address() | xorBytes;
     target.depthSlice = slice;
-    auto aliasResource = View(16, 16, target.address);
+    if (combined) {
+        target.format = d16 ? VK_FORMAT_D16_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+        target.stencilAddress = stencilMemory.Address() + slice * stencilSliceBytes;
+        target.encodedStencilAddress = stencilMemory.Address();
+        target.stencilInfo = (24u << 4u) | 1u;
+        target.clearStencil = 0x7fu;
+        std::memcpy(stencilMemory.data, expectedStencil.data(), expectedStencil.size());
+        AgcDriver::GuestMemory::MarkWritten(stencilMemory.Address(), expectedStencil.size());
+        const auto* stencilEquation = FindTextureSwizzleEquation(24u, 1u);
+        Require(stencilEquation != nullptr, "the stencil oracle has no swizzle equation");
+        const auto stencilBlocksPerRow = (extent.width + 255u) / 256u;
+        for (std::uint32_t y = 0; y < extent.height; ++y) {
+            for (std::uint32_t x = 0; x < extent.width; ++x) {
+                std::uint32_t offset = 0;
+                for (std::uint32_t bit = 0; bit < stencilEquation->bits.size(); ++bit) {
+                    const auto mask = stencilEquation->bits[bit];
+                    const auto coordinates = (x & mask & 0xfffu) ^ ((y << 12u) & mask & 0xfff000u) ^ ((slice << 24u) & mask & 0xff000000u);
+                    offset |= (std::popcount(coordinates) & 1u) << bit;
+                }
+                const auto block = (y / 256u) * stencilBlocksPerRow + x / 256u;
+                expectedStencil[slice * stencilSliceBytes + block * Block + offset] = std::byte{0x7f};
+            }
+        }
+    }
+    auto aliasResource = View(16, 16, stencilAlias ? target.stencilAddress : target.address);
+    auto& aliasExpected = stencilAlias ? expectedStencil : expected;
+    const auto aliasSliceBytes = stencilAlias ? stencilSliceBytes : sliceBytes;
     aliasResource.format = d16 ? 20u : 29u;
     const auto aliasPitch = DescribeSurface(aliasResource).mips.front().pitchBytes;
     const auto aliasRowBytes = aliasResource.width * 4u;
@@ -633,17 +664,22 @@ void CanonicalDepthAliasTest(const Context& context, bool d16, bool pendingAlias
     Require(!DepthSurfaceAt(target.address), "the incompatible alias did not retire its published native depth surface");
     AgcDriver::GuestMemory::FlushGpuWrites(memory.Address(), totalBytes);
     Require(std::equal(expected.begin(), expected.end(), memory.data), "canonical depth publication changed pixel bits, another slice or tile padding");
+    if (combined) {
+        AgcDriver::GuestMemory::FlushGpuWrites(stencilMemory.Address(), expectedStencil.size());
+        Require(std::equal(expectedStencil.begin(), expectedStencil.end(), stencilMemory.data),
+            "canonical depth publication lost stencil pixels, another slice or padding");
+    }
     Buffer aliasReadback(context, aliasResource.width * aliasResource.height * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     ReadStorageImage(context, *alias, aliasReadback);
     for (std::uint32_t y = 0; y < aliasResource.height; ++y) {
-        Require(std::memcmp(aliasReadback.Bytes().data() + y * aliasRowBytes, expected.data() + slice * sliceBytes + y * aliasPitch, aliasRowBytes) == 0,
+        Require(std::memcmp(aliasReadback.Bytes().data() + y * aliasRowBytes, aliasExpected.data() + slice * aliasSliceBytes + y * aliasPitch, aliasRowBytes) == 0,
             "the incompatible alias kept older GPU pixels after canonical depth publication");
     }
     Buffer changed(context, aliasReadback.Bytes().size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     std::fill(changed.Bytes().begin(), changed.Bytes().end(), std::byte{0});
     WriteStorageImage(context, *alias, changed);
     for (std::uint32_t y = 0; y < aliasResource.height; ++y) {
-        std::fill_n(expected.data() + slice * sliceBytes + y * aliasPitch, aliasRowBytes, std::byte{0});
+        std::fill_n(aliasExpected.data() + slice * aliasSliceBytes + y * aliasPitch, aliasRowBytes, std::byte{0});
     }
     DepthSurfaceView(context, target);
     auto restored = CachedStorageSurface(context, original);
@@ -658,6 +694,32 @@ void CanonicalDepthAliasTest(const Context& context, bool d16, bool pendingAlias
     }
     AgcDriver::GuestMemory::FlushGpuWrites(memory.Address(), totalBytes);
     Require(std::equal(expected.begin(), expected.end(), memory.data), "rebinding published depth resurrected pixels from before the alias write");
+    if (combined) {
+        auto stencilResource = original;
+        stencilResource.baseAddress = stencilMemory.Address();
+        stencilResource.format = 5u;
+        stencilResource.pipeBankXor = 0;
+        auto restoredStencil = CachedStorageSurface(context, stencilResource);
+        Buffer readback(context, (slice + 1u) * extent.width * extent.height, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        ReadStorageImage(context, *restoredStencil, readback);
+        const auto layerPixels = static_cast<std::size_t>(extent.width) * extent.height;
+        const auto* stencilEquation = FindTextureSwizzleEquation(24u, 1u);
+        const auto stencilBlocksPerRow = (extent.width + 255u) / 256u;
+        for (std::uint32_t y = 0; y < extent.height; ++y) {
+            for (std::uint32_t x = 0; x < extent.width; ++x) {
+                std::uint32_t offset = 0;
+                for (std::uint32_t bit = 0; bit < stencilEquation->bits.size(); ++bit) {
+                    const auto mask = stencilEquation->bits[bit];
+                    const auto coordinates = (x & mask & 0xfffu) ^ ((y << 12u) & mask & 0xfff000u) ^ ((slice << 24u) & mask & 0xff000000u);
+                    offset |= (std::popcount(coordinates) & 1u) << bit;
+                }
+                const auto block = (y / 256u) * stencilBlocksPerRow + x / 256u;
+                Require(readback.Bytes()[slice * layerPixels + y * extent.width + x] == expectedStencil[slice * stencilSliceBytes + block * Block + offset],
+                    "rebinding a published combined surface lost its stencil plane");
+            }
+        }
+    }
+    if (stencilAlias) return;
     std::fill_n(memory.data + slice * sliceBytes, sliceBytes, std::byte{0x5a});
     AgcDriver::GuestMemory::MarkWritten(target.address, sliceBytes);
     AgcDriver::GuestMemory::BumpCollectEpoch();
@@ -1006,7 +1068,7 @@ void Run(const Context& context) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         std::unique_ptr<Device> device;
         try {
@@ -1017,6 +1079,17 @@ int main() {
             return VulkanTestSkipped;
         }
         std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+        if (argc == 2 && std::string_view(argv[1]) == "--canonical-only") {
+            CanonicalDepthAliasTest(device->GetContext(), false, false);
+            CanonicalDepthAliasTest(device->GetContext(), true, false);
+            CanonicalDepthAliasTest(device->GetContext(), false, true);
+            CanonicalDepthAliasTest(device->GetContext(), true, true);
+            CanonicalDepthAliasTest(device->GetContext(), false, false, true);
+            CanonicalDepthAliasTest(device->GetContext(), false, true, true);
+            CanonicalDepthAliasTest(device->GetContext(), false, false, true, true);
+            std::puts("canonical depth and stencil alias tests passed");
+            return 0;
+        }
         Run(device->GetContext());
         RemappedColorTest(*device);
         SampledSnapshotTest(device->GetContext());
@@ -1028,6 +1101,8 @@ int main() {
         CanonicalDepthAliasTest(device->GetContext(), true, false);
         CanonicalDepthAliasTest(device->GetContext(), false, true);
         CanonicalDepthAliasTest(device->GetContext(), true, true);
+        CanonicalDepthAliasTest(device->GetContext(), false, false, true);
+        CanonicalDepthAliasTest(device->GetContext(), false, true, true);
         StorageArrayRoundTripTest(device->GetContext(), true);
         StorageArrayRoundTripTest(device->GetContext(), false);
         StorageArrayRoundTripTest(device->GetContext(), true, true);

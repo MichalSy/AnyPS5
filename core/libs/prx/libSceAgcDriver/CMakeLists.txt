@@ -1213,6 +1213,8 @@ target_include_directories(agc_driver_prepared_shaders_tests PRIVATE
 
 if(BUILD_TESTING)
     add_test(NAME agc_driver_stencil_storage_reuse COMMAND agc_driver_depth_storage_reuse_tests --stencil-only)
+    add_test(NAME agc_driver_canonical_depth_alias COMMAND agc_driver_depth_surface_last_writer_tests --canonical-only)
+    set_tests_properties(agc_driver_canonical_depth_alias PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(agc_driver_stencil_storage_reuse PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_driver_stencil_storage_reuse PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

@@ -219,35 +219,38 @@ public:
             (descriptor.dimension == TextureDimension::k2D && descriptor.depthOrLastArray != 0u) || storage.ImageDepth() != 1u);
     }
 
-    std::optional<GuestTextureResource> CanonicalResource() const {
-        const bool d16 = target.format == VK_FORMAT_D16_UNORM;
-        const bool d32 = target.format == VK_FORMAT_D32_SFLOAT;
+    std::optional<GuestTextureResource> CanonicalResource(bool stencil = false) const {
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const bool d32 = target.format == VK_FORMAT_D32_SFLOAT || target.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
         const auto extent = surfaceExtent(target);
-        if ((!d16 && !d32) || target.stencilAddress != 0 || target.samples != VK_SAMPLE_COUNT_1_BIT || target.mipCount != 1u || target.mip != 0u ||
-            ((target.zInfo >> 4u) & 0x1fu) != 24u || (target.zInfo & 3u) != (d16 ? 1u : 3u) || (target.zInfo & 0x000f100cu) != 0u ||
-            target.encodedSurfaceAddress == 0 || (target.encodedSurfaceAddress & 0xffu) != 0u || target.encodedSurfaceAddress >= (1ull << 48u) || target.depthSlice > 0x1fffu ||
+        const auto info = stencil ? target.stencilInfo : target.zInfo;
+        const auto encodedAddress = stencil ? target.encodedStencilAddress : target.encodedSurfaceAddress;
+        const auto address = stencil ? target.stencilAddress : target.address;
+        if ((!d16 && !d32) || (stencil && target.stencilAddress == 0) || target.samples != VK_SAMPLE_COUNT_1_BIT || target.mipCount != 1u || target.mip != 0u ||
+            ((info >> 4u) & 0x1fu) != 24u || (info & (stencil ? 1u : 3u)) != (stencil ? 1u : d16 ? 1u : 3u) || (info & 0x000f100cu) != 0u ||
+            encodedAddress == 0 || (encodedAddress & 0xffu) != 0u || encodedAddress >= (1ull << 48u) || target.depthSlice > 0x1fffu ||
             extent.width == 0u || extent.height == 0u || extent.width > 16384u || extent.height > 16384u) return std::nullopt;
-        const auto elementBytes = d16 ? 2u : 4u;
+        const auto elementBytes = stencil ? 1u : d16 ? 2u : 4u;
         const auto bytes = DepthSliceBytes(extent, elementBytes);
-        const auto base = target.encodedSurfaceAddress & ~0xffffull;
+        const auto base = encodedAddress & ~0xffffull;
         const auto offset = static_cast<std::uint64_t>(target.depthSlice) * bytes;
-        if (base == 0 || offset > std::numeric_limits<std::uint64_t>::max() - base || target.address != base + offset ||
-            bytes > std::numeric_limits<std::uint64_t>::max() - target.address) return std::nullopt;
+        if (base == 0 || offset > std::numeric_limits<std::uint64_t>::max() - base || address != base + offset ||
+            bytes > std::numeric_limits<std::uint64_t>::max() - address) return std::nullopt;
         const auto* equation = FindTextureSwizzleEquation(24u, elementBytes);
         if (equation == nullptr) return std::nullopt;
-        auto xorBytes = static_cast<std::uint32_t>(target.encodedSurfaceAddress & 0xffffu);
+        auto xorBytes = static_cast<std::uint32_t>(encodedAddress & 0xffffu);
         for (std::uint32_t bit = 0; bit < equation->bits.size(); ++bit) {
             xorBytes ^= (std::popcount((target.depthSlice << 24u) & equation->bits[bit]) & 1u) << bit;
         }
-        const auto encoded = target.address | xorBytes;
+        const auto encoded = address | xorBytes;
         const std::array<std::uint32_t, 8> words{
             static_cast<std::uint32_t>(encoded >> 8u), static_cast<std::uint32_t>((encoded >> 40u) & 0xffu) |
-                ((d16 ? 7u : 22u) << 20u) | (((extent.width - 1u) & 3u) << 30u),
+                ((stencil ? 5u : d16 ? 7u : 22u) << 20u) | (((extent.width - 1u) & 3u) << 30u),
             ((extent.width - 1u) >> 2u) | ((extent.height - 1u) << 14u), 0xfacu | (24u << 20u) | (9u << 28u), 0, 0, 0, 0
         };
         auto resource = DecodeTextureResource(words);
         const auto geometry = DescribeSurface(resource);
-        if (resource.baseAddress != target.address || geometry.imageLayers != 1u || geometry.imageDepth != 1u || geometry.layerBytes != bytes) return std::nullopt;
+        if (resource.baseAddress != address || geometry.imageLayers != 1u || geometry.imageDepth != 1u || geometry.layerBytes != bytes) return std::nullopt;
         return resource;
     }
 
@@ -305,8 +308,10 @@ public:
     bool HasPendingWriter() const { return writer != nullptr && writer->PendingWrites(); }
 
     void RequireCanonicalPublication(const StorageTexture& storage) const {
-        if (storage.Descriptor().dccAddress != 0 || depthWritten == 0 || !GuestMemory::Watched(target.address, depthBytes()) ||
-            !GuestMemory::UnchangedSince(target.address, depthBytes(), depthWritten)) refuseStorage(storage, OverwrittenInMemory());
+        if ((target.stencilAddress != 0 && !CanonicalResource(true).has_value()) || storage.Descriptor().dccAddress != 0 || depthWritten == 0 || !GuestMemory::Watched(target.address, depthBytes()) ||
+            !GuestMemory::UnchangedSince(target.address, depthBytes(), depthWritten) ||
+            (target.stencilAddress != 0 && (stencilWritten == 0 || !GuestMemory::Watched(target.stencilAddress, stencilBytes()) ||
+                !GuestMemory::UnchangedSince(target.stencilAddress, stencilBytes(), stencilWritten)))) refuseStorage(storage, OverwrittenInMemory());
     }
 
     bool StorageOwnsSample(const GuestTextureResource& resource) const {
@@ -444,14 +449,17 @@ private:
     [[noreturn]] void refuseStorage(const StorageTexture& storage, bool newerGuestWrites) const {
         const auto& descriptor = storage.Descriptor();
         const auto extent = surfaceExtent(target);
-        char text[640];
-        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d, %u samples, %u mips) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented; newer guest writes=%u; DB_Z_INFO=0x%08x encodedBase=0x%llx originalSlice=%u generation=%llu watched=%u aliasDcc=0x%llx",
+        char text[896];
+        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d, %u samples, %u mips) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented; newer guest writes=%u; DB_Z_INFO=0x%08x encodedBase=0x%llx originalSlice=%u generation=%llu watched=%u aliasDcc=0x%llx canonicalDepth=%u canonicalOther=%u DB_STENCIL_INFO=0x%08x stencil=0x%llx encodedStencil=0x%llx stencilGeneration=%llu stencilWatched=%u",
             static_cast<unsigned long long>(target.address), extent.width, extent.height, static_cast<int>(target.format),
             static_cast<unsigned>(target.samples), target.mipCount, descriptor.width, descriptor.height,
             static_cast<int>(storage.StorageFormat()), static_cast<int>(descriptor.dimension), descriptor.mipCount,
             static_cast<unsigned>(newerGuestWrites), target.zInfo, static_cast<unsigned long long>(target.encodedSurfaceAddress), target.depthSlice,
             static_cast<unsigned long long>(depthWritten), static_cast<unsigned>(GuestMemory::Watched(target.address, depthBytes())),
-            static_cast<unsigned long long>(descriptor.dccAddress));
+            static_cast<unsigned long long>(descriptor.dccAddress), static_cast<unsigned>(CanonicalResource().has_value()),
+            static_cast<unsigned>(CanonicalResource(true).has_value()), target.stencilInfo,
+            static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.encodedStencilAddress),
+            static_cast<unsigned long long>(stencilWritten), static_cast<unsigned>(target.stencilAddress != 0 && GuestMemory::Watched(target.stencilAddress, stencilBytes())));
         throw std::runtime_error(text);
     }
 
@@ -481,7 +489,8 @@ bool sameSurface(const DepthTarget& a, const DepthTarget& b) {
     const auto aExtent = surfaceExtent(a);
     const auto bExtent = surfaceExtent(b);
     return a.address == b.address && a.stencilAddress == b.stencilAddress && aExtent.width == bExtent.width && aExtent.height == bExtent.height && a.mipCount == b.mipCount && a.format == b.format && a.samples == b.samples &&
-        (a.zInfo & 0x1f0u) == (b.zInfo & 0x1f0u) && a.encodedSurfaceAddress == b.encodedSurfaceAddress && a.depthSlice == b.depthSlice;
+        (a.zInfo & 0x1f0u) == (b.zInfo & 0x1f0u) && a.encodedSurfaceAddress == b.encodedSurfaceAddress && a.depthSlice == b.depthSlice &&
+        (a.stencilInfo & 0x1f0u) == (b.stencilInfo & 0x1f0u) && a.encodedStencilAddress == b.encodedStencilAddress;
 }
 
 std::mutex& surfacesMutex() {
@@ -524,6 +533,15 @@ void reloadPublishedDepth(std::unique_lock<std::mutex>& lock, const std::shared_
     lock.lock();
     Require(registeredSurface(surface), "depth mapping changed during canonical reload");
     surface->Transfer(*storage, false, 0);
+    if (surface->target.stencilAddress != 0) {
+        const auto stencilResource = surface->CanonicalResource(true);
+        Require(stencilResource.has_value(), "retired stencil surface lost its canonical guest layout");
+        lock.unlock();
+        auto stencilStorage = canonicalStorage(surface->context, *stencilResource);
+        lock.lock();
+        Require(registeredSurface(surface), "depth mapping changed during stencil reload");
+        surface->Transfer(*stencilStorage, false, 0);
+    }
     surface->guestPublished = false;
 }
 
@@ -783,10 +801,7 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
         if (found == list.rend()) continue;
         auto surface = *found;
         if (!surface->StorageAccepts(*storage, layer)) {
-            if (surface->target.stencilAddress == address) {
-                surface->SeedStorage(storage, layer);
-                continue;
-            }
+            const bool stencilAlias = surface->target.stencilAddress == address;
             const auto bytes = static_cast<std::size_t>(DepthMipChainBytes(surfaceExtent(surface->target),
                 surface->target.format == VK_FORMAT_D16_UNORM || surface->target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u, surface->target.mipCount));
             GuestMemory::CollectWritesUncached(surface->target.address, bytes);
@@ -797,7 +812,7 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
                 lock.lock();
                 continue;
             }
-            const auto resource = surface->CanonicalResource();
+            const auto resource = surface->CanonicalResource(stencilAlias);
             if (!resource.has_value()) {
                 surface->SeedStorage(storage, layer);
                 lock.unlock();
@@ -806,10 +821,13 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
                 continue;
             }
             surface->RequireCanonicalPublication(*storage);
+            const auto otherResource = stencilAlias ? surface->CanonicalResource() :
+                surface->target.stencilAddress != 0 ? surface->CanonicalResource(true) : std::nullopt;
             const bool covered = surface->CoversStorage(*resource, *storage);
             lock.unlock();
             storage->ReplaceFromMemory(covered, [&] {
                 auto canonical = canonicalStorage(context, *resource, storage.get());
+                auto canonicalOther = otherResource ? canonicalStorage(context, *otherResource, storage.get()) : nullptr;
                 try {
                     lock.lock();
                     Require(registeredSurface(surface) && !surface->retired, "depth mapping changed during canonical publication");
@@ -825,10 +843,15 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
                     auto consumed = surface->TakeWrites();
                     surface->ApplyFastClear();
                     surface->Transfer(*canonical, true, 0);
+                    if (canonicalOther != nullptr) surface->Transfer(*canonicalOther, true, 0);
                     lock.unlock();
                     if (consumed != nullptr) consumed->WriteBackLayer(consumedLayer);
                     canonical->MarkDirty();
                     canonical->WriteBackLayer(0);
+                    if (canonicalOther != nullptr) {
+                        canonicalOther->MarkDirty();
+                        canonicalOther->WriteBackLayer(0);
+                    }
                     lock.lock();
                     Require(registeredSurface(surface) && !surface->retired, "depth mapping changed while publishing canonical pixels");
                     surface->guestPublished = true;

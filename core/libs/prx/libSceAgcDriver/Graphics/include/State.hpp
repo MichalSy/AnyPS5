@@ -84,6 +84,8 @@ struct DepthTarget {
     std::uint64_t encodedSurfaceAddress = 0;
     std::uint32_t depthSlice = 0;
     std::uint32_t samples = 1;
+    std::uint32_t stencilInfo = 0;
+    std::uint64_t encodedStencilAddress = 0;
 };
 
 struct State {

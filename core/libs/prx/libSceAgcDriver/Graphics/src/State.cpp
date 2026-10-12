@@ -366,6 +366,8 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
     depth.zInfo = zInfo;
     depth.encodedSurfaceAddress = depth.address;
     depth.stencilAddress = stencil ? base(0x013, 0x01b) : 0;
+    depth.stencilInfo = read(cx, 0x011);
+    depth.encodedStencilAddress = depth.stencilAddress;
     Require(zFormat == 0 || depthReadOnly || base(0x014, 0x01c) == depth.address, "depth read and written at different addresses is unsupported");
     Require(!stencil || stencilReadOnly || base(0x015, 0x01d) == depth.stencilAddress, "stencil read and written at different addresses is unsupported");
     if (((zInfo >> 4u) & 0x1fu) == 24u && mipCount == 1u && mip == 0u && samples == VK_SAMPLE_COUNT_1_BIT && !stencil) depth.address &= ~0xffffull;
