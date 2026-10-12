@@ -39,6 +39,7 @@ private:
     std::vector<std::byte> snapshot;
     GuestAllocations::Lease backing;
     std::unique_ptr<Buffer> linear;
+    std::unique_ptr<Buffer> gpuLinear;
     VkFormat nativeFormat = VK_FORMAT_UNDEFINED;
     VkImage image = VK_NULL_HANDLE;
     VkImageView storageView = VK_NULL_HANDLE;
