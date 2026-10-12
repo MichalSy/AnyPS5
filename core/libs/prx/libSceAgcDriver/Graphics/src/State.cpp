@@ -880,7 +880,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         const auto renderControl = find(cx, 0x000);
         const bool clear = renderControl != cx.end() && (renderControl->second & 3u) != 0;
         const auto tests = planeTests(cx, depthControl);
-        if (clear || (tests != 0 && depthSurfaceBound(cx))) {
+        if (clear || (!inertDepth(cx, depthControl) && tests != 0 && depthSurfaceBound(cx))) {
             decodeDepth(cx, depthControl, (read(cx, 0x203) & 2u) != 0 && !PixelProgramSkipped(queue), result);
         } else if (depthPassThrough(depthControl) || ((depthControl & 0xbu) != 0 && (tests == 0 || depthPlanesAbsent(cx)))) {
             static bool reported = false;
@@ -1425,7 +1425,7 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
             if ((value(cx, 0x010, z) && (z & 3u) == 0) || (value(cx, 0x002, view) && (view & 0x01000000u) != 0)) return require(false, "depth clear requires a writable depth plane");
         }
         const auto tests = planeTests(cx, word);
-        const bool surface = (tests != 0 || depthClear || stencilClear) && depthSurfaceBound(cx);
+        const bool surface = ((!inertDepth(cx, word) && tests != 0) || depthClear || stencilClear) && depthSurfaceBound(cx);
         if (!surface && !((word & 0xbu) != 0 && (tests == 0 || depthPlanesAbsent(cx))) && !depthPassThrough(word) && !IgnoreDepthTest() && (effectiveDepthControl(word) & DepthControlMask) != 0) return zeroMessage(0x200, word, "depth, stencil or conditional color writes");
         if (auto reason = require((word & 8u) == 0 || surface || depthPlanesAbsent(cx), "depth bounds without a depth surface"); !reason.empty()) return reason;
         if (auto reason = require((word & 0xc0000000u) == 0, "depth-conditional color writes are unsupported"); !reason.empty()) return reason;
