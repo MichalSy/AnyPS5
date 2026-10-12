@@ -1,9 +1,18 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include <cstdlib>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include "Optimization/ResourceProgram.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -105,6 +114,76 @@ void Run(AgcDriver::VulkanDevice& device, bool registrationModules, bool formatt
     }
 }
 
+void ConditionalDescriptor(AgcDriver::VulkanDevice& device) {
+    alignas(256) static constexpr std::array<std::uint32_t, 13> code{
+        0x34020082u, 0x7e040280u, 0xbf06800au, 0xbf850006u,
+        0xf4080004u, 0xfa000000u, 0xbf8cc07fu, 0xe0001000u, 0x80000201u,
+        0xbf8c3f70u, 0xe0701000u, 0x80010201u, 0xbf810000u,
+    };
+#ifdef _WIN32
+    auto* block = static_cast<std::byte*>(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+    auto* block = static_cast<std::byte*>(std::aligned_alloc(65536, 65536));
+#endif
+    Require(block != nullptr, "conditional buffer descriptor allocation failed");
+    GuestAllocations::Mutation().Add(block, 65536, true, true, true);
+    struct Cleanup {
+        void* block;
+        ~Cleanup() {
+            GuestAllocations::Mutation().Remove(block);
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } cleanup{block};
+    auto* input = reinterpret_cast<std::uint32_t*>(block);
+    auto* output = reinterpret_cast<std::uint32_t*>(block + 8192);
+    auto* table = reinterpret_cast<std::uint32_t*>(block + 16384);
+    for (std::uint32_t lane = 0; lane < Lanes; ++lane) input[lane] = 0x3f800000u + lane * 0x10000u;
+    std::array<std::uint32_t, 12> userData{};
+    const auto outputDescriptor = BufferDescriptor(output, Lanes * 4u);
+    std::copy(outputDescriptor.begin(), outputDescriptor.end(), userData.begin() + 4);
+    const auto tableAddress = reinterpret_cast<std::uintptr_t>(table);
+    userData[8] = static_cast<std::uint32_t>(tableAddress);
+    userData[9] = static_cast<std::uint32_t>(tableAddress >> 32u);
+    const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
+        {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))},
+        {tableAddress, std::as_bytes(std::span(table, 4))},
+    }};
+    for (const auto mode : {0u, 1u, 2u, 3u}) {
+        std::fill_n(output, Lanes, Fill);
+        auto descriptor = BufferDescriptor(input, Lanes * 4u);
+        if (mode == 1u || mode == 3u) descriptor = {0x25f72f5du, 0x3c00345fu, 0x25f22f55u, 0x3c00345du};
+        if (mode == 3u) descriptor[3] = (descriptor[3] & ~7u) | 2u;
+        if (mode == 2u) descriptor = {0x11u, 0x20000180u, 0x12u, 0u};
+        std::copy(descriptor.begin(), descriptor.end(), table);
+        userData[10] = mode == 1u ? 0u : 1u;
+        auto request = Request(userData, device.ComputeTarget(Lanes), memory, code);
+        request.useCache = false;
+        const auto shader = ShaderRecompiler::Recompile(request);
+        bool faulted = false;
+        try {
+            device.Dispatch(shader, 1, 1, 1);
+            device.WaitIdle();
+        } catch (const std::runtime_error& error) {
+            const std::string message(error.what());
+            if (mode != 3u || message.find("BDA access failed") == std::string::npos || message.find("reason=8") == std::string::npos) throw;
+            faulted = true;
+        }
+        if (mode == 3u) {
+            Require(faulted || std::all_of(output, output + Lanes, [](auto value) { return value == Fill; }),
+                "an executed invalid conditional descriptor continued to write after its GPU fault");
+            continue;
+        }
+        for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+            Require(output[lane] == (mode == 0u ? input[lane] : 0u),
+                "conditional descriptor produced an incorrect value or touched its skipped resource");
+        }
+    }
+}
+
 }
 
 int main() {
@@ -116,6 +195,7 @@ int main() {
         Run(*device, true);
         Run(*device, false, true);
         Run(*device, true, true);
+        ConditionalDescriptor(*device);
         std::puts("buffer descriptor runtime tests passed");
         return 0;
     } catch (const std::exception& error) {

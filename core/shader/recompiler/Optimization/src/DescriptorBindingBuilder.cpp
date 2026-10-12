@@ -274,6 +274,11 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         const auto& descriptor = snapshot.buffers.at(index);
         if (descriptor.dwordCount != 4u) fail("buffer specialization requires four descriptor words");
         const auto& buffer = info.buffers[index];
+        if (buffer.gpuDescriptorOnly) {
+            // The immutable SRT snapshot proves the format, but execution decides whether to access it.
+            plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, descriptor.dwords[3]});
+            continue;
+        }
         const auto format = (descriptor.dwords[3] >> 12u) & 0x7fu;
         const bool present = (format != 0u || (descriptor.dwords[3] & (1u << 23u)) != 0u) &&
             descriptor.dwords[2] != 0u && (descriptor.dwords[0] != 0u || (descriptor.dwords[1] & 0xffffu) != 0u);
