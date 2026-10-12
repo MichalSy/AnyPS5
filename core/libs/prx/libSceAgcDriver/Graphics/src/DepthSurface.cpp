@@ -202,14 +202,17 @@ public:
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const bool d32 = target.format == VK_FORMAT_D32_SFLOAT || target.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
         const auto extent = surfaceExtent(target);
-        const auto stride = DepthSliceBytes(extent, d16 ? 2u : 4u);
         const auto offset = geometry.GuestLayerOffset(layer);
+        const bool stencil = target.stencilAddress != 0 && offset <= std::numeric_limits<std::uint64_t>::max() - descriptor.baseAddress && descriptor.baseAddress + offset == target.stencilAddress;
+        const auto planeAddress = stencil ? target.stencilAddress : target.address;
+        const auto elementBytes = stencil ? 1u : d16 ? 2u : 4u;
+        const auto stride = DepthSliceBytes(extent, elementBytes);
         const bool sized = !IsConvertedTextureFormat(descriptor.format) && BlockWidth(descriptor.format) == 1u &&
-            BlockHeight(descriptor.format) == 1u && BytesPerElement(descriptor.format) == (d16 ? 2u : 4u) &&
+            BlockHeight(descriptor.format) == 1u && BytesPerElement(descriptor.format) == elementBytes &&
             storage.StorageFormat() == ResolveTextureFormat(descriptor.format);
-        return !(target.samples != VK_SAMPLE_COUNT_1_BIT || target.mipCount != 1u || target.mip != 0u || target.address == 0 ||
+        return !(target.samples != VK_SAMPLE_COUNT_1_BIT || target.mipCount != 1u || target.mip != 0u || planeAddress == 0 ||
             (!d16 && !d32) || !sized || !storage.CanWriteBackLayer(layer) || offset > std::numeric_limits<std::uint64_t>::max() - descriptor.baseAddress ||
-            descriptor.baseAddress + offset != target.address || (storage.ImageLayers() > 1u && geometry.layerBytes != stride) || descriptor.width != extent.width ||
+            descriptor.baseAddress + offset != planeAddress || (storage.ImageLayers() > 1u && geometry.layerBytes != stride) || descriptor.width != extent.width ||
             descriptor.height != extent.height || descriptor.mipCount != 1u || descriptor.baseLevel != 0u ||
             descriptor.lastLevel != 0u || descriptor.baseArray >= storage.ImageLayers() || layer >= storage.ImageLayers() ||
             (descriptor.dimension != TextureDimension::k2D && descriptor.dimension != TextureDimension::k2DArray) ||
@@ -276,7 +279,9 @@ public:
             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         VkBufferImageCopy depthRegion{};
-        depthRegion.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        const auto storageAddress = storage.Descriptor().baseAddress + DescribeSurface(storage.Descriptor()).GuestLayerOffset(layer);
+        const bool stencil = target.stencilAddress != 0 && storageAddress == target.stencilAddress;
+        depthRegion.imageSubresource = {stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
         depthRegion.imageExtent = {extent.width, extent.height, 1};
         auto storageRegion = depthRegion;
         storageRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -759,8 +764,9 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
             (!containsPlane(surface->target.address) && !containsPlane(surface->target.stencilAddress))) continue;
         Require((descriptor.dimension == TextureDimension::k2D || descriptor.dimension == TextureDimension::k2DArray) && storage->ImageDepth() == 1u,
             "storage access to a depth surface requires a 2D image or array");
-        Require(surface->target.address >= descriptor.baseAddress && surface->target.address - descriptor.baseAddress < geometry.guestBytes &&
-            (surface->target.address - descriptor.baseAddress) % geometry.layerBytes == 0u,
+        const auto planeAddress = containsPlane(surface->target.address) ? surface->target.address : surface->target.stencilAddress;
+        Require(planeAddress >= descriptor.baseAddress && planeAddress - descriptor.baseAddress < geometry.guestBytes &&
+            (planeAddress - descriptor.baseAddress) % geometry.layerBytes == 0u,
             "storage access to a depth surface requires an aligned depth array layer: depth=" + std::to_string(surface->target.address) +
             " extent=" + std::to_string(surface->target.extent.width) + "x" + std::to_string(surface->target.extent.height) +
             " format=" + std::to_string(surface->target.format) + " storage=" + std::to_string(descriptor.baseAddress) +
@@ -772,11 +778,15 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
         const auto address = descriptor.baseAddress + geometry.GuestLayerOffset(layer);
         const auto& list = surfaces();
         const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
-            return !surface->retired && !surface->mappingInvalidated && surface->context.device == context.device && surface->target.address == address;
+            return !surface->retired && !surface->mappingInvalidated && surface->context.device == context.device && (surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address));
         });
         if (found == list.rend()) continue;
         auto surface = *found;
         if (!surface->StorageAccepts(*storage, layer)) {
+            if (surface->target.stencilAddress == address) {
+                surface->SeedStorage(storage, layer);
+                continue;
+            }
             const auto bytes = static_cast<std::size_t>(DepthMipChainBytes(surfaceExtent(surface->target),
                 surface->target.format == VK_FORMAT_D16_UNORM || surface->target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u, surface->target.mipCount));
             GuestMemory::CollectWritesUncached(surface->target.address, bytes);
