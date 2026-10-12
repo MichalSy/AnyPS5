@@ -1185,8 +1185,15 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
         color.arrayLastSlice = attrib3 & 0x1fffu;
         color.arraySlice = slice;
     }
-    const auto surfaceLastSlice = volume ? color.depth - 1u : color.arrayLastSlice;
-    Require(slice <= surfaceLastSlice, "color view starts beyond its surface");
+    // Preserve single-slice 2D views: a zero MIP0_DEPTH does not remove their slice offset.
+    const bool singleSliceWithoutDepth = !volume && color.arrayLastSlice == 0u && slice == lastSlice;
+    const auto surfaceLastSlice = volume ? color.depth - 1u : singleSliceWithoutDepth ? slice : color.arrayLastSlice;
+    if (slice > surfaceLastSlice) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "AGC graphics: color view starts beyond its surface (slot=%u slice=%u last=%u surfaceLast=%u CB_COLOR_VIEW=0x%08x CB_COLOR_INFO=0x%08x CB_COLOR_ATTRIB2=0x%08x CB_COLOR_ATTRIB3=0x%08x)",
+            slot, slice, lastSlice, surfaceLastSlice, view, info, attrib2, attrib3);
+        throw std::runtime_error(message);
+    }
     // SLICE_MAX bounds shader-selected indices; the resource depth can be smaller.
     color.layerCount = std::min(lastSlice, surfaceLastSlice) - slice + 1u;
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};

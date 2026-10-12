@@ -81,33 +81,33 @@ std::string Hex(std::uint32_t value) {
 
 class GuestBlock {
 public:
-    GuestBlock() {
+    explicit GuestBlock(std::size_t allocationBytes = SurfaceBytes) : bytes(allocationBytes) {
 #ifdef _WIN32
-        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(SurfaceBytes, LayerBytes));
-        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, SurfaceBytes, PAGE_READWRITE, SurfaceBytes);
+        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, LayerBytes));
+        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
 #else
-        void* mapped = mmap(nullptr, SurfaceBytes + LayerBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* mapped = mmap(nullptr, bytes + LayerBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
             const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
             const auto aligned = (begin + LayerBytes - 1) & ~(static_cast<std::uintptr_t>(LayerBytes) - 1);
             if (aligned != begin) munmap(mapped, aligned - begin);
-            if (aligned + SurfaceBytes != begin + SurfaceBytes + LayerBytes) munmap(reinterpret_cast<void*>(aligned + SurfaceBytes), begin + LayerBytes - aligned);
+            if (aligned + bytes != begin + bytes + LayerBytes) munmap(reinterpret_cast<void*>(aligned + bytes), begin + LayerBytes - aligned);
             block = reinterpret_cast<std::uint8_t*>(aligned);
-            if (AgcDriver::GuestMemory::WriteWatched()) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, SurfaceBytes);
+            if (AgcDriver::GuestMemory::WriteWatched()) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
         }
 #endif
         Require(block != nullptr, "array layer target: cannot allocate the guest block");
-        GuestAllocations::Mutation().Add(block, SurfaceBytes, true, true, true);
+        GuestAllocations::Mutation().Add(block, bytes, true, true, true);
     }
 
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);
 #ifdef _WIN32
-        GuestArena::GuestArenaReset_nid_postfix(block, SurfaceBytes);
-        GuestArena::GuestArenaRelease_nid_postfix(block, SurfaceBytes);
+        GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
 #else
-        munmap(block, SurfaceBytes);
-        if (AgcDriver::GuestMemory::WriteWatched()) GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, SurfaceBytes);
+        munmap(block, bytes);
+        if (AgcDriver::GuestMemory::WriteWatched()) GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, bytes);
 #endif
     }
 
@@ -118,6 +118,7 @@ public:
 
 private:
     std::uint8_t* block = nullptr;
+    std::size_t bytes;
 };
 
 std::array<std::uint32_t, 8> ArrayDescriptor(std::uint64_t address) {
@@ -186,6 +187,25 @@ AgcDriver::Graphics::ColorTarget DecodeTarget(std::uint64_t address, std::uint32
     Require(color.format == VK_FORMAT_R32_SFLOAT && color.bytes == LayerBytes * (last - slice + 1u) && color.layerCount == last - slice + 1u && color.address == address + slice * LayerBytes, "the COLOR_32 float view did not decode as a 128x128 R32 slice of the array");
     Require(color.arrayAddress == address && color.arrayLastSlice == Layers - 1u && color.arraySlice == slice, "the color view did not keep its array and slice");
     return color;
+}
+
+void CheckSingleSliceWithZeroDepth() {
+    GuestBlock block(4u * SurfaceBytes);
+    const auto address = AddressOf(block.Data());
+    AgcDriver::Registers cx;
+    cx[0x318] = static_cast<std::uint32_t>(address >> 8u);
+    cx[0x390] = static_cast<std::uint32_t>(address >> 40u);
+    cx[0x31b] = 0x00002001u;
+    cx[0x31c] = 0x00040730u;
+    cx[0x31d] = 0u;
+    cx[0x3b0] = 0x701fc07fu;
+    cx[0x3b8] = 0x4dc6c000u;
+    const auto color = AgcDriver::Graphics::DecodeColorBuffer(cx, 0);
+    Require(color.extent.width == 128 && color.extent.height == 128 && color.mipCount == 8 && color.mip == 0,
+        "the single-slice mipmapped color view changed its extent or mip chain");
+    // Slice stride: 128 KiB mip 0, 64 KiB mip 1 and a 64 KiB mip tail.
+    Require(color.layerCount == 1 && color.bytes == 131072 && color.address == address + 262144,
+        "the single-slice color view did not address slice 1 after the complete mip chain: bytes=" + std::to_string(color.bytes) + " offset=" + std::to_string(color.address - address));
 }
 
 void DrawSlice(AgcDriver::VulkanDevice& device, std::uint64_t surface, std::uint32_t slice) {
@@ -343,6 +363,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
 
 int main() {
     try {
+        CheckSingleSliceWithZeroDepth();
         GuestBlock block;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
