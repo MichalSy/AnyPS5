@@ -43,6 +43,12 @@ for command 4; the new integer, pointer and duplication commands need explicit
 translation and ownership handling. The `guest_dup` shared-status-flags check
 exposes the POSIX translation gap.
 
+The `libSceNet` socket registry uses low descriptor numbers that the file close
+hook does not currently dispatch to `KernelCloseSocket_nid_no_patch`. The
+`guest_sce_net` kernel-close check exposes this gap. Keep file and socket
+ownership distinct when integrating that registry; a socket number must not be
+used as a native file descriptor.
+
 The standard-stream mode fixture still passes a native `dup(fileno(...))` result
 to guest `fdopen`; adapt that fixture to use a guest-owned descriptor. Host-only
 descriptors must continue to be rejected.

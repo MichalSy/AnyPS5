@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <source_location>
+#include <string_view>
 #include <stdexcept>
 #include <thread>
 
@@ -92,8 +94,11 @@ int APS5_VABI sceNetPoolDestroy(int);
 int APS5_VABI sceNetGetMemoryPoolStats(int, NetMemoryPoolStats*);
 }
 
-static void Require(bool condition) {
-    if (!condition) std::abort();
+static void Require(bool condition, const std::source_location where = std::source_location::current()) {
+    if (!condition) {
+        std::fprintf(stderr, "network assertion failed at line %u\n", where.line());
+        std::abort();
+    }
 }
 
 static bool Failed(std::int64_t result, int error) {
@@ -338,7 +343,42 @@ static void CheckUnspecifiedIpv6() {
     Require(sceNetSocketClose(receiver) == 0);
 }
 
-int main() {
+void CheckPeerSocketTypes() {
+    std::array<std::uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
+    const int receiver = sceNetSocket("peer-udp-receiver", 2, 6, 0);
+    const int sender = sceNetSocket("peer-udp-sender", 2, 6, 0);
+    Require(receiver >= 0 && sender >= 0);
+    const int enabled = 1;
+    Require(sceNetSetsockopt(receiver, 0xffff, 0x20, &enabled, sizeof(enabled)) == 0);
+    Require(sceNetSetsockopt(receiver, 0xffff, 0x20000, &enabled, sizeof(enabled)) == 0);
+    Require(sceNetBind_nid_postfix(receiver, address.data(), address.size()) == 0);
+    std::uint32_t size = address.size();
+    Require(sceNetGetsockname(receiver, address.data(), &size) == 0);
+    const char payload[] = "peer socket transport";
+    char received[sizeof(payload)]{};
+    Require(sceNetSendto(sender, payload, sizeof(payload), 0, address.data(), size) == sizeof(payload));
+    Require(sceNetRecvfrom(receiver, received, sizeof(received), 0, nullptr, nullptr) == sizeof(received));
+    Require(std::strcmp(payload, received) == 0);
+    Require(sceNetSocketClose(sender) == 0 && sceNetSocketClose(receiver) == 0);
+
+    const int listener = sceNetSocket("peer-stream-listener", 2, 10, 0);
+    const int client = sceNetSocket("peer-stream-client", 2, 10, 0);
+    Require(listener >= 0 && client >= 0);
+    address = {16, 2, 0, 0, 127, 0, 0, 1};
+    Require(sceNetBind_nid_postfix(listener, address.data(), address.size()) == 0);
+    Require(sceNetListen(listener, 1) == 0);
+    size = address.size();
+    Require(sceNetGetsockname(listener, address.data(), &size) == 0);
+    Require(sceNetConnect(client, address.data(), size) == 0);
+    const int accepted = sceNetAccept(listener, nullptr, nullptr);
+    Require(accepted >= 0);
+    Require(sceNetSend(client, payload, sizeof(payload), 0) == sizeof(payload));
+    Require(sceNetRecv(accepted, received, sizeof(received), 0) == sizeof(received));
+    Require(std::strcmp(payload, received) == 0);
+    Require(sceNetSocketClose(accepted) == 0 && sceNetSocketClose(client) == 0 && sceNetSocketClose(listener) == 0);
+}
+
+int main(int argc, char** argv) {
     const auto epoch = std::chrono::steady_clock::time_point{};
     Require(KernelSocketSelect::DeadlineAfter(epoch, 2, 250000) == epoch + std::chrono::milliseconds(2250));
     Require(KernelSocketSelect::DeadlineAfter(epoch, INT64_MAX, 0) == std::chrono::steady_clock::time_point::max());
@@ -351,6 +391,8 @@ int main() {
         Require(in6addr_loopback_nid_postfix[i] == (i == 15 ? 1 : 0));
     }
     Require(sceNetInit_nid_postfix() == 0);
+    CheckPeerSocketTypes();
+    if (argc == 2 && std::string_view(argv[1]) == "--peer-only") return 0;
     CheckPoolStats();
     CheckEmptyEpoll();
     CheckAddressText(2, "127.0.0.1");
