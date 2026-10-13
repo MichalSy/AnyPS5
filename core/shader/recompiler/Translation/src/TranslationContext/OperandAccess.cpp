@@ -342,19 +342,17 @@ IrU32 TranslationContext::quietNan32(IrU32 bits) {
 }
 
 IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct) {
-    const auto isNan = [&](IrValue& value) -> IrValue& { return ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&value}); };
-    IrValue* candidate = nullptr;
+    const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
+    IrValue* bits = &ir.BitCastU32(*result);
+    bits = &ir.Select(isNan(*bits), ir.Constant(0xffc00000u), *bits);
     for (auto source = sources.end(); source != sources.begin();) {
         --source;
         IrValue& sourceBits = ir.BitCastU32(**source);
-        if (candidate == nullptr) {
-            candidate = invalidProduct != nullptr && sources.size() == 3u ? &ir.Select(*invalidProduct, ir.Constant(0u), sourceBits) : &sourceBits;
-            continue;
-        }
-        candidate = &ir.Select(isNan(**source), sourceBits, *candidate);
+        IrValue* selected = &isNan(sourceBits);
+        if (invalidProduct != nullptr && source + 1 == sources.end() && sources.size() == 3u) selected = &ir.LogicalAnd(*selected, ir.LogicalNot(*invalidProduct));
+        bits = &ir.Select(*selected, quietNan32(IrU32(sourceBits)).Value(), *bits);
     }
-    IrValue& fallback = ir.Select(isNan(*result), ir.Constant(0xffc00000u), ir.BitCastU32(*result));
-    return &ir.BitCastF32(ir.Select(isNan(ir.BitCastF32(*candidate)), quietNan32(IrU32(*candidate)).Value(), fallback));
+    return &ir.BitCastF32(*bits);
 }
 
 IrValue& TranslationContext::invalidProductF32(IrValue* lhs, IrValue* rhs) {
