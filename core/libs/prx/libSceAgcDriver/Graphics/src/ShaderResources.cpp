@@ -2372,12 +2372,31 @@ void CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const bool labels = Recorder::PendingCompletionLabels() != 0;
     if ((context.copiedWriters == nullptr || context.copiedWriters->empty()) && drawWriters->empty() && !labels) return;
     if (!recorder->PendingWriteOverlaps(address, bytes)) return;
-    const auto overlaps = [&](const auto& writers) {
-        return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); });
-    };
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
+    if (labels && recorder->PendingLabelIn(address, bytes)) {
         Recorder::CountSync(4);
         recorder->SyncThrough(address, bytes);
+        return;
+    }
+    // Address-table builds request whole registered heaps, but only copied outputs
+    // need CPU completion. Snapshot their intersections before syncs retire writers.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> copied;
+    const auto collect = [&](const auto& writers) {
+        for (const auto& writer : writers) {
+            for (const auto& [begin, end] : writer->GpuWrites()) {
+                const auto first = std::max(address, begin);
+                const auto last = std::min(address + bytes, end);
+                if (first < last && writer->CopiedWritesOverlap(first, static_cast<std::size_t>(last - first))) copied.emplace_back(first, last);
+            }
+        }
+    };
+    if (context.copiedWriters != nullptr) collect(*context.copiedWriters);
+    collect(*drawWriters);
+    std::sort(copied.begin(), copied.end());
+    copied.erase(std::unique(copied.begin(), copied.end()), copied.end());
+    for (const auto& [begin, end] : copied) {
+        if (!recorder->PendingWriteOverlaps(begin, static_cast<std::size_t>(end - begin))) continue;
+        Recorder::CountSync(4);
+        recorder->SyncThrough(begin, static_cast<std::size_t>(end - begin));
     }
 }
 

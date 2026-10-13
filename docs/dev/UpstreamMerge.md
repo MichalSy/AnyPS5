@@ -41,6 +41,8 @@ and file-based pad input are not enabled on main.
 - CPU copy-back dependency checks consider copied buffer writes only. A shader
   that also writes directly imported buffers must not force a CPU wait when a
   later GPU resource uses those direct writes; their recorded hazards remain.
+  Whole-heap address-table requests wait through the overlapping copied output
+  ranges, preserving unrelated later GPU batches instead of draining the heap.
 - Retired depth surfaces no longer validate or consume storage writes to their
   former memory. Retained views stay alive for recorded work without restoring
   depth ownership over memory reused for another resource.

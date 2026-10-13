@@ -364,7 +364,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     binding.descriptorSet = 0;
     binding.binding = 0;
     binding.count = 1;
-    binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, 1024, 0x31000000u};
+    binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, 1024, 0x31014204u};
     binding.bufferWritten = {true};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -431,12 +431,18 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         copied->WriteBackBuffers();
         std::erase(writers, copied);
     });
+    recorder.Submit();
+    const auto copiedSerial = recorder.Submissions();
     auto separateProgram = program;
     separateProgram.bindings[0].guestDescriptor[0] += 4096;
     const CompiledShader separateCompute{ShaderRecompiler::ShaderStage::Compute, &separateProgram, 0};
     auto separate = std::make_shared<ShaderResources>(context, separateCompute);
     Require(!writers.empty() && *block == 20, "a disjoint consumer waited for copied writes");
     update(separate, 2);
+    CompletePendingCpuWrites(context, address, bytes);
+    Require(recorder.Submissions() == copiedSerial, "a whole-heap copy-back dependency submitted unrelated later GPU writes");
+    Require(*block == 21 && block[1024] == 30, "copy-back completion did not preserve the later GPU batch");
+    Require(recorder.PendingWriteOverlaps(address + 4096, sizeof(std::uint32_t)), "the later direct GPU write was retired by an unrelated copy-back");
     recorder.Sync();
     Require(*block == 21 && block[1024] == 32, "disjoint copied and direct writes changed each other");
     const std::uint32_t label = 40;
@@ -510,7 +516,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         imageProgram.bindings[0].guestDescriptor[6] = (1u << 21) | (static_cast<std::uint32_t>((keys >> 8) & 0xffu) << 24);
         imageProgram.bindings[0].guestDescriptor[7] = static_cast<std::uint32_t>(keys >> 16);
         auto keyProgram = program;
-        keyProgram.bindings[0].guestDescriptor = {static_cast<std::uint32_t>(keys), static_cast<std::uint32_t>(keys >> 32u) & 0xffffu, static_cast<std::uint32_t>(keyBytes), 0x31000000u};
+        keyProgram.bindings[0].guestDescriptor = {static_cast<std::uint32_t>(keys), static_cast<std::uint32_t>(keys >> 32u) & 0xffffu, static_cast<std::uint32_t>(keyBytes), 0x31014204u};
         const CompiledShader keyCompute{ShaderRecompiler::ShaderStage::Compute, &keyProgram, 0};
         for (int reuse = 0; reuse < 2; ++reuse) {
             std::memset(reinterpret_cast<void*>(keys), 0, keyBytes);
