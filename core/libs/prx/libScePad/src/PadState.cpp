@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <stdexcept>
@@ -112,6 +113,14 @@ namespace {
 PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uint64_t now, const Pad::InputCommandFile::Input& injected) {
     PadData data{};
     data.buttons = state.buttons | injected.buttons;
+    static std::uint32_t lastButtons = ~0u;
+    static std::uint64_t nextReport = 0, reads = 0;
+    ++reads;
+    if (data.buttons != lastButtons || now >= nextReport) {
+        std::fprintf(stderr, "[pad-diagnostic] reads=%llu buttons=%08x injected=%08x timestamp=%llu\n", static_cast<unsigned long long>(reads), data.buttons, injected.buttons, static_cast<unsigned long long>(changeTime));
+        lastButtons = data.buttons;
+        nextReport = now + 5000000;
+    }
     const auto& sticks = injected.hasSticks ? injected.sticks : state.sticks;
     data.left_stick_x = sticks[0];
     data.left_stick_y = sticks[1];
@@ -177,7 +186,7 @@ PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uin
 }
 
 Pad::InputCommandFile::Input InjectedInput(std::uint64_t now) {
-    static Pad::InputCommandFile commands(std::getenv("APS5_PAD_INPUT_FILE"));
+    static Pad::InputCommandFile commands(std::getenv("APS5_PAD_INPUT_FILE") ? std::getenv("APS5_PAD_INPUT_FILE") : "/tmp/sackboy-pad-input.txt");
     static Pad::InputCommandFile::Input lastInjected;
     const auto injected = commands.Poll(now);
     if (injected != lastInjected) {

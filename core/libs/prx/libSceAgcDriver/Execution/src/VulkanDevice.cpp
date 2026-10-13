@@ -2537,10 +2537,10 @@ struct FrameDumps {
 FrameDumps& Dumps() {
     static FrameDumps dumps{[] {
         const char* value = std::getenv("APS5_DUMP_FRAMES");
-        return value ? std::atoi(value) : 0;
+        return value ? std::atoi(value) : 24;
     }(), std::getenv("APS5_NO_GPU_DUMP") != nullptr, [] {
         const char* value = std::getenv("APS5_DUMP_FRAMES_EVERY");
-        return value ? std::max(std::atoi(value), 1) : 1;
+        return value ? std::max(std::atoi(value), 1) : 121;
     }()};
     return dumps;
 }
