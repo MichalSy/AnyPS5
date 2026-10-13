@@ -55,7 +55,7 @@ void Warn(std::string_view message) {
     line.append(": ").append(message).append("\n");
     FileStream* const stream = __stderrp_nid_postfix;
     std::fwrite(line.data(), 1, line.size(), GetNativeStream(stream));
-    stream->SyncStatus();
+    GuestFileStreamSyncStatus_nid_no_patch(stream);
 }
 
 std::string Character(int character) {

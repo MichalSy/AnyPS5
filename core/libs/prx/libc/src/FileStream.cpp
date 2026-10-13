@@ -201,6 +201,15 @@ std::FILE* FileStream::GetHandle() {
     return nullptr;
 }
 
+extern "C" std::FILE* GuestFileStreamNative_nid_no_patch(FileStream* stream) {
+    if (!stream) { errno = 22; return nullptr; }
+    return stream->GetHandle();
+}
+
+extern "C" void GuestFileStreamSyncStatus_nid_no_patch(FileStream* stream) {
+    if (stream) stream->SyncStatus();
+}
+
 int FileStream::Descriptor() {
     if (!GetHandle()) return -1;
     _guest.descriptor = static_cast<std::int16_t>(state->descriptor);

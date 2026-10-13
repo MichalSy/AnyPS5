@@ -185,7 +185,7 @@ if(BUILD_TESTING)
         add_test(NAME host_exception_typed COMMAND host_exception_runtime_tests typed "${LIBC_PATCHED}")
         set_tests_properties(host_exception_io host_exception_typed PROPERTIES TIMEOUT 20)
         add_custom_target(guest_file_patched_runtime_artifacts DEPENDS
-                "${LIBC_PATCHED}" "${PATCHED_DIR}/libkernel.prx" "${PATCHED_DIR}/libScePosixForWebKit.prx")
+                "${LIBC_PATCHED}" "${PATCHED_DIR}/libkernel.prx" "${PATCHED_DIR}/libScePosixForWebKit.prx" "${PATCHED_DIR}/libSceLibcInternal.prx")
         add_test_executable(guest_patched_file_runtime_tests tests/GuestPatchedFileRuntime.cpp
                 nid/src/NidCompute.cpp nid/src/Sha1.cpp)
         target_include_directories(guest_patched_file_runtime_tests PRIVATE
@@ -195,7 +195,7 @@ if(BUILD_TESTING)
         target_link_libraries(guest_patched_file_runtime_tests PRIVATE "${LIBC_PATCHED}" stdc++ gcc_s ${CMAKE_DL_LIBS})
         add_dependencies(guest_patched_file_runtime_tests guest_file_patched_runtime_artifacts)
         add_test(NAME guest_patched_file_runtime COMMAND guest_patched_file_runtime_tests
-                "${LIBC_PATCHED}" "${PATCHED_DIR}/libkernel.prx" "${PATCHED_DIR}/libScePosixForWebKit.prx")
+                "${LIBC_PATCHED}" "${PATCHED_DIR}/libkernel.prx" "${PATCHED_DIR}/libScePosixForWebKit.prx" "${PATCHED_DIR}/libSceLibcInternal.prx")
         set_tests_properties(guest_patched_file_runtime PROPERTIES TIMEOUT 20)
     endif()
     add_test_executable(guest_libc_compatibility_tests tests/GuestLibcCompatibility.cpp)

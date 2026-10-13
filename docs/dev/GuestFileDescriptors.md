@@ -56,7 +56,11 @@ Build the patched runtime with `cmake --build build --target relinker libs`
 while no game is running. Tests cover host isolation, stream identity, descriptor
 ownership, concurrent close/read, pipe rollback, select, duplication, AIO and
 POSIX/kernel errors. `guest_patched_file_runtime` additionally checks the actual
-NID-patched shared libraries used by games. Run the relevant checks with:
+NID-patched shared libraries used by games, including LibcInternal eager loading
+and its getopt warning path. Cross-library stream access uses the C helpers
+`GuestFileStreamNative_nid_no_patch` and `GuestFileStreamSyncStatus_nid_no_patch`;
+internal C++ method names must not become unresolved imports after NID patching.
+Run the relevant checks with:
 
 ```sh
 ctest --test-dir build --output-on-failure \

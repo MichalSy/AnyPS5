@@ -78,9 +78,12 @@ public:
 };
 static_assert(std::is_standard_layout_v<FileStream>);
 
+extern "C" std::FILE* GuestFileStreamNative_nid_no_patch(FileStream* stream);
+extern "C" void GuestFileStreamSyncStatus_nid_no_patch(FileStream* stream);
+
 inline std::FILE* GetNativeStream(FileStream* stream) {
     if (!stream) { errno = 22; return nullptr; }
-    return stream->GetHandle();
+    return GuestFileStreamNative_nid_no_patch(stream);
 }
 
 extern "C" {

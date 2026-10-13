@@ -194,7 +194,7 @@ static void CheckFdopen(const Api& api, const char* oldPath, const char* replace
 }
 
 int main(int argc, char** argv) {
-    Require(argc == 3 || argc == 4, "exact patched libc and kernel paths and optional WebKit path are required");
+    Require(argc >= 3 && argc <= 5, "exact patched libc and kernel paths and optional WebKit/LibcInternal paths are required");
     const rlimit core{0, 0};
     Require(::setrlimit(RLIMIT_CORE, &core) == 0, "the bounded runtime fixture must disable large core exports");
     void* libc = ::dlopen(argv[1], RTLD_NOW | RTLD_NOLOAD | RTLD_GLOBAL);
@@ -233,7 +233,7 @@ int main(int argc, char** argv) {
         CheckBinding(::dlsym(kernel, helper), helper, argv[2]);
     void* webkit = nullptr;
     int (*isatty)(int) = nullptr;
-    if (argc == 4) {
+    if (argc >= 4) {
         ::dlerror();
         webkit = ::dlopen(argv[3], RTLD_NOW | RTLD_LOCAL);
         const char* error = ::dlerror();
@@ -241,6 +241,20 @@ int main(int argc, char** argv) {
         Require(webkit != nullptr && error == nullptr, "all actual patched WebKit native imports must resolve eagerly");
         isatty = Resolve<decltype(isatty)>(webkit, "isatty", argv[3]);
         ::dl_iterate_phdr(RejectUnpatched, nullptr);
+    }
+    void* internal = nullptr;
+    if (argc == 5) {
+        ::dlerror();
+        internal = ::dlopen(argv[4], RTLD_NOW | RTLD_LOCAL);
+        const char* error = ::dlerror();
+        if (error) std::fprintf(stderr, "Patched LibcInternal RTLD_NOW: %s\n", error);
+        Require(internal != nullptr && error == nullptr, "all actual patched LibcInternal imports must resolve eagerly");
+        ::dl_iterate_phdr(RejectUnpatched, nullptr);
+        const auto getopt = Resolve<int (*)(int, char* const*, const char*)>(internal, "getopt", argv[4]);
+        char program[] = "patched-stream-test";
+        char option[] = "-z";
+        char* arguments[] = {program, option, nullptr};
+        Require(getopt(2, arguments, "a") == '?', "LibcInternal getopt must write a warning through the patched guest stderr stream");
     }
     std::fflush(stdout);
     {
@@ -262,6 +276,7 @@ int main(int argc, char** argv) {
                 "patched socket close and WebKit must agree on the retired socket identity");
         }
     }
+    if (internal) Require(::dlclose(internal) == 0, "the fixture must release its LibcInternal loader reference");
     if (webkit) Require(::dlclose(webkit) == 0, "the fixture must release its explicit WebKit loader reference");
     Require(::dlclose(kernel) == 0 && ::dlclose(libc) == 0, "the fixture must release its explicit loader references");
     std::puts("patched guest file runtime tests passed");
