@@ -1264,18 +1264,24 @@ bool DepthSurfaceStoreBack(const Context& context, const StorageTexture& storage
     std::lock_guard lock(surfacesMutex());
     bool stored = false;
     for (const auto& surface : surfaces()) {
-        if (surface->context.device == context.device && !surface->mappingInvalidated && !surface->HasWriterPointer(&storage)) {
+        // Retired memory may already hold color or another resource. Its old plane
+        // views remain alive for recorded work, but no longer own these bytes.
+        if (surface->context.device != context.device || surface->mappingInvalidated || surface->retired) continue;
+        if (!surface->HasWriterPointer(&storage)) {
             const auto address = storage.Descriptor().baseAddress;
             const auto& current = surface->storagePlanes[address == surface->target.stencilAddress ? 1u : 0u];
-            Require((address != surface->target.address && address != surface->target.stencilAddress) || !current || current.get() == &storage,
-                "storage image written through a view that another view of the plane replaced");
+            if ((address == surface->target.address || address == surface->target.stencilAddress) && current && current.get() != &storage) {
+                char text[320];
+                std::snprintf(text, sizeof(text), "storage image written through a view that another view of the plane replaced (address=0x%llx, incoming dim=%u format=%u tile=%u, current dim=%u format=%u tile=%u)",
+                    static_cast<unsigned long long>(address), static_cast<unsigned>(storage.Descriptor().dimension), storage.Descriptor().format, static_cast<unsigned>(storage.Descriptor().tileMode),
+                    static_cast<unsigned>(current->Descriptor().dimension), current->Descriptor().format, static_cast<unsigned>(current->Descriptor().tileMode));
+                Require(false, text);
+            }
         }
-        if (surface->context.device != context.device || surface->mappingInvalidated ||
-            (!surface->HasWriterPointer(&storage) && std::none_of(surface->storagePlanes.begin(), surface->storagePlanes.end(), [&](const auto& plane) { return plane.get() == &storage; }))) continue;
+        if (!surface->HasWriterPointer(&storage) && std::none_of(surface->storagePlanes.begin(), surface->storagePlanes.end(), [&](const auto& plane) { return plane.get() == &storage; })) continue;
         stored = true;
         if (surface->HasWriterPointer(&storage)) static_cast<void>(surface->TakeWrites());
         else surface->Transfer(*(surface->storagePlanes[0].get() == &storage ? surface->storagePlanes[0] : surface->storagePlanes[1]), false, 0);
-        surface->retired = false;
         surface->NoteWritten();
     }
     return stored;

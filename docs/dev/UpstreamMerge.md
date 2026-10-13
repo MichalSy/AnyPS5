@@ -41,6 +41,9 @@ and file-based pad input are not enabled on main.
 - CPU copy-back dependency checks consider copied buffer writes only. A shader
   that also writes directly imported buffers must not force a CPU wait when a
   later GPU resource uses those direct writes; their recorded hazards remain.
+- Retired depth surfaces no longer validate or consume storage writes to their
+  former memory. Retained views stay alive for recorded work without restoring
+  depth ownership over memory reused for another resource.
 
 A successful merge build does not establish that Sackboy's previously reported
 neon textures, black surfaces or menu rendering are fixed. Game validation must

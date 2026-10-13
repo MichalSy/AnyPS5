@@ -247,6 +247,12 @@ void Run(Context context, std::uint8_t* block) {
     layeredDepth.depthOrLastArray = 0;
     layeredDepth.baseArray = 1;
     ExpectFailure([&] { static_cast<void>(DepthSurfaceStorage(context, {}, layeredDepth, 0)); }, "storage image access to depth/stencil surface", "a 2D array view of layer 1 of the depth plane was accepted");
+
+    RetireDepthSurfaces(context.device, address, 1);
+    Require(!DepthSurfaceAt(address), "retired depth memory must be available to another resource");
+    Require(!DepthSurfaceStoreBack(context, *depth), "an obsolete view must not publish into a retired depth surface");
+    Require(!DepthSurfaceStoreBack(context, *arrayDepth), "the cached plane must not reactivate a retired depth surface");
+    Require(!DepthSurfaceAt(address), "storage writes resurrected retired depth memory");
 }
 
 }
