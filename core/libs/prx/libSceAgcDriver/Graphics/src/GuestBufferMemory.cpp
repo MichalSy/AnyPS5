@@ -3087,6 +3087,27 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 region.deviceLocal = staged;
                 region.copySource = entry->buffer;
                 region.copySourceBase = entry->base;
+            } else if (entry == nullptr && recorder != nullptr && gpuCopyEligible(region)) {
+                // Keep the bounded import windows. A buffer view crossing their
+                // registration boundaries can still copy from each import on
+                // the GPU, with its written intersections copied back below.
+                static_cast<void>(recorder->Commands());
+                region.copyParts.clear();
+                auto cursor = region.begin;
+                while (cursor < region.end) {
+                    const auto* part = findImport(state, cursor, cursor + 1);
+                    if (part == nullptr) part = importAllocation(context, state, cursor, importRanges());
+                    if (part == nullptr || part->base > cursor || part->base + part->bytes <= cursor) break;
+                    const auto end = std::min(region.end, part->base + part->bytes);
+                    region.copyParts.push_back({part->buffer, part->base, cursor, end});
+                    cursor = end;
+                }
+                copyOnGpu = cursor == region.end;
+                if (!copyOnGpu) region.copyParts.clear();
+                else if (staged) {
+                    if (!region.deviceLocal) region.buffer.reset();
+                    region.deviceLocal = true;
+                }
             }
         }
         if (region.direct != nullptr) {
@@ -3296,7 +3317,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 expected.assign(snapshotBytes.begin(), snapshotBytes.end());
             }
         }
-        CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        if (inputSnapshot != nullptr || region->copyParts.empty()) {
+            CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        } else {
+            for (const auto& part : region->copyParts) {
+                CopyBuffer(context, commands, part.buffer, part.begin - part.base, region->buffer->Handle(), part.begin - region->begin, part.end - part.begin);
+            }
+        }
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -3375,7 +3402,15 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             }
             // Exactly the sub-range the shader may write, in place in the import: what the shader
             // would have stored there itself had the range been bindable.
-            CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+            if (region.copyParts.empty()) {
+                CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+            } else {
+                for (const auto& part : region.copyParts) {
+                    const auto first = std::max(from, part.begin);
+                    const auto last = std::min(to, part.end);
+                    if (first < last) CopyBuffer(context, commands, region.buffer->Handle(), first - region.begin, part.buffer, first - part.base, last - first);
+                }
+            }
             copiedBytes += to - from;
             recorder.Keep(region.buffer);
             if (profile) {

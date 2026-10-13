@@ -319,7 +319,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         return;
     }
     recorder.Sync();
-    const auto bytes = static_cast<std::size_t>(std::max<VkDeviceSize>(131072, context.hostImportAlignment));
+    const auto bytes = static_cast<std::size_t>(std::max<VkDeviceSize>(131072, 2 * context.hostImportAlignment));
     auto* block = static_cast<std::uint32_t*>(AllocateWatched(bytes, bytes));
     Require(block != nullptr, "allocate copied/direct ordering memory");
     const auto address = reinterpret_cast<std::uint64_t>(block);
@@ -562,6 +562,52 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
             Require(value == 0xff000000, "cached sampled image ignored copied compression-metadata writes");
         }
     }
+    // A descriptor crossing two stable import windows must remain GPU-ordered.
+    // Growing and re-importing a combined span is unnecessary for this view.
+    direct.reset();
+    separate.reset();
+    copied.reset();
+    release.layoutOwner.reset();
+    recorder.Sync();
+    const auto piece = bytes / 2;
+    struct SplitRanges {
+        std::uint32_t* block;
+        std::size_t piece;
+        ~SplitRanges() {
+            SetHostImportWindow(0);
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(reinterpret_cast<std::byte*>(block) + piece);
+        }
+    } split{block, piece};
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        mutation.Add(block, piece, true, true, true);
+        mutation.Add(reinterpret_cast<std::byte*>(block) + piece, piece, true, true, true);
+    }
+    SetHostImportWindow(piece);
+    const auto crossingAddress = address + piece - 16;
+    auto* crossingWords = reinterpret_cast<std::uint32_t*>(crossingAddress);
+    std::fill_n(crossingWords - 1, 10, 100u);
+    AgcDriver::GuestMemory::MarkWritten(crossingAddress - 4, 40);
+    Require(HostImportFor(context, crossingAddress, 32) == nullptr, "crossing view unexpectedly joined import windows");
+    auto crossingProgram = program;
+    crossingProgram.bindings[0].guestDescriptor = {static_cast<std::uint32_t>(crossingAddress), static_cast<std::uint32_t>(crossingAddress >> 32), 32, 0x31014204u};
+    const CompiledShader crossingCompute{ShaderRecompiler::ShaderStage::Compute, &crossingProgram, 0};
+    auto crossing = std::make_shared<ShaderResources>(context, crossingCompute);
+    update(crossing, 1, 8);
+    Require(!crossing->HasCopiedWrites(), "a buffer spanning import windows requires CPU write-back");
+    const auto crossingSubmissions = recorder.Submissions();
+    CompletePendingCpuWrites(context, crossingAddress, 32);
+    Require(recorder.Submissions() == crossingSubmissions, "cross-window GPU output forced a CPU completion wait");
+    auto crossingConsumer = std::make_shared<ShaderResources>(context, crossingCompute);
+    Require(recorder.Submissions() == crossingSubmissions, "cross-window consumer waited for its GPU producer");
+    update(crossingConsumer, 2, 8);
+    recorder.Sync();
+    Require(std::all_of(crossingWords, crossingWords + 8, [](auto value) { return value == 103; }), "cross-window GPU copy-back lost a written segment or producer ordering");
+    Require(crossingWords[-1] == 100 && crossingWords[8] == 100, "cross-window GPU copy-back changed neighboring words");
+    crossing.reset();
+    crossingConsumer.reset();
     std::cout << "Copied producers precede fresh and reused direct consumers\n";
 }
 

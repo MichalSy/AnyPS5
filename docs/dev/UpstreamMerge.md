@@ -45,6 +45,12 @@ and file-based pad input are not enabled on main.
   ranges, preserving unrelated later GPU batches instead of draining the heap.
   A pending CPU label or interrupt elsewhere does not force CPU completion of
   labels already stored by the GPU in the requested range.
+- Buffer views spanning multiple host imports copy in and publish written
+  intersections on the GPU. Upstream's stable aligned import windows remain
+  intact; a view crossing their boundaries no longer requires CPU round trips
+  when all segments are importable. Unmapped or refused imports retain the
+  existing CPU fallback. GPU tests verify producer ordering across the boundary
+  and preservation of neighboring bytes.
 - Retired depth surfaces no longer validate or consume storage writes to their
   former memory. Retained views stay alive for recorded work without restoring
   depth ownership over memory reused for another resource.

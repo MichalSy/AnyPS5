@@ -309,6 +309,15 @@ private:
         bool gpuCopy = false;
         VkBuffer copySource = VK_NULL_HANDLE;
         std::uint64_t copySourceBase = 0;
+        struct CopyPart {
+            VkBuffer buffer;
+            std::uint64_t base;
+            std::uint64_t begin;
+            std::uint64_t end;
+        };
+        // A descriptor may span several stable imports without joining their
+        // allocation windows or falling back to CPU uploads and write-back.
+        std::vector<CopyPart> copyParts;
         bool copiedBack = false;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
