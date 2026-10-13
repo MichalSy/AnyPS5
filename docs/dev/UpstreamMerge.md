@@ -106,3 +106,14 @@ assertion in `CheckFixedMappingsReachTheApplicationAreaEnd`; this is outside the
 changes. Complete memory/rendering correctness and Sackboy rendering remain
 unverified.
 Linux was validated; a native Windows build and game smoke tests were not run.
+
+GPU-selected formatted buffer stores pack complete contiguous components into
+whole dwords before writing through BDA. The fast path requires a writable
+mapped span, compatible physical/guest alignment and contiguous component
+addresses; split, unaligned and denied spans retain the component path. Format
+conversion, byte order, bounds checks and written-page publication are retained.
+GPU regressions cover packed 8/16-bit and 32-bit formats, shifted bases,
+out-of-bounds records and registration boundaries. A captured Sackboy skinning
+pass reproduces slow byte writes to host memory; the grouped version produces
+identical output bytes and written ranges. This fixes a measured pass cost,
+not all remaining frame-time or rendering problems.

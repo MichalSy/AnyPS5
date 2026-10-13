@@ -291,15 +291,57 @@ std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instructi
         const auto values = storeValues(state, data, components);
         EmitIfCondition(state, inBounds, [&] {
             auto packed = ConstantU32(state, 0u);
+            std::array<std::uint32_t, 4> encoded{};
             for (std::uint32_t component = 0; component < info.componentCount; ++component) {
-                const auto encoded = component >= components ? ConstantU32(state, 0u) : memory.d16 ? EmitD16StoreComponent(state, info, component, values[component]) : EmitFormatStoreComponent(state, info, component, values[component]);
+                encoded[component] = component >= components ? ConstantU32(state, 0u) : memory.d16 ? EmitD16StoreComponent(state, info, component, values[component]) : EmitFormatStoreComponent(state, info, component, values[component]);
                 if (info.packedBitfield) {
-                    packed = EmitOrU32(state, packed, Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, encoded, (1u << info.componentBits[component]) - 1u), ConstantU32(state, info.componentBitOffset[component])));
-                } else {
-                    writeBuffer(context, instruction, addresses[component].guest, encoded, info.componentBits[component]);
+                    packed = EmitOrU32(state, packed, Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, encoded[component], (1u << info.componentBits[component]) - 1u), ConstantU32(state, info.componentBitOffset[component])));
                 }
             }
-            if (info.packedBitfield) writeBuffer(context, instruction, addresses[0].guest, packed);
+            if (info.packedBitfield) {
+                writeBuffer(context, instruction, addresses[0].guest, packed);
+                return;
+            }
+            const auto separate = [&] {
+                for (std::uint32_t component = 0; component < info.componentCount; ++component) writeBuffer(context, instruction, addresses[component].guest, encoded[component], info.componentBits[component]);
+            };
+            std::uint32_t totalBits = 0;
+            bool wholeWords = true;
+            for (std::uint32_t component = 0; component < info.componentCount; ++component) {
+                wholeWords &= totalBits % 32u + info.componentBits[component] <= 32u;
+                totalBits += info.componentBits[component];
+            }
+            if (!memory.gpuDescriptor || state.bdaWriteProbeFunction == 0 || info.componentCount < 2u || !wholeWords || totalBits % 32u != 0u) {
+                separate();
+                return;
+            }
+            const auto u64 = TypeScalarU64(state);
+            const auto physical = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaWriteProbeFunction, addresses[0].guest, ConstantU32(state, totalBits / 8u), BdaInstructionPc(state, instruction));
+            auto contiguous = Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u));
+            for (const auto pointer : {addresses[0].guest, physical}) {
+                contiguous = both(state, contiguous, Binary(state, spv::OpIEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, u64, pointer, BdaConstant(state, 3u)), BdaConstant(state, 0u)));
+            }
+            for (std::uint32_t component = 1; component < info.componentCount; ++component) {
+                const auto expected = Binary(state, spv::OpIAdd, u64, addresses[0].guest, BdaConstant(state, GetFormatComponentByteOffset(info, component)));
+                contiguous = both(state, contiguous, Binary(state, spv::OpIEqual, TypeBool(state), addresses[component].guest, expected));
+            }
+            EmitIfCondition(state, contiguous, [&] {
+                std::array<std::uint32_t, 4> words{};
+                words.fill(ConstantU32(state, 0u));
+                std::uint32_t bit = 0;
+                for (std::uint32_t component = 0; component < info.componentCount; ++component) {
+                    const auto width = info.componentBits[component];
+                    const auto value = width == 32u ? encoded[component] : EmitAndConstant(state, encoded[component], (1u << width) - 1u);
+                    const auto shifted = bit % 32u == 0u ? value : Binary(state, spv::OpShiftLeftLogical, u32, value, ConstantU32(state, bit % 32u));
+                    words[bit / 32u] = EmitOrU32(state, words[bit / 32u], shifted);
+                    bit += width;
+                }
+                const auto count = totalBits / 32u;
+                if (count == 1u) EmitBdaWrite(context, instruction, addresses[0].guest, words[0], 32u);
+                else EmitBdaDwordWrites(context, instruction, addresses[0].guest, 0u, count, composite(state, count, words));
+            });
+            EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), contiguous), separate);
         });
         return ConstantU32(state, 0u);
     }

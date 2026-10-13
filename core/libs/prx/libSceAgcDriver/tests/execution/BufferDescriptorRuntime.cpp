@@ -189,6 +189,106 @@ void ConditionalDescriptor(AgcDriver::VulkanDevice& device) {
     }
 }
 
+void PackedGpuStores(AgcDriver::VulkanDevice& device) {
+    constexpr std::size_t BlockBytes = 131072;
+    alignas(256) static constexpr std::array<std::uint32_t, 18> code{
+        0x34020084u, 0xe0301000u, 0x80010801u, 0xe0301004u, 0x80010901u,
+        0xe0301008u, 0x80010a01u, 0xe030100cu, 0x80010b01u, 0xbf8c3f70u,
+        0xbf06800au, 0xbf850005u, 0xf4080004u, 0xfa000000u, 0xbf8cc07fu,
+        0xe01c2000u, 0x80000800u, 0xbf810000u,
+    };
+#ifdef _WIN32
+    auto* block = static_cast<std::byte*>(VirtualAlloc(nullptr, BlockBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+    auto* block = static_cast<std::byte*>(std::aligned_alloc(65536, BlockBytes));
+#endif
+    Require(block != nullptr, "packed GPU stores: allocation failed");
+    GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
+    struct Cleanup {
+        std::byte* block;
+        bool split = false;
+        ~Cleanup() {
+            GuestAllocations::Mutation().Remove(block);
+            if (split) GuestAllocations::Mutation().Remove(block + 65536);
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } cleanup{block};
+    auto* input = reinterpret_cast<std::uint32_t*>(block);
+    auto* table = reinterpret_cast<std::uint32_t*>(block + 16384);
+    const std::array<std::uint32_t, 4> values{0x3f800000u, 0xbf000000u, 0x3e800000u, 0xbf800000u};
+    for (std::uint32_t lane = 0; lane < Lanes; ++lane) std::copy(values.begin(), values.end(), input + lane * 4u);
+    std::array<std::uint32_t, 11> userData{};
+    const auto source = BufferDescriptor(input, Lanes * 16u);
+    std::copy(source.begin(), source.end(), userData.begin() + 4);
+    const auto tableAddress = reinterpret_cast<std::uintptr_t>(table);
+    userData[8] = static_cast<std::uint32_t>(tableAddress);
+    userData[9] = static_cast<std::uint32_t>(tableAddress >> 32u);
+    const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
+        {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))},
+        {tableAddress, std::as_bytes(std::span(table, 4))},
+    }};
+    auto request = Request(userData, device.ComputeTarget(Lanes), memory, code);
+    request.useCache = false;
+    const auto handle = ShaderRecompiler::PrepareShader(request);
+    struct Format {
+        std::uint32_t format, bytes;
+        std::array<std::uint32_t, 4> words;
+    };
+    const std::array<Format, 6> formats{{
+        {56, 4, {0x004000ffu}},
+        {66, 8, {0xc0007fffu, 0x80012000u}},
+        {71, 8, {0xb8003c00u, 0xbc003400u}},
+        {64, 8, {0x3f800000u, 0xbf000000u}},
+        {74, 12, {0x3f800000u, 0xbf000000u, 0x3e800000u}},
+        {77, 16, values},
+    }};
+    for (const bool split : {false, true}) {
+        if (split) {
+            GuestAllocations::Mutation().Remove(block);
+            GuestAllocations::Mutation().Add(block, 65536, true, true, true);
+            GuestAllocations::Mutation().Add(block + 65536, 65536, true, true, true);
+            cleanup.split = true;
+        }
+        for (const auto& format : formats) {
+            for (const std::uint32_t offset : {0u, 1u, 2u, 3u, 4u}) {
+                auto* origin = block + (split ? 65536 - 32 : 8192);
+                auto* destination = origin + offset;
+                std::fill_n(origin, 1024, std::byte{0xa5});
+                const auto address = reinterpret_cast<std::uintptr_t>(destination);
+                const std::array<std::uint32_t, 4> descriptor{
+                    static_cast<std::uint32_t>(address),
+                    static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (format.bytes << 16u),
+                    Lanes - 1u, (format.format << 12u) | 0xfacu,
+                };
+                std::copy(descriptor.begin(), descriptor.end(), table);
+                userData[10] = 1;
+                ShaderRecompiler::SrtRuntime runtime{};
+                runtime.userData = userData;
+                const auto capture = ShaderRecompiler::CaptureResources(request, runtime, *handle);
+                const auto shader = ShaderRecompiler::MaterializeShader(request, *capture, *handle);
+                Require(std::any_of(shader->bindings.begin(), shader->bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; }), "packed GPU stores did not exercise address-based descriptors");
+                device.Dispatch(*shader, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+                device.WaitIdle();
+                for (std::uint32_t lane = 0; lane < Lanes - 1u; ++lane) {
+                    if (std::memcmp(destination + lane * format.bytes, format.words.data(), format.bytes) != 0) {
+                        std::uint32_t actual;
+                        std::memcpy(&actual, destination + lane * format.bytes, sizeof(actual));
+                        std::fprintf(stderr, "packed format=%u lane=%u actual=%08x expected=%08x\n", format.format, lane, actual, format.words[0]);
+                    }
+                    Require(std::memcmp(destination + lane * format.bytes, format.words.data(), format.bytes) == 0,
+                        "packed GPU store mismatch: format " + std::to_string(format.format) + ", offset " + std::to_string(offset) + ", split " + std::to_string(split));
+                }
+                Require(std::all_of(origin, destination, [](std::byte value) { return value == std::byte{0xa5}; }), "packed GPU store modified its prefix");
+                Require(std::all_of(destination + (Lanes - 1u) * format.bytes, origin + 1024, [](std::byte value) { return value == std::byte{0xa5}; }), "packed GPU store modified its tail or an out-of-bounds record");
+            }
+        }
+    }
+}
+
 }
 
 int main() {
@@ -201,6 +301,7 @@ int main() {
         Run(*device, false, true);
         Run(*device, true, true);
         ConditionalDescriptor(*device);
+        PackedGpuStores(*device);
         std::puts("buffer descriptor runtime tests passed");
         return 0;
     } catch (const std::exception& error) {
