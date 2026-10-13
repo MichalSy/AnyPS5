@@ -184,6 +184,12 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         }
     }
 
+    if (header == FlipPacketHeader) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        static_cast<void>(Graphics::StorageTexture::StoreSmallPending("flip"));
+    }
+
     static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
     const bool drains = drainAll ? ((Pm4::AccessesMemory(header) && opcode != 0x16) || opcode == 0x42 || opcode == 0x46 || opcode == 0x58 || header == FlipPacketHeader)
                                  : (!wroteOnGpu && !orderedAlready && (opcode == 0x49 || opcode == 0x37 || opcode == 0x40 || opcode == 0x45 || opcode == 0x50 || opcode == 0x83 || sampleDump || (drawPacket && drawDrain) || (header == FlipPacketHeader && syncFlip)));
@@ -262,14 +268,21 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
         const auto address = store->address;
         std::vector<std::byte> bytes(store->Bytes().begin(), store->Bytes().end());
         const auto size = bytes.size();
+        const bool metadataFill = Pm4::DmaDestination(packet) != 1;
+        const auto fillAddress = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+        const auto fillBytes = packet[6] & 0x3ffffffu;
         const auto pattern = packet[2];
-        DrawPipeline::Queue0().Enqueue([this, queue, address, pattern, bytes = std::move(bytes)] {
+        DrawPipeline::Queue0().Enqueue([this, queue, address, bytes = std::move(bytes), metadataFill, fillAddress, fillBytes, pattern] {
             GuestMemory::SetCurrentPacket(0x50, queue);
+            if (metadataFill) {
+                Graphics::NoteDepthMetadataFill(fillAddress, fillBytes, pattern);
+                Graphics::NoteColorMetadataFill(fillAddress, fillBytes, pattern);
+            }
             commitDmaStore(queue, address, bytes);
-            Graphics::NoteDepthMetadataFill(address, bytes.size(), pattern);
         }, {{address, address + size}});
         return true;
     }
+    if (Pm4::DmaSource(packet) == 0 || Pm4::DmaSource(packet) == 3) Graphics::RequireNoMultisampleTarget(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), packet[6] & 0x3ffffffu, "a DMA copy");
     const auto copy = Pm4::DecodeMemoryCopy(packet);
     if (!copy.has_value() || copy->destination % 4 != 0 || copy->bytes % 4 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) return false;
     DrawPipeline::Queue0().Enqueue([this, queue, copy = *copy] {
@@ -320,7 +333,8 @@ void Driver::commitDmaStore(std::uint32_t queue, std::uint64_t address, std::spa
 bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue) {
     static const bool ordered = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     if (!ordered || !DeferLabels() || (opcode != 0x49 && opcode != 0x37)) return false;
-    const bool endOfPipeInterrupt = opcode == 0x49 && ((packet[2] >> 24u) & 7u) != 0;
+    const auto interruptSelect = opcode == 0x49 ? (packet[2] >> 24u) & 7u : 0u;
+    const bool endOfPipeInterrupt = interruptSelect != 0 && interruptSelect != 3;
     const auto label = Pm4::DecodeLabelWrite(packet);
     if (!label.has_value()) {
         if (opcode != 0x49) return false;

@@ -74,9 +74,9 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
-    if (!thread.joinable()) thread = std::thread([this] { run(); });
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes)});
     outstanding.fetch_add(1, std::memory_order_release);
+    if (!thread.joinable()) thread = std::thread([this] { run(); });
     if (committerWaiting) wake.notify_one();
     if (!profile) return;
     const auto now = std::chrono::steady_clock::now();

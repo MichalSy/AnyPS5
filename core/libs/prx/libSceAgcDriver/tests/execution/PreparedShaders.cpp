@@ -337,6 +337,104 @@ void PendingRegistrationPreparation(AgcDriver::VulkanDevice& device) {
     ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request)); }, "injected registration preparation failure");
 }
 
+void QueuedAbiPreparation(AgcDriver::VulkanDevice& device) {
+    alignas(256) const std::array<std::uint32_t, 1> code{0xbf810000u};
+    std::array<std::uint32_t, 4> users{};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{1, 1, 1}, 0, {false, false, false}, false, 1, {}};
+    const auto address = reinterpret_cast<std::uintptr_t>(code.data());
+    using AbiPreparation = AgcDriver::DriverDetail::PreparedShaders::AbiPreparation;
+    for (const bool source : {true, false}) {
+        AgcDriver::DriverDetail::ShaderSnapshot snapshot{address, 0, 0, {code.begin(), code.end()}, {}};
+        snapshot.header.resize(sizeof(Shader));
+        ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, address, snapshot.code, 0, {}}, {32, 0, users, compute, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
+        const auto handle = ShaderRecompiler::PrepareShader(request);
+        unsigned runs = 0;
+        snapshot.prepared->pendingAbis.push_back({1});
+        snapshot.prepared->abiPreparations.push_back(std::make_shared<AbiPreparation>(AbiPreparation{address, {1}, [&] { ++runs; return std::vector<AgcDriver::DriverDetail::PreparedShaders::Entry>{{0, handle}}; }}));
+        if (source) Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == handle, "first use did not take the artifact of a queued ABI preparation");
+        else static_cast<void>(AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request));
+        Require(runs == 1 && snapshot.prepared->entries.size() == 1, "first use did not run a queued ABI preparation exactly once");
+        Require(snapshot.prepared->abiPreparations.empty() && snapshot.prepared->pendingAbis.empty() && snapshot.prepared->registeredAbis.size() == 1, "a finished ABI preparation was not recorded");
+    }
+    AgcDriver::DriverDetail::ShaderSnapshot snapshot{address, 0, 0, {code.begin(), code.end()}, {}};
+    snapshot.header.resize(sizeof(Shader));
+    ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, address, snapshot.code, 0, {}}, {32, 0, users, compute, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
+    snapshot.prepared->abiPreparations.push_back(std::make_shared<AbiPreparation>(AbiPreparation{address, {1}, [&]() -> std::vector<AgcDriver::DriverDetail::PreparedShaders::Entry> { throw std::runtime_error("injected ABI preparation failure"); }}));
+    const auto handle = AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request);
+    Require(handle != nullptr && snapshot.prepared->entries.size() == 1 && snapshot.prepared->failedAbis.size() == 1 && snapshot.prepared->registeredAbis.empty(), "a failed ABI preparation was not deferred to its use");
+    {
+        AgcDriver::DriverDetail::ShaderPreparationTransaction transaction;
+        Require(transaction.Read(snapshot).entries.size() == 1, "a failed ABI preparation poisoned the snapshot");
+        transaction.Commit();
+    }
+}
+
+void BackgroundAbiResolution() {
+    const bool sync = std::getenv("APS5_SYNC_SHADER_PREPARE") != nullptr;
+    alignas(256) static const std::array<std::uint32_t, 4> pixelCode{0xbf820001u, 0xbe8003ffu, 0x12345678u, 0xbf810000u};
+    struct PixelHeader {
+        Shader shader{};
+        std::array<ShaderRegister, 3> registers{};
+        std::array<ShaderRegister, 3> context{{{0x1b3, 2}, {0x1b4, 2}, {0x1b6, 1}}};
+    } pixel;
+    const auto pixelAddress = reinterpret_cast<std::uintptr_t>(pixelCode.data());
+    pixel.shader.file_header = 0x34333231u;
+    pixel.shader.version = 0x18;
+    pixel.shader.header_size = sizeof(pixel);
+    pixel.shader.shader_size = sizeof(pixelCode);
+    pixel.shader.code = pixelCode.data();
+    pixel.shader.type = 1;
+    pixel.shader.sh_registers = pixel.registers.data();
+    pixel.shader.num_sh_registers = pixel.registers.size();
+    pixel.shader.cx_registers = pixel.context.data();
+    pixel.shader.num_cx_registers = pixel.context.size();
+    pixel.registers = {{{0x008, static_cast<std::uint32_t>(pixelAddress >> 8u)}, {0x009, static_cast<std::uint32_t>(pixelAddress >> 40u)}, {0x00b, 0}}};
+    AgcDriverRegisterShader_nid_postfix(&pixel.shader);
+    const auto resolve = [&] { AgcDriverResolveShaderAbi_nid_postfix(&pixel.shader, {}, {}); };
+    if (sync) ExpectFailure(resolve, "targets invalid program counter");
+    else {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (std::chrono::steady_clock::now() < deadline) {
+            resolve();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    alignas(256) static const std::array<std::uint32_t, 1> computeCode{0xbf810000u};
+    struct ComputeHeader {
+        Shader shader{};
+        std::array<ShaderRegister, 7> registers{};
+        ShaderSpecialRegs specials{};
+    } compute;
+    const auto computeAddress = reinterpret_cast<std::uintptr_t>(computeCode.data());
+    compute.shader.file_header = 0x34333231u;
+    compute.shader.version = 0x18;
+    compute.shader.header_size = sizeof(compute);
+    compute.shader.shader_size = sizeof(computeCode);
+    compute.shader.code = computeCode.data();
+    compute.shader.sh_registers = compute.registers.data();
+    compute.shader.num_sh_registers = compute.registers.size();
+    compute.shader.specials = &compute.specials;
+    compute.specials.dispatch_modifier = 0x8000;
+    compute.registers = {{{0x20c, static_cast<std::uint32_t>(computeAddress >> 8u)}, {0x20d, static_cast<std::uint32_t>(computeAddress >> 40u)}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 0}}};
+    AgcDriverRegisterShader_nid_postfix(&compute.shader);
+    const std::array<ShaderRegister, 1> context{{{0x1b6, 3}}};
+    AgcDriverResolveShaderAbi_nid_postfix(&compute.shader, context, {});
+    std::uint32_t destination = 0;
+    const auto destinationAddress = reinterpret_cast<std::uintptr_t>(&destination);
+    std::vector<std::uint32_t> commands;
+    for (const auto reg : compute.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
+    commands.insert(commands.end(), {0xc0031500u, 1, 1, 1, 0x8041});
+    commands.insert(commands.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(destinationAddress), static_cast<std::uint32_t>(destinationAddress >> 32u), 7});
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    sceAgcDriverSubmitAcb(0x20, &packet);
+    AgcDriverWaitIdle_nid_postfix();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::atomic_ref<std::uint32_t>(destination).load() != 7 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    Require(destination == 7, "a dispatch right after its ABI was resolved did not run");
+    AgcDriverResolveShaderAbi_nid_postfix(&compute.shader, context, {});
+    AgcDriverShutdown_nid_postfix();
+}
+
 void UnsupportedTypeRegistration() {
     alignas(256) static const std::array<std::uint32_t, 1> code{0xbf810000u};
     struct Header {
@@ -700,12 +798,18 @@ void DeferredUndecodableRegistration() {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup")), "invalid test arguments");
+        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--background-abi")), "invalid test arguments");
         if (argc == 2 && std::string_view(argv[1]) == "--registered-workgroup") {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
             RegisteredVertexWorkgroup(device->Target(), true);
             AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--background-abi") {
+            if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
+            BackgroundAbiResolution();
+            std::cout << "background ABI resolution tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--deferred") {
@@ -726,6 +830,7 @@ int main(int argc, char** argv) {
         RegisteredVertexWorkgroup(device->Target());
         FailureCapture(*device);
         PendingRegistrationPreparation(*device);
+        QueuedAbiPreparation(*device);
         Require(argc != 2 || std::string_view(argv[1]) != "--fail-before-registration", "injected failure before registration");
         PrepareMultisampledStorage(*device);
         device.reset();

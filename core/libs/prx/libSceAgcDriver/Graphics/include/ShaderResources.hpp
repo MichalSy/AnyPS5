@@ -155,6 +155,7 @@ public:
         };
         DescriptorCache* cache = nullptr;
         VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout fragmentLayout = VK_NULL_HANDLE;
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;

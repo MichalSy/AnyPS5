@@ -3623,7 +3623,10 @@ ShaderResources::DrawBindings::~DrawBindings() {
         if (layout != VK_NULL_HANDLE) cache->Recycle(layout, allocation);
         else cache->Free(allocation);
     }
-    if (fragmentAllocation.set != VK_NULL_HANDLE) cache->Free(fragmentAllocation);
+    if (fragmentAllocation.set != VK_NULL_HANDLE) {
+        if (fragmentLayout != VK_NULL_HANDLE) cache->Recycle(fragmentLayout, fragmentAllocation);
+        else cache->Free(fragmentAllocation);
+    }
 }
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
@@ -3767,7 +3770,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     if (!descriptions[1].empty() || splitSets) {
-        result->fragmentAllocation = result->cache->Allocate(fragment.layout, PoolSizes(descriptions[1]), updateAfterBind);
+        result->fragmentAllocation = fragment.ownsLayout ? result->cache->Allocate(fragment.layout, PoolSizes(descriptions[1]), updateAfterBind) : result->cache->AllocateRewritten(fragment.layout, PoolSizes(descriptions[1]), updateAfterBind);
+        result->fragmentLayout = fragment.ownsLayout ? VK_NULL_HANDLE : fragment.layout;
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     auto buffers = descriptorBuffers;

@@ -144,10 +144,52 @@ bool RawGraphicsDrawn() {
 
 namespace {
 
+void RunAbiPreparation(PreparedShaders& prepared, const std::shared_ptr<PreparedShaders::AbiPreparation>& job) {
+    PerformanceContext timingContext(FrameTiming::Preparation());
+    std::vector<PreparedShaders::Entry> entries;
+    bool failed = false;
+    try {
+        entries = job->prepare();
+    } catch (const std::exception& error) {
+        APS5_LOG_ERR("Shader 0x%llx could not be prepared for a resolved ABI (%s); preparing it when it is used", static_cast<unsigned long long>(job->codeAddress), error.what());
+        failed = true;
+    } catch (...) {
+        APS5_LOG_ERR("Shader 0x%llx could not be prepared for a resolved ABI; preparing it when it is used", static_cast<unsigned long long>(job->codeAddress));
+        failed = true;
+    }
+    {
+        std::lock_guard lock(prepared.mutex);
+        for (auto& entry : entries) {
+            const auto duplicate = std::ranges::any_of(prepared.entries, [&](const auto& existing) { return existing.handle->artifact == entry.handle->artifact; });
+            if (!duplicate) prepared.entries.push_back(std::move(entry));
+        }
+        std::erase(prepared.pendingAbis, job->key);
+        (failed ? prepared.failedAbis : prepared.registeredAbis).push_back(job->key);
+        std::erase(prepared.abiPreparations, job);
+    }
+    prepared.settled.notify_all();
+}
+
+void AwaitAbiPreparations(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
+    while (!prepared.abiPreparations.empty()) {
+        const auto queued = std::ranges::find_if(prepared.abiPreparations, [](const auto& job) { return !job->claimed; });
+        if (queued == prepared.abiPreparations.end()) {
+            prepared.settled.wait(lock);
+            continue;
+        }
+        const auto job = *queued;
+        job->claimed = true;
+        lock.unlock();
+        RunAbiPreparation(prepared, job);
+        lock.lock();
+    }
+}
+
 void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
     if (prepared.pending) PrioritizeRegistrationPreparation(prepared);
     prepared.settled.wait(lock, [&] { return !prepared.pending; });
     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
+    AwaitAbiPreparations(prepared, lock);
 }
 
 bool CommittedAbi(const ShaderSnapshot& snapshot, std::span<const std::uint64_t> key) {
@@ -252,6 +294,10 @@ ShaderPreparationTransaction::~ShaderPreparationTransaction() {
 
 PreparedShaderState& ShaderPreparationTransaction::Edit(const ShaderSnapshot& snapshot) {
     require(!committed, "shader preparation transaction is already committed");
+    if (!root->changes.contains(snapshot.prepared.get())) {
+        std::unique_lock lock(snapshot.prepared->mutex);
+        AwaitAbiPreparations(*snapshot.prepared, lock);
+    }
     root->Hold();
     auto& changes = root->changes;
     const auto found = changes.find(snapshot.prepared.get());
@@ -266,6 +312,10 @@ PreparedShaderState& ShaderPreparationTransaction::Edit(const ShaderSnapshot& sn
 
 const PreparedShaderState& ShaderPreparationTransaction::Read(const ShaderSnapshot& snapshot) const {
     require(!committed, "shader preparation transaction is already committed");
+    if (!root->changes.contains(snapshot.prepared.get())) {
+        std::unique_lock lock(snapshot.prepared->mutex);
+        AwaitAbiPreparations(*snapshot.prepared, lock);
+    }
     root->Hold();
     auto& changes = root->changes;
     const auto found = changes.find(snapshot.prepared.get());
@@ -1251,6 +1301,7 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
         {
             std::lock_guard lock(prepared.mutex);
             prepared.entries.insert(prepared.entries.end(), std::make_move_iterator(entries.begin()), std::make_move_iterator(entries.end()));
+            std::erase(prepared.pendingAbis, plan->abiKey);
             if (failure == nullptr && !plan->abiKey.empty()) prepared.registeredAbis.push_back(std::move(plan->abiKey));
             prepared.failure = failure;
             prepared.pending = false;
@@ -1459,6 +1510,50 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
     struct RegisteredAbiKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, RegisteredAbiKeyStorage>();
     BuildRegisteredAbiKey(state, *localDevice, key);
+    if (AsyncRegistrationPrepare()) {
+        auto& prepared = *snapshot->prepared;
+        const auto known = [&] {
+            if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
+            const auto contains = [&](const auto& keys) { return std::ranges::find(keys, key) != keys.end(); };
+            return contains(prepared.registeredAbis) || contains(prepared.pendingAbis) || contains(prepared.failedAbis);
+        };
+        bool settled;
+        {
+            std::lock_guard lock(prepared.mutex);
+            settled = known();
+        }
+        if (settled) {
+            transaction.Commit();
+            return;
+        }
+        std::shared_ptr<RegisteredPreparation> plan = PlanRegistered(*snapshot, *localDevice, state, false);
+        auto job = std::make_shared<PreparedShaders::AbiPreparation>(PreparedShaders::AbiPreparation{snapshot->codeAddress, key, {}});
+        if (plan != nullptr) {
+            plan->prebuildDevice = localDevice;
+            job->prepare = [plan] { return PrepareRegistered(*plan); };
+        }
+        bool queued = false;
+        {
+            std::lock_guard lock(prepared.mutex);
+            if (!known()) {
+                (plan != nullptr ? prepared.pendingAbis : prepared.registeredAbis).push_back(key);
+                if (plan != nullptr) prepared.abiPreparations.push_back(job);
+                queued = plan != nullptr;
+            }
+        }
+        if (queued) {
+            SubmitRegistrationPreparation([snapshot, job] {
+                {
+                    std::lock_guard lock(snapshot->prepared->mutex);
+                    if (job->claimed) return;
+                    job->claimed = true;
+                }
+                RunAbiPreparation(*snapshot->prepared, job);
+            });
+        }
+        transaction.Commit();
+        return;
+    }
     const auto prepare = [&] {
         if (snapshot->type == 0) return PrepareRegisteredWithTemplates(*snapshot, *localDevice, state, false);
         PreparedRegistration registration;
@@ -1706,6 +1801,7 @@ void Driver::RegisterShader(const Shader* shader) {
         if (preparation != nullptr) preparation->prebuildDevice = localDevice;
         if (preparation != nullptr && (snapshot.type == 0 || snapshot.type == 1)) BuildRegisteredAbiKey(registered, *localDevice, preparation->abiKey);
         snapshot.prepared->pending = preparation != nullptr;
+        if (preparation != nullptr && !preparation->abiKey.empty()) snapshot.prepared->pendingAbis.push_back(preparation->abiKey);
     } else {
         snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
         if (snapshot.type == 1 && !snapshot.prepared->entries.empty()) {

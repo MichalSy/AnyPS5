@@ -77,11 +77,20 @@ struct PreparedShaderState {
     std::size_t nextCodeHash = 0;
 };
 struct PreparedShaders : PreparedShaderState {
+    struct AbiPreparation {
+        std::uint64_t codeAddress;
+        std::vector<std::uint64_t> key;
+        std::function<std::vector<Entry>()> prepare;
+        bool claimed = false;
+    };
     std::mutex mutex;
     std::condition_variable settled;
     std::exception_ptr failure;
     std::atomic<bool> demanded{false};
     bool pending = false;
+    std::vector<std::vector<std::uint64_t>> pendingAbis;
+    std::vector<std::vector<std::uint64_t>> failedAbis;
+    std::vector<std::shared_ptr<AbiPreparation>> abiPreparations;
 };
 
 struct RegisteredShaderState {

@@ -43,13 +43,39 @@ A successful merge build does not establish that Sackboy's previously reported
 neon textures, black surfaces or menu rendering are fixed. Game validation must
 run through FrameRift with the rebuilt runtime.
 
+## Additional PR integrations
+
+- Pixel shaders load the perspective/linear per-sample interpolation pairs
+  (PR #4797); tessellation control-point components use their within-slot offset
+  (PR #4723). Existing triangle, quad and data-indexed tessellation stay intact.
+- At flips, pending host-imported storage images up to 64 KiB publish their GPU
+  results for CPU consumers such as exposure calculation (PR #4841). Larger
+  resident targets retain their existing idle/read synchronization policy.
+- Static compute/fragment ABI resolution runs on the background preparation pool
+  (PR #2589). Draws await pending jobs; failed speculative preparations fall back
+  to preparation at use.
+- Pipelined release packets do not interrupt for INT_SEL 3; immediate DMA fills
+  notify both HTILE and CMASK consumers in packet order (PRs #1201/#1202).
+- Registered linear color targets use the resident-image path (PR #1193).
+  Fragment descriptor snapshots reuse sets only while their layouts remain
+  cached; owned layouts retain their explicit free path (PR #1202).
+- Windows write-watch queries size the output capacity to the scanned region
+  (PR #4875). Positional file reads return guest errors on failure (PR #4719);
+  public descriptor hooks continue to preserve host/guest ownership.
+- Host standard-stream isolation already covers the goal of PR #3295. The
+  rejected APR retry/staging proposal #4413 is not included.
+- The GT7 report's packed 11:11:10 workaround disables blending and is not a
+  submitted PR. It is not part of these integrations; Sackboy's green tint needs
+  separate validation instead of assuming the same cause.
+
 ## Validation
 
 The full configured build succeeds with `ANYPS5_ENABLE_DEBUG_BRIDGE=ON`.
-All 48 selected runtime/graphics regressions and 11 relinker checks pass,
-including the complete graphics suite, actual NID-patched libraries, descriptor
-number collision, canonical aliases, queued CMASK, depth plane sampling/storage,
-shader caches, zero-stride fetch, idle publication and recursive module loading.
+Targeted Linux regressions pass, including the complete graphics and submission
+suites, per-sample interpolation, tessellation with 24-byte control points,
+background/synchronous ABI preparation, small image publication at flips,
+actual NID-patched libraries, descriptor isolation, canonical aliases, queued
+CMASK, depth plane sampling/storage and module start arguments.
 
 The complete `agc_driver_depth_mips` and
 `agc_driver_depth_surface_last_writer` suites pass. Native MSAA depth sampling
