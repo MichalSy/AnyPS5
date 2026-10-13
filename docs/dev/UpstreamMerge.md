@@ -38,6 +38,9 @@ and file-based pad input are not enabled on main.
   plane array/cube sampling and host D16/stencil format fallback are integrated.
 - Queued CMASK/metadata ordering, mapping retirement and conditional descriptor
   validation remain in place. Zero-stride vertex bounds handling is retained.
+- CPU copy-back dependency checks consider copied buffer writes only. A shader
+  that also writes directly imported buffers must not force a CPU wait when a
+  later GPU resource uses those direct writes; their recorded hazards remain.
 
 A successful merge build does not establish that Sackboy's previously reported
 neon textures, black surfaces or menu rendering are fixed. Game validation must

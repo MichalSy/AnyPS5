@@ -4094,6 +4094,22 @@ void copiedWriterIndirectOverlapTests() {
         auto copiedWriters = DrawCopiedWriters();
         copiedWriters->push_back(writer);
 
+        {
+            Recorder recorder(context);
+            recorder.Activate();
+            static_cast<void>(recorder.Commands());
+            recorder.NotePendingWrite(directAddress, 1024);
+            recorder.NotePendingWrite(copiedAddress, 1024);
+
+            CompletePendingCpuWrites(context, directAddress, 16);
+            Require(recorder.Submissions() == 0, "direct GPU writes must not force a CPU copy-back wait");
+            Require(recorder.PendingWriteOverlaps(directAddress, 16), "direct GPU writes must remain recorded for later resource barriers");
+
+            CompletePendingCpuWrites(context, copiedAddress, 16);
+            Require(recorder.Submissions() == 1, "copied GPU writes must be submitted before their CPU results are consumed");
+            Require(!recorder.PendingWriteOverlaps(copiedAddress, 16), "copied GPU writes must complete before a CPU read");
+        }
+
         const auto overlapsMain = [&](const auto& w) { return w->WritesOverlap(directAddress, 16); };
         const auto overlapsPR = [&](const auto& w) { return w->CopiedWritesOverlap(directAddress, 16); };
 
