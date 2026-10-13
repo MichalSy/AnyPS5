@@ -27,6 +27,7 @@ static std::atomic<std::int32_t> g_transaction_counter{1};
 static std::atomic<int> g_initializations{0};
 static bool g_initialized_once = false;
 static bool g_initial_cleanup_consumed = false;
+static std::atomic<float> g_convertProgress{0.0f};
 
 static std::string save_root() {
     return std::string(SAVE_DIR);
@@ -62,6 +63,9 @@ static bool dir_name_match(const char* str, const char* pattern) {
             return false;
         }
         str++;
+        pattern++;
+    }
+    while (*pattern == '%') {
         pattern++;
     }
     return *str == '\0' && *pattern == '\0';
@@ -727,6 +731,9 @@ int APS5_VABI sceSaveDataTerminate(void) {
         return SAVE_DATA_ERROR_BUSY;
     }
     --g_initializations;
+    if (g_initializations == 0) {
+        g_convertProgress = 0.0f;
+    }
     return SAVE_DATA_OK;
 }
 
@@ -791,6 +798,7 @@ static int convert(const SaveDataConvert* param) {
     if (param == nullptr || param->dir_name == nullptr) {
         throw std::runtime_error("sceSaveDataConvert: null argument");
     }
+    g_convertProgress = 0.0f;
     const auto* nameEnd = static_cast<const char*>(std::memchr(param->dir_name->data, '\0', sizeof(param->dir_name->data)));
     if (nameEnd == nullptr) {
         return SAVE_DATA_ERROR_PARAMETER;
@@ -802,6 +810,7 @@ static int convert(const SaveDataConvert* param) {
     if (!std::filesystem::is_directory(save_root() + "/" + dirName)) {
         return SAVE_DATA_ERROR_NOT_FOUND;
     }
+    g_convertProgress = 1.0f;
     return SAVE_DATA_OK;
 }
 
@@ -811,9 +820,21 @@ int APS5_VABI sceSaveDataConvert(const SaveDataConvert* param) {
     return rc;
 }
 
-int APS5_VABI sceSaveDataGetConvertProgress() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+static int getConvertProgress(float* progress) {
+    if (progress == nullptr) {
+        return SAVE_DATA_ERROR_PARAMETER;
+    }
+    if (g_initializations == 0) {
+        return SAVE_DATA_ERROR_NOT_INITIALIZED;
+    }
+    *progress = g_convertProgress.load();
+    return SAVE_DATA_OK;
+}
+
+int APS5_VABI sceSaveDataGetConvertProgress(float* progress) {
+    const int rc = getConvertProgress(progress);
+    SAVEDATA_TRACE("getConvertProgress -> 0x%08x progress=%.2f", static_cast<unsigned>(rc), progress != nullptr && rc == SAVE_DATA_OK ? *progress : 0.0f);
+    return rc;
 }
 
 int APS5_VABI sceSaveDataCancel() {
@@ -821,9 +842,10 @@ int APS5_VABI sceSaveDataCancel() {
     return 0;
 }
 
-int APS5_VABI sceSaveDataDirNameSearch2() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceSaveDataDirNameSearch2(const SaveDataDirNameSearchCond* cond, SaveDataDirNameSearchResult* result) {
+    const int rc = dirNameSearch(cond, result);
+    SAVEDATA_TRACE("dirNameSearch2 user=%d pattern=%s hit=%u set=%u -> 0x%08x", cond != nullptr ? cond->user_id : -1, cond != nullptr && cond->dir_name != nullptr ? cond->dir_name->data : "(all)", result != nullptr ? result->hit_num : 0u, result != nullptr ? result->set_num : 0u, static_cast<unsigned>(rc));
+    return rc;
 }
 
 APS5_EXPORT("RvID8BVeg+g", sceSaveDataUnknown_RvID8BVeg);

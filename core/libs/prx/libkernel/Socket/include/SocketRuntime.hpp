@@ -2,8 +2,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include "prx/libkernel/Socket/include/SocketPoll.hpp"
+extern "C" void GuestSocketNativeDescriptorEnter_nid_no_patch();
+extern "C" void GuestSocketNativeDescriptorLeave_nid_no_patch();
+
 namespace GuestSockets {
-constexpr int FirstDescriptor = 0x10000000;
+// File hooks mark translated native handles so socket ownership probes never interpret them
+// as logical socket numbers with the same integer value.
+class NativeDescriptorScope {
+public:
+    NativeDescriptorScope() { GuestSocketNativeDescriptorEnter_nid_no_patch(); }
+    ~NativeDescriptorScope() { GuestSocketNativeDescriptorLeave_nid_no_patch(); }
+    NativeDescriptorScope(const NativeDescriptorScope&) = delete;
+    NativeDescriptorScope& operator=(const NativeDescriptorScope&) = delete;
+};
 struct Iovec {
     void* base;
     std::size_t length;
@@ -11,11 +23,13 @@ struct Iovec {
 int Duplicate(int descriptor);
 int DuplicateTo(int descriptor, int target);
 int Close(int descriptor);
+void Forget(int descriptor);
 bool IsOpen(int descriptor);
 int Family(int descriptor);
 std::int64_t Read(int descriptor, void* buffer, std::size_t length);
 std::int64_t Write(int descriptor, const void* buffer, std::size_t length);
 bool Ready(int descriptor, bool write, std::int64_t* data, bool* eof);
+int Poll(KernelSocketPoll::Entry* entries, int count, int timeoutMilliseconds);
 struct Interest {
     int descriptor;
     bool write;

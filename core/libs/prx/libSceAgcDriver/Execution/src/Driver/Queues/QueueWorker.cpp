@@ -9,9 +9,16 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+constexpr auto IdleResultsQuietPeriod = std::chrono::milliseconds(50);
+
+}
 
 FrameTiming* Driver::frameTiming() {
     if (!APS5_ENABLE_TIMING_LOG) return nullptr;
@@ -118,11 +125,9 @@ void Driver::reapCompletionLabels() {
 
 void Driver::run(std::uint32_t id) noexcept {
     onWorkerThread() = true;
-    {
-        char role[32];
-        std::snprintf(role, sizeof role, "queue worker 0x%x", id);
-        PinWorkerThread(role);
-    }
+    char role[32];
+    std::snprintf(role, sizeof role, "queue worker 0x%x", id);
+    PinWorkerThread(role);
 
     GuestMemory::TagGpuLockThread(id);
     if (id == 0) StartWorkerSampler();
@@ -130,6 +135,7 @@ void Driver::run(std::uint32_t id) noexcept {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& costs = submissionCosts(id);
     try {
+        if (PerformanceTrace::Configured()) PerformanceTrace::BindThread(role);
         for (;;) {
             submission = Submission{};
             struct Running {
@@ -165,6 +171,9 @@ void Driver::run(std::uint32_t id) noexcept {
                     return runningWorkers.load(std::memory_order_acquire) == 0
                         && std::all_of(workers.begin(), workers.end(), [](const auto& item) { return item.second.pending.empty(); });
                 };
+                const auto idleResultsPending = [&] {
+                    return id == 0 && Graphics::StorageTexture::AnyPending() && allQueuesIdle() && !completionsPending();
+                };
                 const auto poll = [&](const auto& done) {
 #ifdef _WIN32
                     lock.unlock();
@@ -180,19 +189,20 @@ void Driver::run(std::uint32_t id) noexcept {
                 while (!ready()) {
                     if (!completionWork()) {
                         const auto idleEpochAtCheck = idleEpoch.load(std::memory_order_acquire);
-                        const bool storeIdleResults = id == 0 && allQueuesIdle() && !completionsPending();
+                        const bool storeIdleResults = idleResultsPending();
                         if (storeIdleResults) {
-                            // Empty queues between frames are not the end of a workload. Keep
-                            // resident render targets until a consumer needs them, or until all
-                            // queues stay quiet long enough for an otherwise unobserved CPU read.
-                            // Completion labels and hooked reads still publish without this delay.
-                            if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
-                            const bool interrupted = changed.wait_for(lock, std::chrono::milliseconds(100), [&] {
-                                return ready() || completionWork() || !allQueuesIdle()
-                                    || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck;
+                            queue0Dormant.store(true, std::memory_order_relaxed);
+                            const auto quietUntil = std::chrono::steady_clock::now() + IdleResultsQuietPeriod;
+                            const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
+                            changed.wait_until(lock, quietUntil, [&] {
+                                return ready() || idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait;
                             });
-                            if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
-                            if (interrupted) continue;
+                            queue0Dormant.store(false, std::memory_order_relaxed);
+                            if (ready()) break;
+                            if (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait) {
+                                continue;
+                            }
+                            if (!idleResultsPending()) continue;
                         }
                         lock.unlock();
                         if (storeIdleResults) {

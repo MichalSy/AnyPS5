@@ -2,6 +2,8 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
+#include <source_location>
 #include <cstring>
 #include <stdexcept>
 #include <initializer_list>
@@ -42,7 +44,7 @@ void APS5_VABI Callback(int value) {
     received = value;
     handlerReturn = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
 }
-static void Require(bool value) { if (!value) std::abort(); }
+static void Require(bool value, std::source_location location = std::source_location::current()) { if (!value) { std::fprintf(stderr, "check failed at line %u\n", location.line()); std::abort(); } }
 
 static void TestSets() {
     GuestSignalSet set{};
@@ -257,10 +259,8 @@ int main() {
     Require(pthread_kill_nid_postfix(nullptr, 15) == 3);
     Require(pthread_kill_nid_postfix(nullptr, 128) == 3);
     Require(pthread_kill_nid_postfix(nullptr, 129) == 22);
-    bool threw = false;
-    try { pthread_kill_nid_postfix(reinterpret_cast<void*>(std::uintptr_t{0x10}), 15); }
-    catch (const std::runtime_error&) { threw = true; }
-    Require(threw && received == 0);
+    Require(pthread_kill_nid_postfix(reinterpret_cast<void*>(std::uintptr_t{0x10}), 15) == 3);
+    Require(received == 0);
     Require(signal_nid_postfix(15, ignore) != invalid);
     received = 0;
     Require(raise_nid_postfix(15) == 0 && received == 0);

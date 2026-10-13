@@ -111,9 +111,9 @@ int main() {
     CheckLog();
 
     Require(isatty_nid_postfix(-1) == 0 && *__error_nid_postfix() == 9);
-    Require(isatty_nid_postfix(GuestSockets::FirstDescriptor) == 0 && *__error_nid_postfix() == 9);
+    Require(isatty_nid_postfix(32767) == 0 && *__error_nid_postfix() == 9);
     const int socket = socket_nid_postfix(2, 1, 0);
-    Require(socket >= GuestSockets::FirstDescriptor);
+    Require(socket >= 3 && GuestSockets::IsOpen(socket));
     Require(isatty_nid_postfix(socket) == 0 && *__error_nid_postfix() == 25);
     Require(close_nid_postfix(socket) == 0);
 

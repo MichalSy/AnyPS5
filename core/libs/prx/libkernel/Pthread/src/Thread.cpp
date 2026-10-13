@@ -194,6 +194,9 @@ PthreadPrivate::PthreadPrivate(const PthreadAttrPrivate* attr) : _finished(false
     const auto* parent = CurrentGuestState().current;
     const KernelCpumask inherited = parent ? parent->affinity.load(std::memory_order_relaxed) : registry.processAffinity;
     affinity.store(attr && attr->_affinityExplicit ? attr->_affinity : inherited, std::memory_order_relaxed);
+    constexpr int ExplicitSched = 0;
+    const int inheritedPolicy = parent ? parent->schedPolicy.load(std::memory_order_relaxed) : schedPolicy.load(std::memory_order_relaxed);
+    schedPolicy.store(attr && attr->_inheritsched == ExplicitSched ? attr->_schedpolicy : inheritedPolicy, std::memory_order_relaxed);
     if (registry.nextThread > static_cast<int>(CPU_CLOCK_ID_MASK))
         throw std::runtime_error("Guest thread CPU clock identifiers are exhausted");
     cpuClockThread = registry.nextThread++;
@@ -242,6 +245,16 @@ KernelCpumask LiveGuestThreadsAffinity() {
         if (!thread->_finished.load(std::memory_order_acquire)) mask |= thread->affinity.load(std::memory_order_relaxed);
     }
     return mask;
+}
+
+bool GuestThreadIsLive(const PthreadPrivate* thread) {
+    auto& registry = CpuClocks();
+    std::lock_guard lock(registry.lock);
+    for (const auto& [id, live] : registry.threads) {
+        if (live != thread) continue;
+        return !live->_finished.load(std::memory_order_acquire);
+    }
+    return false;
 }
 
 bool GuestThreadCpuNanos(int cpuClockThread, std::uint64_t* nanos) {

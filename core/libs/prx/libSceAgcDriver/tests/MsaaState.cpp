@@ -114,10 +114,10 @@ void locations(const State& state) {
     }
 }
 
-std::string decodedError(const AgcDriver::QueueState& queue) {
+std::string decodedError(const AgcDriver::QueueState& queue, std::string_view expected = {}) {
     try { static_cast<void>(DecodeState(queue)); }
     catch (const std::runtime_error& error) { return error.what(); }
-    throw std::runtime_error("invalid multisample state was accepted");
+    throw std::runtime_error("invalid multisample state was accepted (expected " + std::string(expected) + ")");
 }
 
 void rejects(const AgcDriver::QueueState& queue, std::string_view expected, bool shared = true, std::string_view precheckExpected = {}) {
@@ -126,10 +126,10 @@ void rejects(const AgcDriver::QueueState& queue, std::string_view expected, bool
     std::string precheck;
     {
         ReadLog log(reads);
-        decoded = decodedError(queue);
+        decoded = decodedError(queue, expected);
         precheck = DrawRejection(queue, false);
     }
-    Require(decoded.find(expected) != std::string::npos, "wrong multisample decoder rejection: " + decoded);
+    Require(decoded.find(expected) != std::string::npos, "wrong multisample decoder rejection (expected " + std::string(expected) + "): " + decoded);
     if (shared) Require(!precheck.empty(), "multisample precheck accepted a covered invalid feature");
     if (!precheck.empty()) {
         const auto compatible = precheckExpected.empty() ? expected : precheckExpected;
@@ -164,7 +164,10 @@ void sharedRejections() {
     rejects(queue, "depth and rasterization sample counts differ");
     queue = reference();
     queue.context[0x2f8] = 0u;
-    rejects(queue, "MSAA scan conversion without a multisample coverage count");
+    queue.context[0x010] &= ~0xcu;
+    queue.context[0x31d] = 0u;
+    for (std::uint32_t pixel = 0; pixel < 4u; ++pixel) queue.context[0x2feu + pixel * 4u] = 0u;
+    Require(DecodeState(queue).samples == VK_SAMPLE_COUNT_1_BIT, "zero coverage and exposure counts must decode as single-sample rasterization");
     for (const auto count : {4u,5u}) {
         queue = reference();
         queue.context[0x2f8] = (count << 20u) | (7u << 13u) | count;
@@ -210,27 +213,28 @@ void colorRejections() {
     rejects(queue, "mixed color samples/fragments", false);
     queue = reference();
     queue.context[0x3b0] |= 1u << 28u;
-    rejects(queue, "multisampled mipmapped, array or volume color views", false);
+    rejects(queue, "multisampled color mips are unsupported", false);
     queue = reference();
     queue.context[0x31b] = (1u << 13u) | 1u;
     rejects(queue, "multisampled mipmapped, array or volume color views", false);
     queue = reference();
     queue.context[0x3b0] |= 1u << 28u;
     queue.context[0x31b] = 1u << 26u;
-    rejects(queue, "multisampled mipmapped, array or volume color views", false);
+    rejects(queue, "multisampled color mips are unsupported", false);
     queue = reference();
     queue.context[0x3b8] = 0x0ac6c000u;
     rejects(queue, "multisampled mipmapped, array or volume color views", false);
     queue = reference();
     queue.context[0x3b8] = 0x09000000u;
-    rejects(queue, "multisampled color requires SW_64KB_R_X", false);
+    Require(DecodeState(queue).color.samples == VK_SAMPLE_COUNT_8_BIT, "a color tiling variant changed the decoded sample count");
     queue = reference();
     queue.context[0x31c] = 0x872cu;
-    rejects(queue, "multisampled color requires SW_64KB_R_X", false);
+    Require(DecodeState(queue).color.samples == VK_SAMPLE_COUNT_8_BIT, "a color tiling variant changed the decoded sample count");
     for (const auto metadata : {0x10000000u,0x2000u}) {
         queue = reference();
         queue.context[0x31c] |= metadata;
-        rejects(queue, "multisampled DCC or CMASK color metadata", false);
+        if (metadata == 0x10000000u) rejects(queue, "multisampled DCC color metadata", false);
+        else rejects(queue, "CMASK fast clears need pipe-aligned", false);
     }
     queue = reference();
     queue.context.erase(0x304u);

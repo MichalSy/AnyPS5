@@ -209,54 +209,8 @@ int APS5_VABI getrlimit_nid_postfix(int resource, GuestResourceLimit* limit) {
 #endif
 }
 
-int APS5_VABI sysctl_nid_postfix(const int* name, unsigned nameLength, void* oldValue, std::size_t* oldLength, const void* newValue, std::size_t newLength) {
-    if (!name) return Failure(14);
-    if (nameLength < 2 || nameLength > 24) return Failure(22);
-    if (newValue && nameLength == 2 && ((name[0] == 6 && name[1] == 3) || (name[0] == 1 && name[1] == 37))) return Failure(1);
-    if (newValue || newLength) return Failure(45);
-    const int saved = *__error_nid_postfix();
-    try {
-        const int result = ReadSysctl(name, nameLength, oldValue, oldLength);
-        if (result == 0) *__error_nid_postfix() = saved;
-        return result;
-    } catch (const std::bad_alloc&) { return Failure(12); }
-      catch (const std::system_error&) { return Failure(5); }
-}
-
-int APS5_VABI sysctlbyname_nid_postfix(const char* name, void* oldValue, std::size_t* oldLength, const void* newValue, std::size_t newLength) {
-    if (!name) return Failure(14);
-    const std::string_view text(name);
-    if (text == "kern.arandom") {
-        const int mib[]{1, 37};
-        return sysctl_nid_postfix(mib, 2, oldValue, oldLength, newValue, newLength);
-    }
-    if (text == "kern.sdk_version") {
-        if (newValue != nullptr) return Failure(1);
-        return CopyScalar(std::uint32_t{0x01000000}, oldValue, oldLength);
-    }
-    if (text == "kern.rng_pseudo") {
-        if (newValue != nullptr) return Failure(1);
-        if (oldValue == nullptr || oldLength == nullptr)
-            throw std::runtime_error(std::string(__func__) + ": kern.rng_pseudo without an output buffer");
-        const int saved = *__error_nid_postfix();
-        static std::random_device device;
-        auto* bytes = static_cast<std::uint8_t*>(oldValue);
-        for (std::size_t i = 0; i < *oldLength; ++i) bytes[i] = static_cast<std::uint8_t>(device());
-        *__error_nid_postfix() = saved;
-        return 0;
-    }
-    int key = 0;
-    if (text == "hw.machine") key = 1;
-    else if (text == "hw.machine_arch") key = 11;
-    else if (text == "hw.ncpu") key = 3;
-    else if (text == "hw.byteorder") key = 4;
-    else if (text == "hw.physmem") key = 5;
-    else if (text == "hw.usermem") key = 6;
-    else if (text == "hw.realmem") key = 12;
-    else if (text == "hw.pagesize") key = 7;
-    else return Failure(2);
-    const int mib[]{6, key};
-    return sysctl_nid_postfix(mib, 2, oldValue, oldLength, newValue, newLength);
+int GuestReadSysctl_nid_no_patch(const int* name, unsigned nameLength, void* oldValue, std::size_t* oldLength) {
+    return ReadSysctl(name, nameLength, oldValue, oldLength);
 }
 
 }

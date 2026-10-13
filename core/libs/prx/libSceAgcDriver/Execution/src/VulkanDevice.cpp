@@ -45,6 +45,7 @@
 #include <fstream>
 #include <cctype>
 #include <cstdlib>
+#include <ctime>
 #include <mutex>
 #include <SDL_loadso.h>
 #include <SDL_error.h>
@@ -257,6 +258,9 @@ struct VulkanDevice::State {
     void* uploadMapping = nullptr;
     VkDeviceSize uploadSize = 0;
     VkPhysicalDeviceProperties properties{};
+    std::string driverInfo;
+    PFN_vkGetCalibratedTimestampsKHR calibratedTimestamps = nullptr;
+    VkTimeDomainKHR hostTimeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     std::vector<std::uint32_t> capabilities{1};
     std::vector<std::string_view> spirvExtensions;
@@ -271,9 +275,11 @@ struct VulkanDevice::State {
     VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT};
     std::array<VkExtent2D, 7> sampleLocationGridSizes{};
     bool shaderClipDistance = false;
+    bool shaderCullDistance = false;
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    bool float16DenormPreserve = false;
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
@@ -284,6 +290,7 @@ struct VulkanDevice::State {
     VkPhysicalDeviceDescriptorIndexingPropertiesEXT descriptorIndexingProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES_EXT};
     bool imageInt64Atomics = false;
     bool bufferInt64Atomics = false;
+    bool viewportIndexLayer = false;
     bool primitiveListRestart = false;
     bool depthClipControl = false;
     bool graphicsPipelineLibrary = false;
@@ -518,7 +525,7 @@ struct VulkanDevice::State {
     // Whether a recorded dispatch's or draw's copied write-back (listed until it ran) stores into
     // the range on the CPU; under GpuMutex.
     bool CopiedWriterOverlaps(std::uint64_t address, std::size_t bytes) const {
-        const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+        const auto overlaps = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
         return std::any_of(copiedWriters->begin(), copiedWriters->end(), overlaps) || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), overlaps);
     }
 
@@ -1061,6 +1068,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             state->sampleLocationGridSizes[index] = multisampleProperties.maxSampleLocationGridSize;
         }
     }
+    if (hasExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 driverProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &driverProperties);
+        state->driverInfo = std::string(driver.driverName) + " " + driver.driverInfo;
+    }
     auto byteFeatures = QueryBdaByteFeatures(selected, state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"), availableExtensions);
     auto bdaFeatures = QueryBdaFeatures(selected, state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"), availableExtensions);
     require(hasExtension(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME), "VK_KHR_shader_float_controls is unavailable");
@@ -1161,6 +1174,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->imageInt64Atomics = true;
         state->spirvExtensions.push_back("SPV_EXT_shader_image_int64");
     }
+    if (hasExtension(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME)) {
+        deviceExtensions.push_back(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityShaderViewportIndexLayerEXT);
+        state->spirvExtensions.push_back("SPV_EXT_shader_viewport_index_layer");
+        state->viewportIndexLayer = true;
+    }
     deviceExtensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
     state->capabilities.push_back(spv::CapabilitySignedZeroInfNanPreserve);
     state->spirvExtensions.push_back("SPV_KHR_float_controls");
@@ -1179,6 +1198,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->capabilities.push_back(spv::CapabilityRoundingModeRTE);
         state->capabilities.push_back(spv::CapabilityDenormPreserve);
     }
+    state->float16DenormPreserve = floatControls.shaderDenormPreserveFloat16 == VK_TRUE &&
+        floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+    if (state->float16DenormPreserve && std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormPreserve)) == state->capabilities.end()) state->capabilities.push_back(spv::CapabilityDenormPreserve);
     deviceExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     deviceExtensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
     state->capabilities.push_back(4448);
@@ -1412,8 +1434,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->sampleRateShading = enabled.sampleRateShading == VK_TRUE;
     if (enabled.geometryShader) state->capabilities.push_back(spv::CapabilityGeometry);
     enabled.shaderClipDistance = available.shaderClipDistance;
+    enabled.shaderCullDistance = available.shaderCullDistance;
     state->shaderClipDistance = enabled.shaderClipDistance == VK_TRUE;
+    state->shaderCullDistance = enabled.shaderCullDistance == VK_TRUE;
     if (enabled.shaderClipDistance) state->capabilities.push_back(spv::CapabilityClipDistance);
+    if (enabled.shaderCullDistance) state->capabilities.push_back(spv::CapabilityCullDistance);
     if (enabled.shaderStorageImageWriteWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageWriteWithoutFormat);
     if (enabled.shaderStorageImageReadWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageReadWithoutFormat);
     state->storageImageWithoutFormat = enabled.shaderStorageImageWriteWithoutFormat == VK_TRUE && enabled.shaderStorageImageReadWithoutFormat == VK_TRUE;
@@ -1457,6 +1482,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->samplerAnisotropy = true;
     state->textureCompressionBC = true;
     deviceInfo.pEnabledFeatures = &enabled;
+    const char* calibratedTimestamps = !PerformanceTrace::Configured() ? nullptr : hasExtension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : hasExtension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : nullptr;
+    if (calibratedTimestamps != nullptr) deviceExtensions.push_back(calibratedTimestamps);
     deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
     deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     if (state->meshShader) {
@@ -1608,6 +1635,25 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->shaderProfile = std::move(shaderProfile);
     if (compileOnly) return;
+    if (calibratedTimestamps != nullptr) {
+        const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
+        const auto domains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(state->instanceProc(state->instance, khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));
+        std::uint32_t domainCount = 0;
+        std::vector<VkTimeDomainKHR> available;
+        if (domains != nullptr && domains(selected, &domainCount, nullptr) == VK_SUCCESS) {
+            available.resize(domainCount);
+            if (domains(selected, &domainCount, available.data()) != VK_SUCCESS) available.clear();
+        }
+#ifdef _WIN32
+        const auto host = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+        const auto host = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+        if (std::ranges::find(available, VK_TIME_DOMAIN_DEVICE_KHR) != available.end() && std::ranges::find(available, host) != available.end()) {
+            state->hostTimeDomain = host;
+            state->calibratedTimestamps = state->DeviceFunction<PFN_vkGetCalibratedTimestampsKHR>(khr ? "vkGetCalibratedTimestampsKHR" : "vkGetCalibratedTimestampsEXT");
+        }
+    }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1951,8 +1997,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     if (recorder.PendingWriteOverlaps(address, bytes)) {
         // Recorded draws with copied writes keep their own registry (Graphics::DrawCopiedWriters):
         // their CPU write-back would land after a fill recorded on the GPU, so they count too.
-        bool sync = alwaysSync || std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); })
-            || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); });
+        bool sync = alwaysSync || state->CopiedWriterOverlaps(address, bytes);
         if (!sync && Graphics::Recorder::PendingCompletionLabels() != 0) {
             // A label the CPU will store after a completion must not be overwritten by the fill:
             // only a label inside the filled range matters, whatever the range's size.
@@ -2156,9 +2201,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     // A store a batch's completion makes on the CPU over the range (a copied buffer's write-back,
     // a completion-deferred label): it lands only when that batch is reaped, whatever its fence.
     const auto completionStoreOverlaps = [&](std::uint64_t address) {
-        if (alwaysSync || std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); })
-            || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); })) return true;
-        return Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes);
+        if (alwaysSync || state->CopiedWriterOverlaps(address, bytes)) return true;
+        return Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes);
     };
     // The CPU decision (see the header): pure queries, in the order that makes the first failing
     // test the reason; a signaled writer of the source is fine (its in-place stores are final in
@@ -2975,6 +3019,34 @@ std::string VulkanDevice::DeviceName() const {
     return state->properties.deviceName;
 }
 
+std::string VulkanDevice::DriverInfo() const {
+    return state->driverInfo.empty() ? std::to_string(state->properties.driverVersion) : state->driverInfo;
+}
+
+bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const {
+    if (state->calibratedTimestamps == nullptr) return false;
+    const std::array<VkCalibratedTimestampInfoKHR, 2> domains{VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_DEVICE_KHR}, VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, state->hostTimeDomain}};
+    std::array<std::uint64_t, 2> stamps{};
+    std::uint64_t deviation = 0;
+    if (state->calibratedTimestamps(state->device, static_cast<std::uint32_t>(domains.size()), domains.data(), stamps.data(), &deviation) != VK_SUCCESS) return false;
+#ifdef _WIN32
+    LARGE_INTEGER counter{};
+    LARGE_INTEGER frequency{};
+    QueryPerformanceCounter(&counter);
+    const auto now = std::chrono::steady_clock::now();
+    QueryPerformanceFrequency(&frequency);
+    const double sinceNs = static_cast<double>(static_cast<std::uint64_t>(counter.QuadPart) - stamps[1]) * 1e9 / static_cast<double>(frequency.QuadPart);
+#else
+    timespec monotonic{};
+    clock_gettime(CLOCK_MONOTONIC, &monotonic);
+    const auto now = std::chrono::steady_clock::now();
+    const double sinceNs = static_cast<double>(static_cast<std::uint64_t>(monotonic.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(monotonic.tv_nsec) - stamps[1]);
+#endif
+    gpuNs = static_cast<double>(stamps[0]) * state->properties.limits.timestampPeriod;
+    cpu = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::nano>(sinceNs));
+    return true;
+}
+
 const std::uint32_t* VulkanDevice::WorkGroupCountLimit() const {
     return state->properties.limits.maxComputeWorkGroupCount;
 }
@@ -2995,9 +3067,11 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
+    target.float16DenormPreserve = state->float16DenormPreserve;
     target.fixedPushSlots = state->graphicsPipelineLibrary;
     target.registrationModules = state->graphicsPipelineLibrary;
     target.srgbDecodeFormats = state->srgbDecodeFormats;
+    target.vertexSubgroups = (state->subgroup.supportedStages & VK_SHADER_STAGE_VERTEX_BIT) != 0;
     if (state->meshShader) {
         const auto& mesh = state->meshLimits;
         target.mesh = ShaderRecompiler::MeshTargetLimits{{mesh.maxMeshWorkGroupSize[0], mesh.maxMeshWorkGroupSize[1], mesh.maxMeshWorkGroupSize[2]}, mesh.maxMeshWorkGroupInvocations, std::min(mesh.maxMeshSharedMemorySize, mesh.maxMeshPayloadAndSharedMemorySize), mesh.maxMeshOutputVertices, mesh.maxMeshOutputPrimitives, mesh.maxMeshOutputComponents, std::min(mesh.maxMeshOutputMemorySize, mesh.maxMeshPayloadAndOutputMemorySize), mesh.meshOutputPerVertexGranularity, mesh.meshOutputPerPrimitiveGranularity};
@@ -3119,9 +3193,11 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sampleLocationProperties = state->sampleLocationProperties;
     context.sampleLocationGridSizes = state->sampleLocationGridSizes;
     context.shaderClipDistance = state->shaderClipDistance;
+    context.shaderCullDistance = state->shaderCullDistance;
     context.nullDescriptors = state->shaderProfile != nullptr && state->shaderProfile->NullDescriptors();
     context.bufferInt64Atomics = state->bufferInt64Atomics;
     context.placeholderImages = state->placeholderImages.get();
+    context.viewportIndexLayer = state->viewportIndexLayer;
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
@@ -3840,8 +3916,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
         recorder.Sync();
     } else if (record.shader->program->workgroupMemoryDwords != 0) {
         outcome.cpuReason = 8;
-    } else if (labelPending() || std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); })
-               || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); })) {
+    } else if (labelPending() || state->CopiedWriterOverlaps(arguments, 12)) {
         outcome.cpuReason = 2;
     } else if ((record.argumentImport = Graphics::HostImportFor(context, arguments, 12)) == nullptr) {
         // Valid until the next refreshImports, which only runs under GuestMemory::GpuMutex (held

@@ -184,7 +184,7 @@ AgcDriver::Graphics::ColorTarget DecodeTarget(std::uint64_t address, std::uint32
     cx[0x3b8] = TiledAttrib3 | (Layers - 1u);
     cx[0x390] = static_cast<std::uint32_t>(address >> 40u);
     const auto color = AgcDriver::Graphics::DecodeColorBuffer(cx, 0);
-    Require(color.format == VK_FORMAT_R32_SFLOAT && color.bytes == LayerBytes * (last - slice + 1u) && color.layerCount == last - slice + 1u && color.address == address + slice * LayerBytes, "the COLOR_32 float view did not decode as a 128x128 R32 slice of the array");
+    Require(color.format == VK_FORMAT_R32_SFLOAT && color.bytes == LayerBytes * (last - slice + 1u) && color.layers == last - slice + 1u && color.address == address + slice * LayerBytes, "the COLOR_32 float view did not decode as a 128x128 R32 slice of the array");
     Require(color.arrayAddress == address && color.arrayLastSlice == Layers - 1u && color.arraySlice == slice, "the color view did not keep its array and slice");
     return color;
 }
@@ -204,7 +204,7 @@ void CheckSingleSliceWithZeroDepth() {
     Require(color.extent.width == 128 && color.extent.height == 128 && color.mipCount == 8 && color.mip == 0,
         "the single-slice mipmapped color view changed its extent or mip chain");
     // Slice stride: 128 KiB mip 0, 64 KiB mip 1 and a 64 KiB mip tail.
-    Require(color.layerCount == 1 && color.bytes == 131072 && color.address == address + 262144,
+    Require(color.layers == 1 && color.bytes == 131072 && color.address == address + 262144,
         "the single-slice color view did not address slice 1 after the complete mip chain: bytes=" + std::to_string(color.bytes) + " offset=" + std::to_string(color.address - address));
 }
 
@@ -278,8 +278,8 @@ void ClearLayers(AgcDriver::VulkanDevice& device, StorageTexture& image) {
     using namespace AgcDriver::Graphics;
     const auto context = AgcDriver::VulkanDeviceTestAccess::Context(device);
     device.WaitIdle();
-    const auto view = image.AttachmentView(VK_FORMAT_R32_SFLOAT, 0, 0, 1, 2);
-    Require(view != image.AttachmentView(VK_FORMAT_R32_SFLOAT, 0, 0, 1), "layered attachment reused a single-layer view");
+    const auto view = image.AttachmentView(VK_FORMAT_R32_SFLOAT, 0, 0, 2, 1);
+    Require(view != image.AttachmentView(VK_FORMAT_R32_SFLOAT, 0, 0, 1, 1), "layered attachment reused a single-layer view");
     VkAttachmentDescription attachment{};
     attachment.format = VK_FORMAT_R32_SFLOAT;
     attachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -339,7 +339,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
         RequireOutput(Initial, Initial, "slice " + std::to_string(other) + " after the draw into slice 1");
     }
     const auto layered = DecodeTarget(surface, 1, 2);
-    Require(layered.layerCount == 2 && layered.arraySlice == 1, "the layered color view did not retain its subrange");
+    Require(layered.layers == 2 && layered.arraySlice == 1, "the layered color view did not retain its subrange");
     ClearLayers(device, *pending);
     for (const std::uint32_t layer : {1u, 2u}) {
         LoadLayer(device, surface, layer);

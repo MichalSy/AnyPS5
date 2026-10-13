@@ -46,7 +46,8 @@ static void Check(bool value, int line) {
 constexpr int GuestEbadf = 9;
 constexpr int Unix = 1;
 constexpr int Stream = 1;
-constexpr int FirstSocket = 0x10000000;
+constexpr int DescriptorSetSize = 1024;
+constexpr int Unopened = 0x1ffffff0;
 
 static void RequireFailure(int result, int error) {
     Require(result == -1);
@@ -82,7 +83,7 @@ static void DupOutlivesOriginal() {
     int pipe[2];
     Require(pipe_nid_postfix(pipe) == 0);
     const int duplicate = dup_nid_postfix(pipe[1]);
-    Require(duplicate >= 0 && duplicate < FirstSocket && duplicate != pipe[1]);
+    Require(duplicate >= 0 && duplicate != pipe[1]);
     Require(close_nid_postfix(pipe[1]) == 0);
     RequirePipeCarries(duplicate, pipe[0], "dup");
     Require(close_nid_postfix(duplicate) == 0);
@@ -269,8 +270,8 @@ static void BadDescriptors() {
     RequireFailure(dup2_nid_postfix(closed, closed), GuestEbadf);
     RequireFailure(dup2_nid_postfix(pipe[0], -1), GuestEbadf);
     RequireFailure(dup2_nid_postfix(-1, pipe[0]), GuestEbadf);
-    RequireFailure(dup_nid_postfix(FirstSocket + 0x0ffffff0), GuestEbadf);
-    RequireFailure(dup2_nid_postfix(FirstSocket + 0x0ffffff0, FirstSocket + 0x0ffffff1), GuestEbadf);
+    RequireFailure(dup_nid_postfix(Unopened), GuestEbadf);
+    RequireFailure(dup2_nid_postfix(Unopened, Unopened + 1), GuestEbadf);
 #ifdef _WIN32
     const auto previous = _set_invalid_parameter_handler(RecordInvalidParameter);
 #endif
@@ -287,25 +288,29 @@ static void SocketDuplicates() {
     int pair[2];
     Require(socketpair_nid_postfix(Unix, Stream, 0, pair) == 0);
     const int duplicate = dup_nid_postfix(pair[0]);
-    Require(duplicate >= FirstSocket && duplicate != pair[0] && duplicate != pair[1]);
+    Require(duplicate >= 0 && duplicate < DescriptorSetSize && duplicate != pair[0] && duplicate != pair[1]);
     Require(close_nid_postfix(pair[0]) == 0);
     RequireSocketCarries(duplicate, pair[1], "socket");
-    const int target = duplicate + 0x1000;
+    int pipe[2];
+    Require(pipe_nid_postfix(pipe) == 0);
+    const int target = pipe[0];
     Require(dup2_nid_postfix(duplicate, target) == target);
     Require(close_nid_postfix(duplicate) == 0);
     RequireSocketCarries(target, pair[1], "moved");
     Require(dup2_nid_postfix(target, target) == target);
     int next[2];
     Require(socketpair_nid_postfix(Unix, Stream, 0, next) == 0);
-    Require(next[0] > target && next[1] > target);
+    Require(next[0] < DescriptorSetSize && next[1] < DescriptorSetSize);
     RequireSocketCarries(target, pair[1], "kept");
     Require(dup2_nid_postfix(next[0], target) == target);
     RequireSocketCarries(target, next[1], "over");
     Require(Throws([&] { dup2_nid_postfix(target, 1); }));
-    int pipe[2];
-    Require(pipe_nid_postfix(pipe) == 0);
-    Require(Throws([&] { dup2_nid_postfix(pipe[0], target); }));
-    for (const int descriptor : {target, pair[1], next[0], next[1], pipe[0], pipe[1]}) Require(close_nid_postfix(descriptor) == 0);
+    int other[2];
+    Require(pipe_nid_postfix(other) == 0);
+    Require(dup2_nid_postfix(other[1], target) == target);
+    RequirePipeCarries(target, other[0], "file");
+    Require(send_nid_postfix(target, "x", 1, 0) == -1);
+    for (const int descriptor : {target, pair[1], next[0], next[1], pipe[1], other[0], other[1]}) Require(close_nid_postfix(descriptor) == 0);
 }
 
 static void RandomDeviceDuplicates() {
@@ -346,7 +351,7 @@ static void RandomDeviceDuplicates() {
     Require(read_nid_postfix(secondRandom, randomBuf4, sizeof(randomBuf4)) == sizeof(randomBuf4));
     Require(std::memcmp(randomBuf4, randomBuf3, sizeof(randomBuf4)) != 0);
 
-    const int invalidFd = FirstSocket - 100;
+    const int invalidFd = Unopened - 100;
     RequireFailure(dup2_nid_postfix(invalidFd, secondRandom), GuestEbadf);
     unsigned char randomBuf5[16] = {};
     Require(read_nid_postfix(secondRandom, randomBuf5, sizeof(randomBuf5)) == sizeof(randomBuf5));
@@ -382,7 +387,38 @@ static void DuplicatesShareStatusFlags() {
     for (const int descriptor : {pipe[0], pipe[1], other[0], other[1], duplicate}) Require(close_nid_postfix(descriptor) == 0);
 }
 
+#ifndef _WIN32
+static void NativeSocketNumberCollision() {
+    constexpr int collision = 1023;
+    Require(::fcntl(collision, F_GETFD) < 0 && errno == EBADF);
+    int native[2];
+    Require(::pipe(native) == 0);
+    Require(::dup2(native[1], collision) == collision);
+    Require(::close(native[1]) == 0);
+    const auto reader = GuestFiles::GuestFileAdoptOwned_nid_no_patch(native[0], 0);
+    const auto writer = GuestFiles::GuestFileAdoptOwned_nid_no_patch(collision, 1);
+    Require(reader && writer);
+    const auto readDescriptor = GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(reader);
+    const auto writeDescriptor = GuestFiles::GuestFileLogicalDescriptor_nid_no_patch(writer);
+    int sockets[2];
+    Require(socketpair_nid_postfix(Unix, Stream, 0, sockets) == 0);
+    Require(dup2_nid_postfix(sockets[0], collision) == collision);
+    Require((fcntl_nid_postfix(writeDescriptor, 3) & 3) == 1);
+    RequirePipeCarries(writeDescriptor, readDescriptor, "file");
+    RequireSocketCarries(collision, sockets[1], "socket");
+    Require(close_nid_postfix(collision) == 0);
+    RequirePipeCarries(writeDescriptor, readDescriptor, "alive");
+    Require(close_nid_postfix(readDescriptor) == 0);
+    Require(close_nid_postfix(writeDescriptor) == 0);
+    Require(close_nid_postfix(sockets[0]) == 0);
+    Require(close_nid_postfix(sockets[1]) == 0);
+}
+#endif
+
 int main() {
+#ifndef _WIN32
+    NativeSocketNumberCollision();
+#endif
     DupOutlivesOriginal();
     Dup2ReplacesTarget();
     Dup2CreatesTarget();

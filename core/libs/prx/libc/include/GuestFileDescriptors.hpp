@@ -14,7 +14,7 @@ using NativeCleanup = void (*)(int) noexcept;
 extern "C" {
 int GuestFileInitializeStandards_nid_no_patch();
 Lease GuestFileAcquire_nid_no_patch(int descriptor);
-Lease GuestFileAdoptOwned_nid_no_patch(int nativeDescriptor, int accessMode, NativeCleanup cleanup = nullptr);
+Lease GuestFileAdoptOwned_nid_no_patch(int nativeDescriptor, int accessMode, NativeCleanup cleanup = nullptr, int minimumDescriptor = 3);
 // Atomically replace or create a logical slot; leases retain the retired native ownership.
 Lease GuestFileReplaceOwned_nid_no_patch(int descriptor, int nativeDescriptor,
     int accessMode, NativeCleanup cleanup = nullptr);

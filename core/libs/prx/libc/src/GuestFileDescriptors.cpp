@@ -106,8 +106,8 @@ Table& GetTable() {
     return *table;
 }
 
-int FreeDescriptor(const Table& table, int excluded = -1) {
-    for (int descriptor = 3; descriptor != 32768; ++descriptor)
+int FreeDescriptor(const Table& table, int excluded = -1, int minimumDescriptor = 3) {
+    for (int descriptor = std::max(3, minimumDescriptor); descriptor != 32768; ++descriptor)
         if (descriptor != excluded && !table.entries[descriptor]) return descriptor;
     return -1;
 }
@@ -165,14 +165,15 @@ Lease GuestFileAcquire_nid_no_patch(int descriptor) {
     return result;
 }
 
-Lease GuestFileAdoptOwned_nid_no_patch(int nativeDescriptor, int accessMode, NativeCleanup cleanup) {
+Lease GuestFileAdoptOwned_nid_no_patch(int nativeDescriptor, int accessMode, NativeCleanup cleanup, int minimumDescriptor) {
     OwnedNative owned{nativeDescriptor, cleanup};
     if (nativeDescriptor < 0) { errno = 9; return {}; }
+    if (minimumDescriptor < 0 || minimumDescriptor >= 32768) { errno = 22; return {}; }
     if (accessMode < 0 || accessMode > 2) { errno = 22; return {}; }
     if (GuestFileInitializeStandards_nid_no_patch() != 0) return {};
     auto& table = GetTable();
     std::lock_guard lock(table.mutex);
-    const int descriptor = FreeDescriptor(table);
+    const int descriptor = FreeDescriptor(table, -1, minimumDescriptor);
     if (descriptor < 0) { errno = 24; return {}; }
     try {
         auto result = Create(owned, descriptor, accessMode);

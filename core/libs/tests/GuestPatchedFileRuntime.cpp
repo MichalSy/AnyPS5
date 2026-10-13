@@ -255,7 +255,7 @@ int main(int argc, char** argv) {
             Require(api.Close(guest) == 0 && isatty(guest) == 0 && *api.Error() == 9,
                 "patched WebKit must reject the retired logical ID with guest EBADF");
             const int socket = api.Socket(2, 1, 0);
-            Require(socket >= 0x10000000 && isatty(socket) == 0 && *api.Error() == 25,
+            Require(socket >= 3 && isatty(socket) == 0 && *api.Error() == 25,
                 "patched WebKit must classify an actual live guest socket as ENOTTY");
             Require(api.PosixClose(socket) == 0 && isatty(socket) == 0 && *api.Error() == 9 &&
                 api.Close(socket) == SCE_KERNEL_ERROR_EBADF,

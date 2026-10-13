@@ -162,9 +162,11 @@ struct Context {
     bool geometryShader = false;
     bool sampleRateShading = false;
     bool shaderClipDistance = false;
+    bool shaderCullDistance = false;
     bool nullDescriptors = false;
     bool bufferInt64Atomics = false;
     const PlaceholderImages* placeholderImages = nullptr;
+    bool viewportIndexLayer = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;

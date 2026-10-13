@@ -149,6 +149,24 @@ foreach(LIB_DIR ${LIBS_DIRS})
     endif()
 endforeach()
 
+if(APS5_ENABLE_TRACY)
+    set_target_properties(TracyClient PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${UNPATCHED_DIR}
+            LIBRARY_OUTPUT_DIRECTORY ${UNPATCHED_DIR}
+            ARCHIVE_OUTPUT_DIRECTORY ${IMPLIB_DIR}
+    )
+    set(TRACY_CLIENT_COPIED ${CMAKE_CURRENT_BINARY_DIR}/TracyClient.copied)
+    add_custom_command(
+            OUTPUT ${TRACY_CLIENT_COPIED}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${PATCHED_DIR}
+            COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:TracyClient> ${PATCHED_DIR}
+            COMMAND ${CMAKE_COMMAND} -E touch ${TRACY_CLIENT_COPIED}
+            DEPENDS TracyClient
+            COMMENT "Copying the Tracy client next to the patched libraries"
+    )
+    list(APPEND PATCHED_OUTPUTS ${TRACY_CLIENT_COPIED})
+endif()
+
 add_custom_target(libs DEPENDS ${PATCHED_OUTPUTS})
 
 if(BUILD_TESTING)
@@ -223,6 +241,16 @@ if(BUILD_TESTING)
     if(APPLE)
         add_subdirectory(tests/write_watch)
     endif()
+    if(WIN32)
+        add_test_executable(windows_write_watch_tests tests/WindowsWriteWatch.cpp)
+        target_include_directories(windows_write_watch_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(windows_write_watch_tests PRIVATE _WIN32_WINNT=0x0A00)
+        if(MINGW)
+            target_compile_options(windows_write_watch_tests PRIVATE -fasynchronous-unwind-tables)
+        endif()
+        add_test(NAME windows_write_watch COMMAND windows_write_watch_tests)
+        set_tests_properties(windows_write_watch PROPERTIES TIMEOUT 20)
+    endif()
 
     add_test_executable(guest_offline_imports_tests tests/GuestOfflineImports.cpp)
     target_include_directories(guest_offline_imports_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -242,6 +270,26 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(guest_signin_dialog PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSigninDialog>")
+    endif()
+
+    add_test_executable(guest_netctl_ap_dialog_tests tests/GuestNetCtlApDialog.cpp)
+    target_include_directories(guest_netctl_ap_dialog_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_netctl_ap_dialog_tests PRIVATE libSceNetCtlApDialog libc)
+    configure_windows_unwind(guest_netctl_ap_dialog_tests)
+    add_test(NAME guest_netctl_ap_dialog COMMAND guest_netctl_ap_dialog_tests)
+    if(WIN32)
+        set_tests_properties(guest_netctl_ap_dialog PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceNetCtlApDialog>")
+    endif()
+
+    add_test_executable(guest_np_auth_tests tests/GuestNpAuth.cpp)
+    target_include_directories(guest_np_auth_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_np_auth_tests PRIVATE libSceNpAuth libc)
+    configure_windows_unwind(guest_np_auth_tests)
+    add_test(NAME guest_np_auth COMMAND guest_np_auth_tests)
+    if(WIN32)
+        set_tests_properties(guest_np_auth PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceNpAuth>")
     endif()
 
     add_test_executable(guest_rudp_status_tests tests/GuestRudpStatus.cpp)

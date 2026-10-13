@@ -64,39 +64,6 @@ std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std:
 
 namespace {
 
-std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
-    if (const auto guest = FindGuestColorTargetFormat(format, elementBytes)) return *guest;
-    throw std::runtime_error("AGC graphics: no guest texture format matches the color buffer format " + std::to_string(static_cast<int>(format)));
-}
-
-// The color buffer as a single-mip 2D surface descriptor (tile mode SW_64KB_R_X).
-GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
-    static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR_TARGETS") == nullptr;
-    Require(color.tileMode != ColorTileMode::Linear || residentLinear, "linear color targets are not resident (APS5_NO_RESIDENT_LINEAR_TARGETS)");
-    const bool chain = color.mipCount > 1;
-    GuestTextureResource surface{};
-    surface.baseAddress = chain ? color.surfaceAddress : color.address;
-    surface.pipeBankXor = color.pipeBankXor;
-    surface.width = chain ? color.surfaceExtent.width : color.extent.width;
-    surface.height = chain ? color.surfaceExtent.height : color.extent.height;
-    surface.depthOrLastArray = color.depth - 1u;
-    surface.baseArray = 0;
-    surface.mipCount = color.mipCount;
-    surface.baseLevel = 0;
-    surface.lastLevel = color.mipCount - 1;
-    surface.tileMode = ColorTextureTileMode(color.tileMode);
-    surface.dimension = color.depth > 1 ? TextureDimension::k3D : TextureDimension::k2D;
-    surface.format = GuestFormatFor(color.format, color.elementBytes);
-    surface.dstSelX = 4;
-    surface.dstSelY = 5;
-    surface.dstSelZ = 6;
-    surface.dstSelW = 7;
-    surface.dccAddress = color.dccAddress;
-    surface.dccAlphaOnMsb = color.dccAlphaOnMsb;
-    surface.dccPipeAligned = color.dccPipeAligned;
-    return surface;
-}
-
 GuestTextureResource ArraySurfaceForTarget(const ColorTarget& color) {
     Require(color.arrayLastSlice != 0, "the color target is not a view of a 2D array");
     auto surface = SurfaceForTarget(color);
@@ -225,24 +192,8 @@ void proveCmask(std::uint64_t address, std::size_t bytes, std::uint64_t generati
     else cmaskProofs()[address] = {bytes, generation};
 }
 
-std::string hexAddress(std::uint64_t address) {
-    char text[24];
-    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
-    return text;
-}
-
-void requireCmaskCodes(const std::array<std::uint32_t, 7>& error) {
-    const auto codes = error[0];
-    if (codes == 0) return;
+void requireCmaskCodes(std::uint32_t codes) {
     Require((codes & 1u) == 0, "a CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys, was recorded");
-    std::string listed;
-    for (std::uint32_t code = 1; code < 15; ++code) {
-        if ((codes >> code) & 1u) listed += (listed.empty() ? "" : ", ") + std::to_string(code);
-    }
-    char source[192];
-    const auto baseHigh = error[3] - static_cast<std::uint32_t>(error[6] > error[2]);
-    std::snprintf(source, sizeof(source), " (source=0x%08x%08x base=0x%08x%08x word=0x%08x target=%ux%u dcc=%u colorAlias=%u)", error[3], error[2], baseHigh, error[6], error[4], error[5] & 0xffffu, error[5] >> 16u, (error[1] >> 1u) & 1u, (error[1] >> 2u) & 1u);
-    Require(false, "CMASK codes " + listed + " were recorded, which are not a single-sample fast-clear code (0 cleared, 15 expanded)" + source);
 }
 
 CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::vector<std::uint32_t>& cleared) {
@@ -272,7 +223,6 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
             const auto nibble = layout.Nibble(tileX, tileY);
             const auto code = (std::to_integer<std::uint32_t>(mask[nibble / 2u]) >> ((nibble % 2u) * 4u)) & 0xfu;
             if (code == 0u) cleared.push_back(tileY * layout.TilesX() + tileX);
-            else Require(code == 0xfu, "CMASK code " + std::to_string(code) + " of color target " + hexAddress(color.address) + " is not a single-sample fast-clear code (0 cleared, 15 expanded); CPU source=" + hexAddress(address + nibble / 2u) + " byte=" + std::to_string(std::to_integer<unsigned>(mask[nibble / 2u])));
         }
     }
     if (cleared.empty()) return CmaskState::Expanded;
@@ -316,9 +266,7 @@ bool recordCmaskClear(const Context& context, Recorder& recorder, const ColorTar
     recorder.Keep(import);
     recorder.Keep(resident);
     recorder.NotePendingRead(address, bytes, Recorder::ReadKind::StorageUpload);
-    const auto contextFlags = (color.dccAddress != 0 ? 2u : 0u) |
-        (color.cmaskAddress == color.address || color.cmaskAddress == (color.address | color.pipeBankXor) ? 4u : 0u);
-    context.detiler->DispatchCmaskClear(commands, import->buffer, address - import->base, bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0, color.cmaskAddress, contextFlags);
+    context.detiler->DispatchCmaskClear(commands, import->buffer, address - import->base, bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0);
     recorder.NotePendingWrite(address, bytes);
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
     return true;
@@ -706,6 +654,10 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
         add(context.subgroup.supportedOperations);
         add(context.fragmentShaderBarycentric);
         add(context.bufferInt64Atomics);
+        add(context.shaderClipDistance);
+        add(context.shaderCullDistance);
+        add(context.viewportIndexLayer);
+        add(state.paClVsOutCntl);
         add(state.stages.mesh.has_value());
         if (state.stages.mesh) {
             const auto& mesh = *state.stages.mesh;
@@ -757,7 +709,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
     }
     std::set<std::uint32_t> outputs;
     try {
-        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.shaderClipDistance);
+        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.shaderClipDistance, context.shaderCullDistance, context.viewportIndexLayer);
     } catch (const std::exception& error) {
         if (keyed) {
             std::lock_guard lock(validationMutex());
@@ -1674,6 +1626,12 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
         resources.PatchPushConstants(block);
         stages = PushConstantStages(shaders);
     }
+    if (state.stages.tessellation) {
+        for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || shader.pushConstantOffset >= PipelinePushSlotBytes || shader.pushConstantOffset + shader.program->pushConstants.size() <= ShaderRecompiler::TessellationLevelPushOffsetBytes, "a stage's push constants overlap the tessellation levels");
+        const std::array<float, ShaderRecompiler::TessellationLevelPushBytes / 4> levels{state.stages.minTessellationLevel, state.stages.maxTessellationLevel};
+        static_assert(ShaderRecompiler::TessellationLevelPushOffsetBytes + ShaderRecompiler::TessellationLevelPushBytes == PipelinePushSlotBytes);
+        std::memcpy(block.data() + ShaderRecompiler::TessellationLevelPushOffsetBytes, levels.data(), sizeof(levels));
+    }
     if (!state.stages.mesh) {
         pipeline.PushConstants(commands, stages, block);
         return;
@@ -2062,7 +2020,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
-            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.arraySlice, color.layerCount));
+            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
             continue;
         }
         materializeCmaskClear(context, color, nullptr);
@@ -2074,7 +2032,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             if (traced.insert(color.address).second) std::fprintf(stderr, "[sync-target] 0x%llx %ux%u tile %d format %d element %u bytes 0x%llx gpuTiling %d detiler %d\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.tileMode), static_cast<int>(color.format), color.elementBytes, static_cast<unsigned long long>(color.bytes), binding.gpuTiling ? 1 : 0, context.detiler != nullptr ? 1 : 0);
         }
         Require(!color.mipTail || binding.gpuTiling, "rendering into a packed mip tail requires the GPU tiled fallback");
-        Require(color.depth == 1 && color.layerCount == 1, "rendering into a layered color target needs the resident image of its surface");
+        Require(color.depth == 1 && color.layers == 1, "rendering into a layered color target needs the resident image of its surface");
         Require(color.arraySlice == 0 || !ColorTileModeIsXor(color.tileMode), "rendering into a slice of a 2D array color target with an XOR tile mode needs the resident image of its array");
         if (binding.gpuTiling) {
             binding.mip = color.mipTail ? ComputeColorTargetMipLayout(color.tileMode, color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount, color.mip) : ColorTargetMip(color, colorLayout);
@@ -2141,7 +2099,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 return IndirectDrawPath::PendingImage;
             }
             if (recorder != nullptr && recorder->PendingLabelIn(address, bytes)) return IndirectDrawPath::PendingLabelOrCopy;
-            const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+            const auto overlaps = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
             if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
             if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
             if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
@@ -2259,7 +2217,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.multisample != nullptr) multisamples.push_back(binding.multisample);
         persistent.push_back(binding.multisampled ? 1u : 0u);
     }
-    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, persistent, state.renderLayers);
+    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers, persistent);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -2651,7 +2609,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
     auto framebuffer = recipe.framebuffer.lock();
-    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent, {}, state.renderLayers);
+    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent, state.renderLayers);
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;

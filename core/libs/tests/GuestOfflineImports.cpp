@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
+#include <source_location>
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
@@ -12,10 +14,13 @@ extern "C" {
 int APS5_VABI sceHttpSetCookieEnabled(int, int);
 int APS5_VABI sceHttpSendRequest(int, const void*, std::size_t);
 int APS5_VABI sceNpAuthCreateRequest(void);
+int APS5_VABI sceNpAuthDeleteRequest(int);
 int APS5_VABI sceSystemGestureAppendTouchRecognizer(std::int32_t, SystemGestureTouchRecognizer*);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceNpEntitlementAccessGetEntitlementKey(
     std::uint32_t, const NpUnifiedEntitlementLabel*, NpEntitlementAccessEntitlementKey*);
+int APS5_VABI sceNpEntitlementAccessGetGameTrialsFlag(std::uint32_t*);
+int APS5_VABI sceNpEntitlementAccessGetPftFlag(std::uint32_t*);
 int APS5_VABI sceNpEntitlementAccessRequestUnifiedEntitlementInfoList();
 int APS5_VABI sceNpEntitlementAccessPollUnifiedEntitlementInfoList();
 int APS5_VABI sceNpEntitlementAccessRequestServiceEntitlementInfoList();
@@ -27,13 +32,14 @@ int APS5_VABI sceNpEntitlementAccessPollServiceEntitlementInfo();
 int APS5_VABI sceRudpInit_nid_postfix(void*, int);
 int APS5_VABI sceRudpActivate();
 int APS5_VABI sceRudpGetStatus(void*, std::size_t);
-int APS5_VABI sceRudpTerminate();
+int APS5_VABI sceRudpEnd();
 }
 
-static void Require(bool value) { if (!value) std::abort(); }
+static void Require(bool value, std::source_location location = std::source_location::current()) { if (!value) { std::fprintf(stderr, "offline check failed at line %u\n", location.line()); std::abort(); } }
 
-static void CheckUnsupportedGestureAppend() {
-    constexpr int unsupported = static_cast<int>(0x8002002du);
+static void CheckGestureAppend() {
+    constexpr int invalidHandle = static_cast<int>(0x80d10003u);
+    constexpr int invalidArgument = static_cast<int>(0x80d10002u);
     struct RecognizerBuffer {
         std::uint64_t before;
         SystemGestureTouchRecognizer recognizer;
@@ -47,9 +53,9 @@ static void CheckUnsupportedGestureAppend() {
         for (std::int32_t handle : {1, 0, -1, 0x7fffffff}) {
             for (int attempt = 0; attempt < 4; ++attempt) {
                 const int result = sceSystemGestureAppendTouchRecognizer(handle, &output.recognizer);
-                Require(result == unsupported && result < 0);
+                Require(result == (handle == 1 ? 0 : invalidHandle));
                 Require(std::memcmp(&output, original.data(), sizeof(output)) == 0);
-                Require(sceSystemGestureAppendTouchRecognizer(handle, nullptr) == unsupported);
+                Require(sceSystemGestureAppendTouchRecognizer(handle, nullptr) == (handle == 1 ? invalidArgument : invalidHandle));
                 Require(*__error_nid_postfix() == savedError);
             }
         }
@@ -57,14 +63,15 @@ static void CheckUnsupportedGestureAppend() {
 }
 
 int main() {
-    CheckUnsupportedGestureAppend();
+    CheckGestureAppend();
     constexpr int signedOut = static_cast<int>(0x80550006u);
     static_assert(sizeof(int) == sizeof(std::int32_t));
     for (int savedError : {0, 13}) {
         *__error_nid_postfix() = savedError;
         for (int attempt = 0; attempt < 4; ++attempt) {
             const int result = sceNpAuthCreateRequest();
-            Require(result == signedOut && result < 0);
+            Require(result > 0);
+            Require(sceNpAuthDeleteRequest(result) == 0);
             Require(*__error_nid_postfix() == savedError);
         }
     }
@@ -105,6 +112,16 @@ int main() {
         Require(std::memcmp(&output, original.data(), sizeof(output)) == 0);
     }
 
+    std::array<std::uint32_t, 2> trialsFlag{0xa5a5a5a5u, 0x5a5a5a5au};
+    Require(sceNpEntitlementAccessGetGameTrialsFlag(trialsFlag.data()) == 0);
+    Require(trialsFlag[0] == 0 && trialsFlag[1] == 0x5a5a5a5au);
+    Require(sceNpEntitlementAccessGetGameTrialsFlag(nullptr) == parameter);
+
+    std::array<std::uint32_t, 2> pftFlag{0xa5a5a5a5u, 0x5a5a5a5au};
+    Require(sceNpEntitlementAccessGetPftFlag(pftFlag.data()) == 0);
+    Require(pftFlag[0] == 0 && pftFlag[1] == 0x5a5a5a5au);
+    Require(sceNpEntitlementAccessGetPftFlag(nullptr) == parameter);
+
     Require(sceNpEntitlementAccessRequestUnifiedEntitlementInfoList() == signedOut);
     Require(sceNpEntitlementAccessPollUnifiedEntitlementInfoList() == signedOut);
     Require(sceNpEntitlementAccessRequestServiceEntitlementInfoList() == signedOut);
@@ -127,6 +144,6 @@ int main() {
     Require(sceRudpGetStatus(status.data(), status.size()) == 0);
     for (unsigned char byte : status) Require(byte == 0);
     Require(sceRudpGetStatus(nullptr, 0) == static_cast<int>(0x80770004));
-    Require(sceRudpTerminate() == 0);
+    Require(sceRudpEnd() == 0);
     return 0;
 }

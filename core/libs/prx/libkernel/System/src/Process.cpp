@@ -11,6 +11,7 @@
 #endif
 
 #include "SceTypes.hpp"
+#include "prx/libkernel/System/include/PosixSystem.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/HostEntropy.hpp"
@@ -44,6 +45,7 @@ extern "C" int* APS5_VABI __error_nid_postfix();
 namespace {
 
 constexpr int sceInvalidArgument = static_cast<int>(0x80020016u);
+constexpr int errnoNoSuchProcess = 3;
 constexpr int errnoNoChild = 10;
 constexpr int errnoBadAddress = 14;
 constexpr int errnoInvalidArgument = 22;
@@ -167,8 +169,9 @@ int APS5_VABI getpid_nid_postfix(void) {
 }
 
 int APS5_VABI getsid_nid_postfix(int pid) {
-    (void)pid;
-    NotImplemented_nid_no_patch("getsid: process sessions");
+    const int self = getpid_nid_postfix();
+    if (pid == 0 || pid == self) return self;
+    *__error_nid_postfix() = errnoNoSuchProcess;
     return -1;
 }
 
@@ -253,6 +256,33 @@ int APS5_VABI waitpid_nid_postfix(int pid, int* status, int options) {
     return -1;
 }
 
+int APS5_VABI getrlimit_nid_postfix(int resource, GuestResourceLimit* limit);
+
+int APS5_VABI setrlimit_nid_postfix(int resource, const GuestResourceLimit* limit) {
+    if (limit == nullptr) {
+        *__error_nid_postfix() = errnoBadAddress;
+        return -1;
+    }
+    if (resource < 0 || resource >= 15) {
+        *__error_nid_postfix() = errnoInvalidArgument;
+        return -1;
+    }
+
+    GuestResourceLimit requested = *limit;
+    if (requested.current < 0)
+        requested.current = std::numeric_limits<std::int64_t>::max();
+    if (requested.maximum < 0)
+        requested.maximum = std::numeric_limits<std::int64_t>::max();
+    if (requested.current > requested.maximum)
+        requested.current = requested.maximum;
+
+    GuestResourceLimit current{};
+    getrlimit_nid_postfix(resource, &current);
+    if (requested.current != current.current || requested.maximum != current.maximum)
+        throw std::runtime_error("setrlimit: changing the limit of resource " + std::to_string(resource) + " is not supported");
+    return 0;
+}
+
 int APS5_VABI wait_nid_postfix(int* status) {
     return waitpid_nid_postfix(-1, status, 0);
 }
@@ -289,6 +319,14 @@ int APS5_VABI sceKernelGetCurrentCpu(void) {
     const auto index = static_cast<unsigned>(cpu);
 #endif
     return GuestCpuFromHost(index, scePthreadSelf()->affinity.load(std::memory_order_relaxed));
+}
+
+int APS5_VABI sceKernelGetMainSocId(void) {
+    return 0;
+}
+
+int APS5_VABI sceKernelGetCpumode(void) {
+    return 0;
 }
 
 std::uint64_t APS5_VABI sceKernelGetGPI(void) {
@@ -449,6 +487,15 @@ int APS5_VABI setreuid_nid_postfix(std::uint32_t ruid, std::uint32_t euid) {
         throw std::runtime_error("setreuid: unsupported real user id " + std::to_string(ruid));
     if (euid != 0 && euid != unchanged)
         throw std::runtime_error("setreuid: unsupported effective user id " + std::to_string(euid));
+    return 0;
+}
+
+int APS5_VABI setregid_nid_postfix(std::uint32_t rgid, std::uint32_t egid) {
+    constexpr std::uint32_t unchanged = 0xffffffffu;
+    if (rgid != 0 && rgid != unchanged)
+        throw std::runtime_error("setregid: unsupported real group id " + std::to_string(rgid));
+    if (egid != 0 && egid != unchanged)
+        throw std::runtime_error("setregid: unsupported effective group id " + std::to_string(egid));
     return 0;
 }
 

@@ -17,12 +17,14 @@ entry points, acquires a lease, translates the descriptor and calls the native
 implementation. Calls between upstream implementations remain native and do not
 translate twice. Private functions are excluded from NID patching.
 
-The upstream bodies in `Open.cpp`, `Stdio.cpp`, `Terminal.cpp`,
-`SharedMemory.cpp` and `Socket.cpp` stay unchanged. Creation, closing and
-duplication use explicit hooks to transfer ownership. `GuestSelect.cpp` holds
-leases for all selected files while retaining the existing virtual socket
-namespace. AIO retains a lease for each native read/write. Small hooks also cover
-WebKit `isatty`, kernel-sys `fchdir` and directory descriptor lookup.
+The upstream file operation bodies stay behind these hooks. Creation, closing and
+duplication transfer ownership explicitly. Files, POSIX sockets and libSceNet
+socket handles allocate logical numbers from the same guest table; socket
+registries retain their transport objects. `GuestSelect.cpp` holds file leases
+and polls both socket registries. AIO retains leases for native read/write.
+WebKit `isatty`, kernel-sys `fchdir` and directory lookup also translate handles.
+A native descriptor scope prevents a translated host number from being mistaken
+for an unrelated logical socket with the same integer value.
 
 The libc stream implementation shares the descriptor table. `fopen`, `fdopen`,
 `freopen`, formatting and standard streams must use this ownership layer; raw
@@ -36,22 +38,11 @@ native descriptor numbers, and upstream streams still expose native ownership.
 Keep those operation bodies behind the guest boundary rather than replacing the
 ownership layer with them.
 
-The POSIX `fcntl_nid_postfix` file branch in `Socket/src/Udp.cpp` currently calls
-`File::Fcntl` with the guest number without translation. It can modify a host-only
-file descriptor. The kernel `sceKernelFcntl` hook also only forwards the argument
-for command 4; the new integer, pointer and duplication commands need explicit
-translation and ownership handling. The `guest_dup` shared-status-flags check
-exposes the POSIX translation gap.
-
-The `libSceNet` socket registry uses low descriptor numbers that the file close
-hook does not currently dispatch to `KernelCloseSocket_nid_no_patch`. The
-`guest_sce_net` kernel-close check exposes this gap. Keep file and socket
-ownership distinct when integrating that registry; a socket number must not be
-used as a native file descriptor.
-
-The standard-stream mode fixture still passes a native `dup(fileno(...))` result
-to guest `fdopen`; adapt that fixture to use a guest-owned descriptor. Host-only
-descriptors must continue to be rejected.
+POSIX and kernel `fcntl` share a guest wrapper with typed arguments and logical
+duplication. Socket `ioctl` translates file handles through leases. Guest close
+dispatches libSceNet and POSIX sockets before files and notifies equeues using the
+logical descriptor. These boundaries remain necessary with the new upstream
+socket implementation.
 
 ## Upstream updates and verification
 

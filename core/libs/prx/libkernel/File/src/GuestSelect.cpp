@@ -5,6 +5,7 @@
 #include "prx/libc/include/GuestFileDescriptors.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
+#include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/Socket/include/SocketSelectDeadline.hpp"
 
 #include <algorithm>
@@ -66,6 +67,36 @@ void FilterDescriptors(const std::vector<KernelSocketPoll::Entry>& entries, void
             ClearDescriptor(writefds, entry.descriptor);
         if ((entry.revents & KernelSocketPoll::Urgent) == 0) ClearDescriptor(exceptfds, entry.descriptor);
     }
+}
+
+int PollSockets(KernelSocketPoll::Entry* entries, int count, int timeoutMilliseconds) {
+    std::vector<KernelSocketPoll::Entry> kernel, external;
+    std::vector<int> kernelSlots, externalSlots;
+    for (int i = 0; i < count; ++i) {
+        const bool registered = GuestSockets::IsOpen(entries[i].descriptor);
+        (registered ? kernel : external).push_back(entries[i]);
+        (registered ? kernelSlots : externalSlots).push_back(i);
+    }
+    if (!kernel.empty()) {
+        const auto result = GuestSockets::Poll(kernel.data(), static_cast<int>(kernel.size()), 0);
+        if (result < 0) return result;
+    }
+    const auto externalPoller = g_socketPoller.load();
+    if (!external.empty() && externalPoller != nullptr) {
+        const auto result = externalPoller(external.data(), static_cast<int>(external.size()), 0);
+        if (result < 0) return result;
+    } else {
+        for (auto& entry : external) entry.revents = KernelSocketPoll::Unknown;
+    }
+    for (std::size_t i = 0; i < kernel.size(); ++i) entries[kernelSlots[i]] = kernel[i];
+    for (std::size_t i = 0; i < external.size(); ++i) entries[externalSlots[i]] = external[i];
+    int ready = 0;
+    for (int i = 0; i < count; ++i) if ((entries[i].revents & ~KernelSocketPoll::Unknown) != 0) ++ready;
+    if (ready == 0 && timeoutMilliseconds > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMilliseconds));
+        return PollSockets(entries, count, 0);
+    }
+    return ready;
 }
 
 int PollVirtual(KernelSocketPoll::Poller poller, std::vector<KernelSocketPoll::Entry>& entries, int timeoutMilliseconds) {
@@ -130,7 +161,9 @@ int APS5_VABI __inet_pton_nid_postfix(int family, const char* text, void* destin
 
 int* APS5_VABI __error_nid_postfix();
 
+extern "C" void KernelSetSocketPoller_nid_no_patch_native_nid_no_patch(KernelSocketPoll::Poller);
 void KernelSetSocketPoller_nid_no_patch(KernelSocketPoll::Poller poller) {
+    KernelSetSocketPoller_nid_no_patch_native_nid_no_patch(poller);
     g_socketPoller.store(poller);
 }
 
@@ -152,7 +185,7 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         if (DescriptorSet(exceptfds, descriptor)) events |= KernelSocketPoll::Urgent;
         if (events != 0) entries.push_back({descriptor, events, 0});
     }
-    const auto poller = g_socketPoller.load();
+    const KernelSocketPoll::Poller poller = &PollSockets;
     if (poller != nullptr && !entries.empty()) {
         const int result = poller(entries.data(), static_cast<int>(entries.size()), 0);
         if (result < 0) return fail(-result);

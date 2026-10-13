@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 
 namespace AgcDriver::Graphics {
@@ -29,11 +30,23 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
 bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource);
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads);
 void NoteHtileDepthClear(std::uint64_t htileAddress);
+struct MemoryValueFill {
+    std::uint64_t address;
+    std::size_t bytes;
+    std::uint64_t valueAddress;
+};
+std::optional<MemoryValueFill> MatchMemoryValueFill(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups);
+void NoteMemoryValueFill(const MemoryValueFill& fill);
+bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resource, const Texture* texture);
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern);
 VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile);
 std::uint64_t HtileMetadataBytes(VkExtent2D extent);
 bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t address, std::size_t bytes);
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components);
+VkFormat HostDepthFormat(const Context& context, VkFormat format);
+float HostDepthBiasConstant(const Context& context, VkFormat format, float constant);
+std::shared_ptr<StorageTexture> DepthSurfaceStorage(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip);
+bool DepthSurfaceStoreBack(const Context& context, const StorageTexture& storage);
 
 }
 

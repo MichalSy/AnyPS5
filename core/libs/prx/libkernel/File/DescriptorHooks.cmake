@@ -34,6 +34,7 @@ set_property(SOURCE
     "${CMAKE_CURRENT_LIST_DIR}/src/Stdio.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/Terminal.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/SharedMemory.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/DescriptorControl.cpp"
     APPEND PROPERTY COMPILE_DEFINITIONS ${descriptorHookDefinitions})
 target_sources(libkernel PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/FileDescriptorHooks.cpp")
 
@@ -86,3 +87,6 @@ if(BUILD_TESTING)
         add_test(NAME guest_select COMMAND GuestSelect_tests)
     endif()
 endif()
+
+set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/../Socket/src/Udp.cpp" APPEND PROPERTY
+    COMPILE_DEFINITIONS "fcntl_nid_postfix=fcntl_nid_postfix_native_nid_no_patch")

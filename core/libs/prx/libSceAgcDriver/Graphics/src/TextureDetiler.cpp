@@ -1,4 +1,3 @@
-#include "prx/libkernel/System/include/DebugBridge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
@@ -92,10 +91,7 @@ TextureDetiler::TextureDetiler(const Context& context) : context(context) {
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         moduleInfo.codeSize = sizeof(TEXTURE_DETILE_SPV);
         moduleInfo.pCode = TEXTURE_DETILE_SPV;
-        {
-            DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
-            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
-        }
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
         bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &imageDescriptorLayout), "vkCreateDescriptorSetLayout");
         pipelineLayoutInfo.pSetLayouts = &imageDescriptorLayout;
@@ -167,10 +163,7 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         moduleInfo.codeSize = sizeof(TEXTURE_DETILE_IMAGE_SPV);
         moduleInfo.pCode = TEXTURE_DETILE_IMAGE_SPV;
-        {
-            DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
-            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &imageModule), "vkCreateShaderModule");
-        }
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &imageModule), "vkCreateShaderModule");
     }
     std::array<VkSpecializationMapEntry, 22> entries{};
     for (std::uint32_t index = 0; index < entries.size(); ++index) entries[index] = {index, index * 4u, 4};
@@ -188,11 +181,7 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
     createInfo.stage = stage;
     createInfo.layout = image ? imagePipelineLayout : pipelineLayout;
     VkPipeline result = VK_NULL_HANDLE;
-    {
-        DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
-        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &createInfo, nullptr, &result), "vkCreateComputePipelines");
-        activity.Complete();
-    }
+    Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &createInfo, nullptr, &result), "vkCreateComputePipelines");
     pipelines.emplace_back(key, result);
     return result;
 }
@@ -269,14 +258,14 @@ void TextureDetiler::Dispatch(VkCommandBuffer commands, TextureTileMode tileMode
     context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, groupsX, groupsY, 1);
 }
 
-std::array<std::uint32_t, 7> TextureDetiler::CmaskErrors() {
-    if (cmaskErrors == nullptr) return {};
-    std::array<std::uint32_t, 7> codes{};
+std::uint32_t TextureDetiler::CmaskErrors() {
+    if (cmaskErrors == nullptr) return 0;
+    std::uint32_t codes = 0;
     std::memcpy(&codes, cmaskErrors->Bytes().data(), sizeof(codes));
     return codes;
 }
 
-void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask, std::uint64_t cmaskOffset, std::size_t cmaskBytes, VkImageView view, std::uint32_t width, std::uint32_t height, std::uint32_t elementBytes, const std::array<std::uint32_t, 2>& clearWords, bool write, std::uint64_t guestAddress, std::uint32_t contextFlags) {
+void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask, std::uint64_t cmaskOffset, std::size_t cmaskBytes, VkImageView view, std::uint32_t width, std::uint32_t height, std::uint32_t elementBytes, const std::array<std::uint32_t, 2>& clearWords, bool write) {
     Require(commands != VK_NULL_HANDLE && cmask != VK_NULL_HANDLE && view != VK_NULL_HANDLE, "a CMASK clear needs a command buffer, the CMASK buffer and the target view");
     Require(elementBytes == 1 || elementBytes == 2 || elementBytes == 4 || elementBytes == 8, "a CMASK clear of this element size is not modeled");
     Require(cmaskOffset % 4 == 0 && cmaskBytes % 4 == 0 && cmaskBytes != 0, "a CMASK clear needs a word-aligned CMASK");
@@ -292,7 +281,7 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
         layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
         layoutInfo.pBindings = bindings.data();
         Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &cmaskDescriptorLayout), "vkCreateDescriptorSetLayout CMASK clear");
-        const VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, 10 * sizeof(std::uint32_t)};
+        const VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, 7 * sizeof(std::uint32_t)};
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pipelineLayoutInfo.setLayoutCount = 1;
         pipelineLayoutInfo.pSetLayouts = &cmaskDescriptorLayout;
@@ -303,26 +292,18 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
         moduleInfo.codeSize = sizeof(CMASK_CLEAR_SPV);
         moduleInfo.pCode = CMASK_CLEAR_SPV;
         VkShaderModule cmaskModule = VK_NULL_HANDLE;
-        {
-            DebugBridgeWorkActivity activity(DebugBridgeWork::ShaderModule);
-            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &cmaskModule), "vkCreateShaderModule CMASK clear");
-        }
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &cmaskModule), "vkCreateShaderModule CMASK clear");
         VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pipelineInfo.stage.module = cmaskModule;
         pipelineInfo.stage.pName = "main";
         pipelineInfo.layout = cmaskPipelineLayout;
-        VkResult created;
-        {
-            DebugBridgeShaderActivity activity(DebugBridgeShaderMetric::PipelineBuildsActive, DebugBridgeShaderMetric::PipelineBuildsCompleted);
-            created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &cmaskPipeline);
-            if (created == VK_SUCCESS) activity.Complete();
-        }
+        const auto created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &cmaskPipeline);
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, cmaskModule, nullptr);
         Check(created, "vkCreateComputePipelines CMASK clear");
-        cmaskErrors = std::make_unique<Buffer>(context, 7 * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        std::memset(cmaskErrors->Bytes().data(), 0, 7 * sizeof(std::uint32_t));
+        cmaskErrors = std::make_unique<Buffer>(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memset(cmaskErrors->Bytes().data(), 0, 4);
     }
     constexpr std::uint32_t setsPerPool = 64;
     const auto poolIndex = allocatedCmaskSets / setsPerPool;
@@ -348,7 +329,7 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
     const auto descriptorOffset = cmaskOffset - cmaskOffset % alignment;
     const auto base = cmaskOffset - descriptorOffset;
     const VkDescriptorBufferInfo cmaskInfo{cmask, descriptorOffset, base + cmaskBytes};
-    const VkDescriptorBufferInfo errorInfo{cmaskErrors->Handle(), 0, 7 * sizeof(std::uint32_t)};
+    const VkDescriptorBufferInfo errorInfo{cmaskErrors->Handle(), 0, 4};
     const VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
     std::array<VkWriteDescriptorSet, 3> writes{};
     for (std::uint32_t index = 0; index < writes.size(); ++index) {
@@ -374,7 +355,7 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
     context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, cmaskPipeline);
     context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, cmaskPipelineLayout, 0, 1, &set, 0, nullptr);
     const std::uint32_t mask = elementBytes >= 4 ? 0xffffffffu : (1u << (elementBytes * 8u)) - 1u;
-    const std::array<std::uint32_t, 10> push{static_cast<std::uint32_t>(base), width, height, (width + 1023u) / 1024u, clearWords[0] & mask, elementBytes == 8 ? clearWords[1] : 0u, write ? 1u : 0u, static_cast<std::uint32_t>(guestAddress), static_cast<std::uint32_t>(guestAddress >> 32u), contextFlags};
+    const std::array<std::uint32_t, 7> push{static_cast<std::uint32_t>(base), width, height, (width + 1023u) / 1024u, clearWords[0] & mask, elementBytes == 8 ? clearWords[1] : 0u, write ? 1u : 0u};
     context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, cmaskPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push.data());
     context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, (width + 7u) / 8u, (height + 7u) / 8u, 1);
     barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, anyAccess);

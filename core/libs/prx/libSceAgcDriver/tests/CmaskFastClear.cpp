@@ -164,30 +164,14 @@ void queuedCmaskInitialization(AgcDriver::VulkanDevice& device) {
         "CMASK initialization queued before its fast-clear consumer");
 }
 
-void invalidCode(AgcDriver::VulkanDevice& device) {
+void unknownCode(AgcDriver::VulkanDevice& device) {
     const auto color = target(ColorTileMode::RenderTarget);
     prepare(color, [](std::uint32_t tileX, std::uint32_t tileY) { return tileX == 2 && tileY == 0; }, 3);
     eliminate(device, color);
-    {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        device.WaitIdle();
-    }
+    expect(device, color, [](std::uint32_t, std::uint32_t) { return Stale; }, "a tile with CMASK code 3 eliminated");
     prepare(color, [](std::uint32_t, std::uint32_t) { return true; });
-    try {
-        eliminate(device, color);
-    } catch (const std::runtime_error& error) {
-        const std::string message(error.what());
-        Require(message.find("were recorded, which are not a single-sample fast-clear code") != std::string::npos, std::string("unexpected failure: ") + error.what());
-        const CmaskLayout layout(Width, Height);
-        char source[64];
-        std::snprintf(source, sizeof(source), "source=0x%016llx", static_cast<unsigned long long>(color.cmaskAddress + layout.Nibble(2, 0) / 2u));
-        Require(message.find(source) != std::string::npos && message.find("target=61x13") != std::string::npos,
-            "the GPU CMASK error did not identify its original metadata and target: " + message);
-        std::snprintf(source, sizeof(source), "base=0x%016llx", static_cast<unsigned long long>(color.cmaskAddress));
-        Require(message.find(source) != std::string::npos, "the GPU CMASK error lost the original metadata base: " + message);
-        return;
-    }
-    throw std::runtime_error("a CMASK code 3 read by the GPU pass did not throw");
+    eliminate(device, color);
+    expect(device, color, [](std::uint32_t, std::uint32_t) { return Clear; }, "fast-cleared target eliminated after a CMASK code 3");
 }
 
 }
@@ -210,7 +194,7 @@ int main() {
         run(*device, ColorTileMode::Linear, "linear");
         run(*device, ColorTileMode::RenderTarget, "SW_64KB_R_X");
         queuedCmaskInitialization(*device);
-        invalidCode(*device);
+        unknownCode(*device);
         device->WaitIdle();
         device.reset();
         {

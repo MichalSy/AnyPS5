@@ -13,10 +13,16 @@ DEPENDS = re.compile(r'Depends on:[ \t]*((?:#\d+\b(?:(?:[ \t]*,[ \t]*(?:and[ \t]
 PLAIN_DEPENDS = re.compile(r'Depends on[ \t]+(#\d+\b(?:(?:[ \t]*,[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+)#\d+\b)*)')
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))?", re.M)
 MARKER = "<!-- pr-overlap -->"
+FETCH_REFS = 100
 
 
 def git(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", check=True).stdout
+
+
+def own(prs, sha):
+    return {n: pr for n, pr in prs.items()
+            if pr["sha"] != sha and subprocess.run(["git", "merge-base", "--is-ancestor", pr["sha"], sha], capture_output=True).returncode != 0}
 
 
 def gh(*args):
@@ -51,7 +57,8 @@ def open_prs(base):
 
 def fetch(base, prs):
     refspecs = [f"+refs/heads/{base}:refs/pr/base"] + [f"+{pr['sha']}:{pr['ref']}" for pr in prs.values()]
-    git("fetch", "--no-tags", "-q", f"https://github.com/{REPO}.git", *refspecs)
+    for start in range(0, len(refspecs), FETCH_REFS):
+        git("fetch", "--no-tags", "-q", f"https://github.com/{REPO}.git", *refspecs[start:start + FETCH_REFS])
 
 
 def merge(*args):
@@ -190,7 +197,7 @@ if __name__ == "__main__":
     fetch(args.base, prs)
     if args.branch:
         sha = git("rev-parse", args.branch).strip()
-        prs = {n: pr for n, pr in prs.items() if pr["sha"] != sha}
+        prs = own(prs, sha)
         prs[0] = {"ref": sha, "author": None, "depends": set()}
     for pr in prs.values():
         scan(pr)

@@ -15,6 +15,9 @@
 #include <type_traits>
 #ifdef _WIN32
 #include <io.h>
+#include "prx/libc/include/FileLock.hpp"
+extern "C" void* HostStandardHandle_nid_no_patch(int descriptor);
+extern "C" void KeepStandardHandle_nid_no_patch(int descriptor, void* handle);
 #endif
 
 struct GuestFilePrefix {
@@ -39,6 +42,9 @@ static constexpr const char* FOPEN_MSG_NOT_FOUND = "file not found";
 static constexpr const char* FOPEN_MSG_OPEN_FAILED = "open failed";
 
 struct FileStreamState;
+#ifndef _WIN32
+extern "C" int KeepHostStandardError_nid_no_patch();
+#endif
 
 class FileStream {
     GuestFilePrefix _guest{};

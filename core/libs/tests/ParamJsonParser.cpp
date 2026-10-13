@@ -1,5 +1,6 @@
 #include "prx/libkernel/AppMetadata/include/ParamJsonParser.hpp"
 #include <chrono>
+#include <clocale>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -31,6 +32,37 @@ static ParsedParamJson ParseText(const std::filesystem::path& path, const std::s
         Require(static_cast<bool>(file), "Cannot write param.json fixture");
     }
     return parseParamJson(path);
+}
+
+static void CheckNumericLocale(const std::filesystem::path& path) {
+    struct RestoreLocale {
+        std::string previous = std::setlocale(LC_NUMERIC, nullptr);
+        ~RestoreLocale() { std::setlocale(LC_NUMERIC, previous.c_str()); }
+    } restore;
+    bool commaLocale = false;
+    for (const auto* name : {"French", "French_France.1252", "fr_FR.UTF-8", "de_DE.UTF-8"}) {
+        if (std::setlocale(LC_NUMERIC, name) != nullptr && std::string(std::localeconv()->decimal_point) == ",") {
+            commaLocale = true;
+            break;
+        }
+    }
+    if (!commaLocale) {
+#ifdef _WIN32
+        throw std::runtime_error("No Windows comma-decimal locale available for regression");
+#else
+        std::cout << "Comma-decimal locale regression unavailable on this host\n";
+        return;
+#endif
+    }
+    for (const auto& [number, expected] : {std::pair{"1.25e3", std::uint64_t{1250}},
+            std::pair{"0.5e3", std::uint64_t{500}}, std::pair{"12.75e2", std::uint64_t{1275}},
+            std::pair{"1.25", std::uint64_t{1}}}) {
+        Require(ParseSize(path, number).downloadDataSizeMiB == expected,
+            std::string("JSON number depends on host locale: ") + number);
+    }
+    bool rejected = false;
+    try { ParseSize(path, "-0.5"); } catch (const std::exception&) { rejected = true; }
+    Require(rejected, "Negative fractional size was accepted under comma locale");
 }
 
 static void CheckUserDefinedParams(const std::filesystem::path& path) {
@@ -88,6 +120,19 @@ static void CheckLanguages(const std::filesystem::path& path) {
     Require(rejected, "Accepted localizedParameters without a language entry");
 }
 
+static void CheckOutputPermission(const std::filesystem::path& path) {
+    const std::string prefix = R"({"titleId":"PPSA99007","localizedParameters":{"en-US":{"titleName":"Example"}})";
+    Require(ParseText(path, prefix + "}").attribute3 == 0, "Absent output permission is not zero");
+    for (const auto& [text, expected] : {std::pair{"0", 0u}, {"524352", 0x80040u}, {"4294967295", 0xFFFFFFFFu}}) {
+        Require(ParseText(path, prefix + ",\"attribute3\":" + text + "}").attribute3 == expected, "Incorrect output permission");
+    }
+    for (const auto* text : {"-1", "0.5", "1e3", "4294967296", "true", "null", "\"524352\""}) {
+        bool rejected = false;
+        try { ParseText(path, prefix + ",\"attribute3\":" + text + "}"); } catch (const std::exception&) { rejected = true; }
+        Require(rejected, "Accepted invalid attribute3");
+    }
+}
+
 static void CheckNumberSyntax(const std::filesystem::path& path) {
     const std::string prefix = R"({"titleId":"PPSA00000","localizedParameters":{"en-US":{"titleName":"Example"}})";
     const std::pair<const char*, const char*> fields[] = {
@@ -143,6 +188,7 @@ int main() {
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
     int result = 0;
     try {
+        CheckNumericLocale(path);
         CheckUtf8(path);
         CheckNumberSyntax(path);
         CheckStringsAndDefaults(path);
@@ -166,6 +212,7 @@ int main() {
         }
         CheckLanguages(path);
         CheckUserDefinedParams(path);
+        CheckOutputPermission(path);
         CheckNesting(path);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

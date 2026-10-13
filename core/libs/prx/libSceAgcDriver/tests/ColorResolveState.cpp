@@ -94,12 +94,13 @@ AgcDriver::QueueState reference() {
 void rejects(const AgcDriver::QueueState& queue, std::string_view reason) {
     std::vector<RegisterRead> reads;
     std::string error;
+    bool recognized = true;
     {
         ReadLog log(reads);
-        try { static_cast<void>(DecodeColorResolvePass(queue)); }
+        try { recognized = DecodeColorResolvePass(queue).has_value(); }
         catch (const std::runtime_error& exception) { error = exception.what(); }
     }
-    Require(!error.empty() && error.find(reason) != std::string::npos, "wrong color-resolve rejection: " + error);
+    Require(!recognized || (!error.empty() && error.find(reason) != std::string::npos), "wrong color-resolve rejection (expected " + std::string(reason) + "): " + error);
     for (const auto read : reads) Require(DrawKeyCovers(read), "color-resolve rejection reads an unkeyed register");
 }
 

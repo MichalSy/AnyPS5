@@ -62,7 +62,7 @@ def main():
             artifact = case / "app0" / "Media" / "Plugins" / "plugin.prx.guest.prx"
             assert artifact.read_bytes().startswith(b"MZ" if windows else b"\x7fELF"), artifact
             assert list((case / "app0").rglob("*.guest.prx")) == [artifact]
-            assert "    Media/Plugins/plugin.prx.guest.prx\n" in result.stdout, result.stdout
+            assert "        |-- Media/\n              |-- Plugins/\n                    |-- plugin.prx.guest.prx\n" in result.stdout, result.stdout
             if windows and os.name == "nt":
                 run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
                 assert run.returncode == 42, (run.returncode, run.stdout, run.stderr)
@@ -83,7 +83,7 @@ def main():
             result, output = convert(case, windows, ["--module-dir", "Media/Plugins", "--recursive-module-search"])
             assert result.returncode == 0, (result.stdout, result.stderr)
             assert set((case / "app0").rglob("*.guest.prx")) == previous_artifacts
-            assert result.stdout.count("    Media/Plugins/plugin.prx.guest.prx\n") == 1, result.stdout
+            assert result.stdout.count("|-- plugin.prx.guest.prx\n") == 1, result.stdout
 
             case = work / f"{windows}-needed"
             modules = case / "Media" / "Modules"
@@ -106,7 +106,7 @@ def main():
             artifact = case / "app0" / "root.prx.guest.prx"
             assert list((case / "app0").rglob("*.guest.prx")) == [artifact], list(case.rglob("*.guest.prx"))
             assert artifact.read_bytes().startswith(b"MZ" if windows else b"\x7fELF"), artifact
-            assert "    root.prx.guest.prx\n" in result.stdout, result.stdout
+            assert "        |-- root.prx.guest.prx\n" in result.stdout, result.stdout
             if windows:
                 assert "__aps5_guest_initialize" in pe_export_names(artifact.read_bytes())
             else:

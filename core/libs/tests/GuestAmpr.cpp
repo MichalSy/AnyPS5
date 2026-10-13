@@ -82,6 +82,7 @@ std::uint64_t APS5_VABI sceAmprMeasureCommandSizeReadFileScatter(void*, std::uin
 std::uint64_t APS5_VABI sceAmprMeasureCommandSizeReadFileGatherScatter(void*, std::uint64_t, std::uint64_t);
 std::uint64_t APS5_VABI sceAmprMeasureCommandSizeResetGatherScatterState();
 std::size_t APS5_VABI sceKernelGetDirectMemorySize();
+int APS5_VABI sceAmprAmmGetUsageStatsData(void*);
 int APS5_VABI sceAmprAmmCommandBufferConstructor(Apr::CommandBufferObject*);
 int APS5_VABI sceAmprAmmCommandBufferMap(Apr::CommandBufferObject*, std::uint64_t, std::uint64_t, std::int32_t, std::int32_t);
 int APS5_VABI sceAmprAmmCommandBufferMapWithGpuMaskId(Apr::CommandBufferObject*, std::uint64_t, std::uint64_t, std::int32_t, std::int32_t, std::uint8_t);
@@ -261,6 +262,36 @@ void TestFullBuffer() {
     Require(sceAmprCommandBufferConstructor(&unbound) == 0);
     Require(sceAmprCommandBufferPushMarker(&unbound, marker) == bufferFull);
     Require(sceAmprCommandBufferPopMarker(&unbound) == bufferFull);
+}
+
+void TestOffsetPastBuffer() {
+    constexpr std::array<std::uint32_t, 3> invalidOffsets{33u, 64u, 0xffffffffu};
+    for (const auto offset : invalidOffsets) {
+        Recorder recorder(32);
+        recorder.memory.fill(0xA5);
+        recorder.buffer.offset = offset;
+        recorder.buffer.numCommands = 7;
+        const auto before = recorder.buffer;
+        const auto memory = recorder.memory;
+        const auto rejected = [&](const auto& record) {
+            bool threw = false;
+            try {
+                record();
+            } catch (const std::invalid_argument&) {
+                threw = true;
+            }
+            Require(threw);
+            Require(recorder.memory == memory);
+            Require(recorder.buffer.base == before.base && recorder.buffer.size == before.size);
+            Require(recorder.buffer.offset == before.offset && recorder.buffer.numCommands == before.numCommands);
+            Require(recorder.buffer.type == before.type && recorder.buffer.recording == before.recording);
+        };
+        rejected([&] { sceAmprCommandBufferPopMarker(&recorder.buffer); });
+        rejected([&] { sceAmprCommandBufferNop(&recorder.buffer, 1); });
+        rejected([&] { sceAmprCommandBufferPushMarker(&recorder.buffer, "bounds"); });
+        rejected([&] { sceAmprAmmCommandBufferMap(&recorder.buffer, 0x4000, 0x4000, 0, 3); });
+        rejected([&] { sceAmprAmmCommandBufferMapAsPrt(&recorder.buffer, 0x4000, 0x4000); });
+    }
 }
 
 void TestSubmission() {
@@ -823,6 +854,24 @@ void TestAmmRangesAboveHintedMaps() {
     Require(sceKernelMunmap(span, page) == 0);
 }
 
+void TestAmmUsageStats() {
+    std::array<std::uint64_t, 4> stats{};
+    Require(sceAmprAmmGetUsageStatsData(nullptr) == static_cast<int>(0x80020016));
+    stats[0] = 0x19;
+    Require(sceAmprAmmGetUsageStatsData(stats.data()) == static_cast<int>(0x80020016));
+    stats = {0x18, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
+    Require(sceAmprAmmGetUsageStatsData(stats.data()) == 0);
+    Require(stats[0] == 0x18);
+    Require((stats[1] & 0xffffu) == 512u && (stats[1] >> 16u) == 0u);
+    Require((stats[2] & 0xffffffffu) == 7u && (stats[2] >> 32u) == 0u);
+    stats = {0x8, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
+    Require(sceAmprAmmGetUsageStatsData(stats.data()) == 0);
+    Require(stats[0] == 0x8 && stats[1] == 0xdeadbeef && stats[2] == 0xdeadbeef);
+    stats = {0x0, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
+    Require(sceAmprAmmGetUsageStatsData(stats.data()) == 0);
+    Require(stats[0] == 0 && stats[1] == 0xdeadbeef);
+}
+
 void TestAmm() {
     std::uint64_t start = 0;
     std::uint64_t end = 0;
@@ -962,6 +1011,102 @@ void SubmitAmm(Recorder& recorder) {
     std::uint32_t id = 0;
     Require(sceAmprAmmSubmitCommandBuffer3(recorder.memory.data(), recorder.Offset(), 0, &id) == 0);
     Require(sceAmprAmmWaitCommandBufferCompletion(id) == 0);
+}
+
+void TestAmmRemapKeepsPoolReferences() {
+    std::uint64_t start = 0;
+    std::uint64_t end = 0;
+    std::uint64_t multimapStart = 0;
+    std::uint64_t multimapEnd = 0;
+    Require(sceAmprAmmGetVirtualAddressRanges(&start, &end, &multimapStart, &multimapEnd) == 0);
+    std::int64_t pool = -1;
+    Require(sceAmprAmmGiveDirectMemory(0, static_cast<std::int64_t>(sceKernelGetDirectMemorySize()), page, page, 1, &pool) == 0);
+
+    const auto source = start + 256 * page;
+    const auto alias = multimapStart + 256 * page;
+    const auto fresh = start + 257 * page;
+    const auto lastAlias = multimapStart + 257 * page;
+    const auto overlappingAlias = multimapStart + 258 * page;
+    Recorder maps;
+    Require(sceAmprAmmCommandBufferMap(&maps.buffer, source, page, 0, cpuReadWrite) == 0);
+    Require(sceAmprAmmCommandBufferMultiMap(&maps.buffer, alias, source, page, cpuReadWrite) == 0);
+    SubmitAmm(maps);
+    At(source) = 0xA1;
+    Require(At(alias) == 0xA1);
+
+    Recorder move;
+    Require(sceAmprAmmCommandBufferRemap(&move.buffer, alias, source, page, cpuReadWrite) == 0);
+    SubmitAmm(move);
+    Require(Protection(source) == 0 && At(alias) == 0xA1);
+
+    Recorder exhausted;
+    Require(sceAmprAmmCommandBufferMap(&exhausted.buffer, fresh, page, 0, cpuReadWrite) == 0);
+    const auto requireExhausted = [&] {
+        bool rejected = false;
+        try {
+            SubmitAmm(exhausted);
+        } catch (const std::runtime_error& error) {
+            rejected = std::string(error.what()).starts_with("AMM: no free run of ");
+        }
+        Require(rejected);
+    };
+    requireExhausted();
+    At(alias) = 0xB1;
+    Require(At(alias) == 0xB1);
+
+    Recorder retain;
+    Require(sceAmprAmmCommandBufferRemap(&retain.buffer, alias, alias, page, cpuReadWrite) == 0);
+    Require(sceAmprAmmCommandBufferMultiMap(&retain.buffer, lastAlias, alias, page, cpuReadWrite) == 0);
+    Require(sceAmprAmmCommandBufferRemap(&retain.buffer, lastAlias, alias, 2 * page, cpuReadWrite) == 0);
+    Require(sceAmprAmmCommandBufferUnmap(&retain.buffer, lastAlias, page) == 0);
+    SubmitAmm(retain);
+    Require(At(overlappingAlias) == 0xB1);
+    requireExhausted();
+
+    Recorder release;
+    Require(sceAmprAmmCommandBufferUnmap(&release.buffer, overlappingAlias, page) == 0);
+    Require(sceAmprAmmCommandBufferMap(&release.buffer, fresh, page, 0, cpuReadWrite) == 0);
+    SubmitAmm(release);
+    Require(At(fresh) == 0xB1);
+    At(fresh) = 0xC1;
+    Require(At(fresh) == 0xC1);
+}
+
+void TestAmmMapFailureKeepsPoolOwnership() {
+    std::uint64_t start = 0;
+    std::uint64_t end = 0;
+    std::uint64_t multimapStart = 0;
+    std::uint64_t multimapEnd = 0;
+    Require(sceAmprAmmGetVirtualAddressRanges(&start, &end, &multimapStart, &multimapEnd) == 0);
+    std::int64_t pool = -1;
+    Require(sceAmprAmmGiveDirectMemory(0, static_cast<std::int64_t>(sceKernelGetDirectMemorySize()), page, page, 1, &pool) == 0);
+    const auto original = start + 512 * page;
+    const auto fresh = start + 516 * page;
+
+    Recorder mapping;
+    Require(sceAmprAmmCommandBufferMap(&mapping.buffer, original, page, 0, cpuReadWrite) == 0);
+    SubmitAmm(mapping);
+    At(original) = 0xA1;
+    SubmitAmm(mapping);
+    Require(At(original) == 0xA1 && Protection(original) == cpuReadWrite);
+
+    Recorder oversized;
+    Require(sceAmprAmmCommandBufferMap(&oversized.buffer, original, 2 * page, 0, cpuReadWrite) == 0);
+    bool rejected = false;
+    try {
+        SubmitAmm(oversized);
+    } catch (const std::runtime_error& error) {
+        rejected = std::string(error.what()).starts_with("AMM: no free run of ");
+    }
+    Require(rejected);
+    Require(Protection(original) == 0 && Protection(original + page) == 0);
+
+    Recorder reuse;
+    Require(sceAmprAmmCommandBufferMap(&reuse.buffer, fresh, page, 0, cpuReadWrite) == 0);
+    SubmitAmm(reuse);
+    Require(At(fresh) == 0xA1);
+    At(fresh) = 0xB1;
+    Require(At(fresh) == 0xB1 && Protection(original) == 0);
 }
 
 void TestAmmRemapAndProtect() {
@@ -1244,6 +1389,7 @@ int main() {
     TestRecording(std::string(300, 'a'));
     TestRejectedArguments();
     TestFullBuffer();
+    TestOffsetPastBuffer();
     TestSubmission();
     TestKernelEventQueue();
     TestWaits();
@@ -1262,6 +1408,9 @@ int main() {
     TestResolveSymbolicLink();
     TestGatherScatter();
     TestAmmRangesAboveHintedMaps();
+    TestAmmUsageStats();
+    TestAmmRemapKeepsPoolReferences();
+    TestAmmMapFailureKeepsPoolOwnership();
     TestAmm();
     TestAmmRemapAndProtect();
     TestAmmPrt();

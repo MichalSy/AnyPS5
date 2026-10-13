@@ -53,3 +53,10 @@ FD_POSIX(int, tcgetattr_nid_postfix, (int d, void* attributes), (d, attributes),
 FD_CUSTOM(tcsetattr_nid_postfix)
 FD_CUSTOM(pread_nid_postfix)
 FD_CUSTOM(pwrite_nid_disambig1_nid_postfix)
+
+FD_POSIX(int, tcsendbreak_nid_postfix, (int d, int duration), (d, duration), -1)
+FD_POSIX(int, tcdrain_nid_postfix, (int d), (d), -1)
+FD_CUSTOM(tcflush_nid_postfix)
+FD_CUSTOM(tcflow_nid_postfix)
+FD_CUSTOM(tcgetpgrp_nid_postfix)
+FD_CUSTOM(tcsetpgrp_nid_postfix)

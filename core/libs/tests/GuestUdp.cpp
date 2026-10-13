@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <thread>
 #include <chrono>
 extern "C" {
@@ -14,6 +15,7 @@ int APS5_VABI setsockopt_nid_postfix(int, int, int, const void*, std::uint32_t);
 int APS5_VABI getsockopt_nid_postfix(int, int, int, void*, std::uint32_t*);
 int APS5_VABI bind_nid_postfix(int, const void*, std::uint32_t);
 int APS5_VABI getsockname_nid_postfix(int, void*, std::uint32_t*);
+int APS5_VABI getpeername_nid_postfix(int, void*, std::uint32_t*);
 int APS5_VABI ioctl_nid_postfix(int, std::uint64_t, void*);
 int APS5_VABI _ioctl_nid_postfix(int, std::uint64_t, void*);
 std::int64_t APS5_VABI send_nid_postfix(int, const void*, std::uint64_t, int);
@@ -122,6 +124,12 @@ int main() {
     int option = 0;
     std::uint32_t optionSize = sizeof(option);
     Require(getsockopt_nid_postfix(sender, 0xffff, 0x20, &option, &optionSize) == 0 && option != 0);
+    for (const std::int64_t wide : {0, 1}) {
+        Require(setsockopt_nid_postfix(sender, 0xffff, 0x20, &wide, sizeof(wide)) == 0);
+        optionSize = sizeof(option);
+        Require(getsockopt_nid_postfix(sender, 0xffff, 0x20, &option, &optionSize) == 0 && (option != 0) == (wide != 0));
+    }
+    Require(setsockopt_nid_postfix(sender, 0xffff, 0x20, &enabled, 2) == -1 && *__error_nid_postfix() == 22);
     Require(setsockopt_nid_postfix(sender, 0xffff, 12345, &enabled, sizeof(enabled)) == -1);
     Require(*__error_nid_postfix() == 42);
     const int unconnected = socket_nid_postfix(2, 2, 0);
@@ -204,6 +212,45 @@ int main() {
     Require(ioctl_nid_postfix(receiver, 0x4004667f, &queued) == -1);
     Require(_ioctl_nid_postfix(receiver, 0x4004667f, &queued) == -1 && *__error_nid_postfix() == 9);
     Require(close_nid_postfix(sender) == 0);
+    const int peer = socket_nid_postfix(2, 2, 0);
+    const int other = socket_nid_postfix(2, 2, 0);
+    const int dissolved = socket_nid_postfix(2, 2, 0);
+    Require(peer >= 0 && other >= 0 && dissolved >= 0);
+    std::array<unsigned char, 16> peerAddress{16, 2, 0, 0, 127, 0, 0, 1};
+    std::array<unsigned char, 16> dissolvedAddress{16, 2, 0, 0, 127, 0, 0, 1};
+    Require(bind_nid_postfix(peer, peerAddress.data(), peerAddress.size()) == 0);
+    Require(bind_nid_postfix(dissolved, dissolvedAddress.data(), dissolvedAddress.size()) == 0);
+    size = peerAddress.size();
+    Require(getsockname_nid_postfix(peer, peerAddress.data(), &size) == 0);
+    size = dissolvedAddress.size();
+    Require(getsockname_nid_postfix(dissolved, dissolvedAddress.data(), &size) == 0);
+    Require(connect_nid_postfix(dissolved, peerAddress.data(), peerAddress.size()) == 0);
+    std::array<unsigned char, 16> peerName{};
+    size = peerName.size();
+    Require(getpeername_nid_postfix(dissolved, peerName.data(), &size) == 0 && peerName[2] == peerAddress[2] && peerName[3] == peerAddress[3]);
+    const std::array<unsigned char, 16> unspecified{16, 0};
+    Require(connect_nid_postfix(dissolved, unspecified.data(), unspecified.size()) == -1 && *__error_nid_postfix() == 47);
+    size = peerName.size();
+    Require(getpeername_nid_postfix(dissolved, peerName.data(), &size) == -1 && *__error_nid_postfix() == 57);
+    std::array<unsigned char, 16> localName{};
+    size = localName.size();
+    Require(getsockname_nid_postfix(dissolved, localName.data(), &size) == 0);
+    Require(localName[2] == dissolvedAddress[2] && localName[3] == dissolvedAddress[3]);
+#ifndef _WIN32
+    Require(localName[4] == 0 && localName[5] == 0 && localName[6] == 0 && localName[7] == 0);
+#endif
+    Require(send_nid_postfix(dissolved, "x", 1, 0) == -1 && *__error_nid_postfix() == 39);
+    const char unrelated[] = "unrelated sender";
+    Require(sendto_nid_postfix(other, unrelated, sizeof(unrelated), 0, dissolvedAddress.data(), dissolvedAddress.size()) == sizeof(unrelated));
+    queued = 0;
+    for (int i = 0; i < 1000 && queued == 0; ++i) {
+        Require(ioctl_nid_postfix(dissolved, 0x4004667f, &queued) == 0);
+        if (!queued) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Require(queued == sizeof(unrelated));
+    Require(recvfrom_nid_postfix(dissolved, buffer, sizeof(buffer), 0, nullptr, nullptr) == sizeof(unrelated));
+    Require(std::strcmp(buffer, unrelated) == 0);
+    for (const int descriptor : {peer, other, dissolved}) Require(close_nid_postfix(descriptor) == 0);
     unsigned char parsed[16]{};
     Require(inet_pton_nid_postfix(2, "127.0.0.1", parsed) == 1);
     Require(parsed[0] == 127 && parsed[1] == 0 && parsed[2] == 0 && parsed[3] == 1);

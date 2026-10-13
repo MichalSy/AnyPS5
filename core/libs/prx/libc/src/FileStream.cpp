@@ -232,6 +232,14 @@ bool FileStream::Reopen(const std::filesystem::path& filename, const char* mode)
         errno = GuestFiles::GuestFileNativeError_nid_no_patch(openError);
         return false;
     }
+    if (*mode == 'a' && std::fseek(replacement.get(), 0, SEEK_END) != 0) {
+        const int error = GuestFiles::GuestFileNativeError_nid_no_patch(errno);
+        GuestFiles::GuestFileCloseMatching_nid_no_patch(expected);
+        replacement.reset();
+        _guest = {};
+        errno = error;
+        return false;
+    }
     const int duplicate = NativeDuplicate(NativeDescriptor(replacement.get()));
     if (duplicate < 0) {
         const int error = GuestFiles::GuestFileNativeError_nid_no_patch(errno);

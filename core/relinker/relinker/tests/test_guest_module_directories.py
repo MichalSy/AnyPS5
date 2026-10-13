@@ -87,7 +87,9 @@ def main():
                 assert set(artifacts) == expected, artifacts
                 for artifact in artifacts:
                     assert artifact.read_bytes().startswith(b"MZ" if windows else b"\x7fELF")
-                    assert f"    {artifact.relative_to(case / 'app0').as_posix()}\n" in result.stdout, result.stdout
+                    tree = result.stdout.split("Arrange the files like this:\n", 1)[1]
+                    assert f"-- {artifact.parent.name}/\n" in tree, tree
+                    assert f"              |-- {artifact.name}\n" in tree, tree
                 if windows and os.name == "nt":
                     run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
                     assert run.returncode == 42, (run.returncode, run.stdout, run.stderr)
@@ -128,10 +130,10 @@ def main():
                 from test_guest_module_dir import pe_export_names
                 shared = case / "app0/Media/Modules/Shared.prx.guest.prx"
                 plugin = case / "app0/Media/Plugins/Dynamic.prx.guest.prx"
-                assert "__aps5_guest_initialize" not in pe_export_names(shared.read_bytes())
+                assert "__aps5_guest_initialize" in pe_export_names(shared.read_bytes())
                 assert "__aps5_guest_initialize" in pe_export_names(plugin.read_bytes())
             else:
-                assert needed_libraries(output.read_bytes()) == ["$ORIGIN/app0/sce_module/static.prx.guest.prx"]
+                assert needed_libraries(output.read_bytes()) == ["$ORIGIN/app0/sce_module/static.prx.guest.prx"], needed_libraries(output.read_bytes())
                 assert needed_libraries((case / "app0/sce_module/static.prx.guest.prx").read_bytes()) == []
                 assert needed_libraries((case / "app0/Media/Modules/Shared.prx.guest.prx").read_bytes()) == []
                 assert needed_libraries((case / "app0/Media/Plugins/Dynamic.prx.guest.prx").read_bytes()) == [

@@ -174,7 +174,7 @@ def main():
                     run(output)
                 else:
                     child = output.parent / 'app0/sce_module/consumer.prx.guest.prx'
-                    assert needed_libraries(child.read_bytes()) == ['$ORIGIN/renamed.prx.guest.prx']
+                    assert needed_libraries(child.read_bytes()) == ['$ORIGIN/renamed.prx.guest.prx', 'libkernel.prx'], needed_libraries(child.read_bytes())
 
             providers = {'one.prx': declared_provider(22, ('libGuest',)),
                          'two.prx': declared_provider(33, ('libGuest',), symbol='other')}

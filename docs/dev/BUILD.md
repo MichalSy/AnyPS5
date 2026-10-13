@@ -27,6 +27,7 @@ git submodule update --init --recursive
 ## Requirements
 
 - x86-64, Git, CMake 3.22.1 or newer, Ninja, C++20.
+- Linux display refresh queries require SDL's XRandR support (`libxrandr-dev` on Debian/Ubuntu; `libXrandr-devel` on Fedora). Bundled SDL configuration fails without it. Keep `SDL_X11_XRANDR` enabled.
 - Linux: GCC, G++, binutils. SDL's X11 backend requires X11 and Xext development headers (`libx11-dev` and `libxext-dev` on Debian/Ubuntu). Audio output needs SDL's PipeWire, PulseAudio or ALSA backend, built from their development files (`libpipewire-0.3-dev`, `libpulse-dev` and `libasound2-dev` on Debian/Ubuntu; `pipewire-devel`, `pulseaudio-libs-devel` and `alsa-lib-devel` on Fedora). SDL loads them at run time. Without any of them SDL keeps only its silent dummy and disk drivers, so configuration fails.
 - Fedora: if CMake reports `Could NOT find Threads`, install `glibc-static` and `libstdc++-static` with `sudo dnf install glibc-static libstdc++-static`, then rerun configuration. The project enables static executable linking, and FFmpeg's thread check needs these libraries.
 - Windows: only MinGW-w64 GCC 15.2.0 (WinLibs `x86_64-ucrt-posix-seh`, release `15.2.0posix-14.0.0-ucrt-r7`) is currently supported. Add its `mingw64/bin` directory to `PATH` before configuring.
@@ -62,7 +63,7 @@ Project switches accept `ON` or `OFF`:
 | `-DANYPS5_ENABLE_ASAN=ON`       | `OFF`   | Build with AddressSanitizer on Linux and move the guest arena out of ASan's shadow gap. |
 | `-DANYPS5_USE_SYSTEM_DEPS=ON`    | `OFF`   | Resolve SDL2, freetype, Vulkan-Headers, SPIRV-Headers, glslang and SPIRV-Tools from the system instead of the submodules. |
 | `-DAPS5_ENABLE_TIMING_LOG=ON`    | `OFF`   | Compile frame timing logging.                    |
-| `-DANYPS5_ENABLE_DEBUG_BRIDGE=ON` | `OFF`   | Include the optional FrameRift UDP connection. |
+| `-DAPS5_ENABLE_TRACY=ON`         | `OFF`   | Build the [Tracy](#tracy) profiler client into the agc driver. |
 | `-DAPS5_AGC_CREATE_LOG=OFF`      | `ON`    | Disable successful `sceAgcCreateShader` logging. |
 | `-DAGC_BUILD_VISUAL_TEST=ON`     | `OFF`   | Build the standalone AGC SPIR-V visual test.     |
 
@@ -93,60 +94,11 @@ ctest --test-dir build/write-watch --output-on-failure
 
 With `CMAKE_OSX_ARCHITECTURES=x86_64` Apple silicon runs the tests through Rosetta, which is how relinked titles run; without it they run natively. The full `BUILD_TESTING` build on macOS also registers them.
 
-## FrameRift debug bridge
+## Tracy
 
-Build with `ANYPS5_ENABLE_DEBUG_BRIDGE=ON` to include the connection worker in
-`libkernel.prx` and start it when the video output driver initializes. Rebuild the
-patched runtime libraries with `cmake --build build --target libs --parallel`.
-With the option off, no bridge worker or startup call is compiled.
+`-DAPS5_ENABLE_TRACY=ON` builds the [Tracy](https://github.com/wolfpld/tracy) 0.14.1 client from `3rdparty/tracy` as a shared library next to the patched `.prx` files (`libTracyClient.dll`, `libTracyClient.so.0.14.1` on Linux); copy it with them. Every `PerformanceTimer` scope of libSceAgcDriver and libSceVideoOut is a zone, every presented flip ends a frame, and the queue workers and the presenter are named threads. Connect the Tracy 0.14.1 profiler to `127.0.0.1`: the client listens only on localhost and records only while a profiler is connected. Sampling, system tracing, call stacks, code transfer and Tracy's crash handler are disabled. Without the flag nothing of Tracy is built.
 
-FrameRift supplies `FRAMERIFT_BRIDGE_HOST=127.0.0.1`, `FRAMERIFT_BRIDGE_PORT`,
-`FRAMERIFT_BRIDGE_SESSION` and `FRAMERIFT_GAME_ID` to its managed game. The port
-must be 1-65535 and both IDs must be nonempty UTF-8 strings of at most 128 bytes.
-Missing or invalid configuration leaves the bridge inactive. Set
-`APS5_DEBUG_BRIDGE=0` to disable a compiled bridge for a run.
-
-One independent worker sends a UDP v1 `hello` and one-second heartbeats from the
-same nonblocking loopback socket, periodically repeating `hello` for reconnection.
-It never waits for FrameRift. Normal runtime shutdown sends a best-effort
-`goodbye`; crashes and forced termination are detected by the receiver's timeout.
-An unavailable receiver does not stop the game or change existing logging.
-
-The bridge advertises `set_monitoring`, `resource_status` and `work_activity`. Monitoring starts
-off; the `set_monitoring` command accepts `{"enabled":true}` or `false`, acknowledges
-receipt and reports completion with enabled state and monitoring epoch. Main-output
-flip samples use a bounded nonblocking producer queue; saturation drops telemetry.
-Shader and resource counters are atomic and remain available when monitoring is
-off, so activation includes the current process caches. Bridge-disabled builds omit
-these hooks.
-
-`resource_status` independently reports preparation/optimization queues, active
-and completed translation/pipeline operations, retained shader variants and payload
-bytes, disk-cache counters, texture-cache accounting and the existing Vulkan heap
-budget sample. The worker coalesces changes to at most four resource packets per
-second and refreshes every five seconds. Linux process RSS is sampled on that worker
-at most once per second; it is unavailable on other platforms in this increment.
-GPU source age is separate from packet age. Cache accounting, CPU shader payload,
-process RSS and the driver heap estimate have different scopes and are not additive.
-The [FrameRift protocol](https://github.com/MichalSy/FrameRift/blob/main/docs/debug-bridge.md#shader-and-memory-resources)
-defines their units and nullable fields. Input commands, screenshots and game pause
-remain unavailable.
-
-`work_activity` adds eleven fixed work records to resource events: preparation,
-translation, specialization, pipeline build/optimization, shader-module creation,
-presentation/acquisition/idle/graphics synchronization, and queue submission.
-Each reports active calls and lifetime started/completed/failed counters, elapsed
-microseconds and the longest finished attempt. Short work remains observable even
-when its latest active gauge is zero. Producers only update atomics and query the
-monotonic clock; serialization and nonblocking UDP stay on the bridge worker.
-
-Durations are elapsed wall time, including waits, and are credited when an attempt
-finishes. Nested scopes overlap; they are not additive CPU usage or GPU execution
-time. Specialized-module preparation includes disk-cache lookup and SPIR-V
-optimization; idle can include retirement and synchronization. Instrumentation
-does not cover every thread, mutex, I/O operation, startup import probe or driver
-activity. FrameRift displays the actual observed delta window and labels unexplained
-missing frames as an unknown stall. Existing file logging is unchanged.
+On Windows MinGW frees `thread_local` objects before their destructors run, so the Tracy client is built without `thread_local` destructors and never destroys its event queue: a thread that emitted a zone and ended keeps its event blocks (2 MiB each) until the process exits.
 
 ## Compute pipeline replay
 
@@ -170,28 +122,25 @@ Each invocation creates one pipeline. With no `--cache-in`, its application pipe
 
 Set `APS5_PIPELINE_STATS=1` to capture and print driver statistics for each newly created graphics or compute pipeline. This requires `VK_KHR_pipeline_executable_properties` and `pipelineExecutableInfo`; an unsupported device fails with an error. Statistic names and units are driver-specific. Capturing statistics can increase pipeline compilation cost. The setting is disabled by default.
 
-## Guarded local game launch
+## Worker sampler
 
-The local root `run.sh` uses `tools/run_with_memory_guard.py` to launch Bomberman
-inside a systemd user memory cgroup on Linux. It requires cgroup v2 and an active
-systemd user manager; a failed setup does not fall back to an unguarded launch.
+Set `APS5_SAMPLE_WORKER=<file>` to sample queue worker 0 every millisecond (in practice every timer tick). Every 20 s and at exit it writes `<file>`, one `module offset self inclusive` line per sampled address, and `<file stem>.collapsed.txt`, the worker's whole stacks in the collapsed format that speedscope.app and flamegraph.pl read: one `frame;...;frame count` line per distinct stack, root first, each frame as `module+0xRVA`. A walk that ends before the thread's root starts with `[truncated]`. The `#` lines give the samples, the walk depth (64 frames), the truncated walks, the mean and longest time the worker was suspended, and the size and PE timestamp of each module, to check the binary a file is symbolized against. A frame with `.pdata` is stepped by `RtlVirtualUnwind`; any other frame by its DWARF record in `.ehfram`, the unwind data the libraries are built with. Those steps read only inside the worker's stack, and a module is indexed after the worker resumes, the first time a walk meets it.
 
-`ANYPS5_MEMORY_MAX_MIB` caps the game group, defaulting to 18432 MiB. The actual
-limit is the smaller of this cap and available RAM minus
-`ANYPS5_MEMORY_RESERVE_MIB`, which defaults to 4096 MiB. Limits apply to resident
-cgroup memory, including charged file and shared memory, rather than the large
-virtual guest address reservation. No CPU or memory-high throttling is applied.
+`APS5_SAMPLE_THREADS=<file>` samples every thread of the process every 2 ms and writes the 40 hottest addresses of each busy thread to `<file>`, 12 frames deep and through `.pdata` only. Both samplers exist only on Windows; the addresses are symbolized offline, for example with `nm` on the `.prx`.
 
-The guard samples memory once per second and stops its game group if available
-system RAM falls below the smaller of the reserve and 4096 MiB. A kernel cgroup
-OOM can also terminate the game at its hard limit. This limits test damage; it
-does not fix an allocation leak or guarantee stability under unrelated system
-memory pressure. Core dumps and swapping for the game group are disabled.
+## Performance trace
 
-`ANYPS5_MEMORY_LOG` selects a new JSONL output file; otherwise logs are written
-under `build/profiles/memory-guard/`. Logs record the cap, memory usage, cgroup
-memory categories and observed peak. Stop a guarded run with Ctrl+C or close its
-game window. Each launch computes its limit again.
+Set `APS5_TRACE_FRAMES=<start>:<count>` to record `<count>` presents from present `<start>` (counted from 0), or `APS5_TRACE_SECONDS=<start>:<length>` to record from the first present at least `<start>` seconds after the first present until the first present `<length>` seconds later. Both values are whole numbers and the length is above 0; a malformed value, or both switches together, fails the first present. The window opens and closes at presents.
+
+Inside the window the queue workers and the presenter record every `PerformanceTimer` scope and stage as a complete event named after its frame timing key: `Driver.WorkerWait`, `Driver.Packet`, `Driver.Packet.draw`, `Graphics.Draw`, `Driver.Present`, `Driver.Present.inflight_wait`, `Vulkan.Retire` and so on. A slice shorter than 20 us is only counted: its time is in the thread's counter `<thread> folded` (milliseconds per present) and in the summary. A thread writes a present's counter sample at its first slice after the next present, so the last present of the window has no sample; its time is still in the summary. Each thread allocates a buffer for 262,144 events when it starts; a full buffer stops that thread's recording and sets `trace_dropped`. When the window closes, the presenter formats the trace once and a `ProfileOutput` writer thread writes `aps5-trace-<commit>-<pid>.json.gz` (Chrome trace-event JSON, opened by ui.perfetto.dev or chrome://tracing) and appends one line to `aps5-summary.jsonl`, both in `APS5_TRACE_DIR` or the working directory. A window that is still open when the title exits writes nothing.
+
+The summary line has `commit` and `dirty` of the build, `env` (every `APS5_*` variable; a value containing `/` or `\` is written as `<path>`), `gpu`, `driver`, `os`, `resolution` (the video output's), `window`, `presents`, `frame_ms` (p50, p90, p99 and max of the intervals between presents), `gpu_busy_ms_per_present` (the batch timestamps behind `[present]`), `worker_busy_pct` (share of the window each queue worker spends in `Driver.Packet`, `Driver.Suspend`, `Driver.EndSubmission`, `Driver.Rewind` and `Driver.Completion`), `top_phases_ms_per_frame` (the eight largest scopes and stages, without `Driver.WorkerWait`), `trace_dropped` and `trace`. A trace holds timings, scope names, counts and thread names; no guest memory, paths or strings of the title.
+
+The shader preparation threads are traced as well, `shader prepare`, with a buffer for 32,768 events each. A wait for the GPU mutex on a traced thread is a `GpuMutex.wait.<site>` slice (`dispatch`, `draw`, `present`, `flush` and so on, as on the `[lock]` line).
+
+The `gpu` track holds one `batch` slice per recorder batch, from the batch's timestamp pair. With `APS5_PROFILE_GPU=1` it also holds a slice per command class range, under the class names of the `[gputime]` line (`draw`, `copy`, `fill`, `present-blit`, ...); program ranges are left out. The track keeps up to 262,144 ranges; more set `trace_dropped`. The GPU clock is mapped onto the CPU clock with calibrated timestamps (`VK_KHR_calibrated_timestamps` or the EXT version, enabled only when a trace switch is set) taken when the window opens and when it closes, so the two clocks are matched at both ends of the window. A batch is added when the driver reads its timestamps, after its fence signals, so the batches of the last frames of the window, which complete after it closes, are missing. Without calibrated timestamps the trace has no `gpu` track, and the `[trace]` line says so.
+
+With either switch set, the recorder writes a timestamp pair per batch for the whole run, as with `APS5_PROFILE_DRAW`. Without them, a `PerformanceTimer`, a GPU mutex acquisition and a read of batch timestamps each cost one more predictable branch.
 
 ## Driver thread priority
 
@@ -212,3 +161,14 @@ ctest --test-dir build/register-context --output-on-failure
 ```
 
 On Linux x86-64, omit `CMAKE_OSX_ARCHITECTURES`; the full `BUILD_TESTING` build also registers these tests. Apple silicon runs the x86-64 tests through Rosetta. They cover the unwinder's register transfer, not the complete macOS runtime or guest exception handling.
+
+## FrameRift runtime bridge
+
+Configure with `-DANYPS5_ENABLE_DEBUG_BRIDGE=ON` when FrameRift needs runtime
+frame, shader and resource telemetry. The bridge is optional; ordinary builds
+retain the same runtime behavior without the telemetry exports. Use the checkout
+runtime and relinker directly rather than installing another copy.
+
+The relinker accepts `--recursive-module-search` for native game modules outside
+the usual module directories. It uses the upstream ELF signature validation and
+converter, skips metadata/fakelib directories, and preserves original game files.

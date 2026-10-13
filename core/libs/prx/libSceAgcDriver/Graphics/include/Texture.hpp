@@ -34,8 +34,6 @@ struct HostImport;
 VkFormat StorageFormatForGuest(const Context& context, std::uint32_t guestFormat);
 // Whether StorageFormatForGuest would succeed, without throwing (unknown guest formats included).
 bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat);
-// Whether a storage image of the guest format takes DCC clear `keys` as a GPU clear (see
-// StorageTexture::upload); false for integer formats and non-clear keys.
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys);
 std::uint64_t SampledTextureMemory();
 bool ClearKeepsDenormals(const Context& context, VkFormat format);
@@ -64,12 +62,12 @@ public:
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
     // CanCopyFrom says whether the two descriptors address the same surface compatibly.
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
-    Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, std::uint32_t baseLevel = 0, std::uint32_t levelCount = 1);
+    Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D, std::uint32_t baseLevel = 0, std::uint32_t levelCount = 1);
     struct DepthCopyTag {};
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag);
     static VkFormat DepthCopyFormat(VkFormat colorFormat);
     static bool CanDepthCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
-    bool IsDepthCopy() const { return depthCopy; }
+    bool IsDepthCopy() const { return perUseCopy == PerUseCopy::RefreshedOnReuse; }
     bool RefreshDepthCopy();
     struct DepthCopyCounts {
         std::uint64_t textures;
@@ -102,6 +100,10 @@ public:
     // the source image's own (snapshots, views over other metadata); one per cache entry, so every
     // object binding the texture shares it. Under GuestMemory::GpuMutex only.
     DccKeyProof& KeyProof() const { return keyProof; }
+    enum class PerUseCopy : std::uint8_t { None, RefreshedOnReuse, RemadePerUse };
+    PerUseCopy CopyKind() const { return perUseCopy; }
+    bool RefreshedPerUse() const { return perUseCopy == PerUseCopy::RemadePerUse; }
+    void MarkRefreshedPerUse() { perUseCopy = PerUseCopy::RemadePerUse; }
 
 private:
     void release() noexcept;
@@ -128,7 +130,7 @@ private:
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;
-    bool depthCopy = false;
+    PerUseCopy perUseCopy = PerUseCopy::None;
     bool copiedOnce = false;
     std::uint64_t copiedVersion = 0;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
@@ -164,7 +166,7 @@ public:
     // Render targets live in the same images: draws attach mip 0 through a view of the color
     // buffer's format and mark the image dirty like a storage write.
     bool Attachable() const { return attachable; }
-    VkImageView AttachmentView(VkFormat format, std::uint32_t mip = 0, std::uint32_t depthSlice = 0, std::uint32_t layer = 0, std::uint32_t layerCount = 1);
+    VkImageView AttachmentView(VkFormat format, std::uint32_t mip = 0, std::uint32_t depthSlice = 0, std::uint32_t layers = 1, std::uint32_t layer = 0);
     VkImageView AttachmentProxyView();
     void RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
     void RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
@@ -322,7 +324,7 @@ public:
     // GuestMemory::GpuMutex only, as Refresh is; never from a build's stage A.
     DccKeys UploadedKeys() const { return uploadedKeys; }
     DccKeys FilledKeys() const { return filledKeys; }
-    bool GuestSnapshotValid() const { return originalValid; }
+    bool GuestSnapshotValid() const { return originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); }
     DccKeyProof& KeyProof() const { return keyProof; }
     DccRangeProof& TargetKeyProof() const { return targetKeyProof; }
     DccKeys ProvedKeys() const;
@@ -350,6 +352,7 @@ private:
     void upload(const std::vector<bool>* layers = nullptr);
     void invalidateOriginal();
     void captureGuestBytes(const std::vector<bool>* layers);
+    bool originalHolds(std::uint64_t address, std::size_t bytes) const;
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
     // each, 64 KiB blocks the CPU wrote since the layer's generation keep the CPU's bytes. Block
@@ -563,7 +566,7 @@ private:
     bool dirty = false;
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
-    bool originalValid = true;
+    std::vector<bool> layerOriginal;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
