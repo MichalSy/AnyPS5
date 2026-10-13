@@ -522,8 +522,8 @@ void SampledSnapshotTest(const Context& context) {
         AgcDriver::GuestMemory::BumpCollectEpoch();
         Require(!AgcDriver::GuestMemory::Watched(address, Block), "the sampled snapshot oracle remains watched");
         changed = lookup();
-        Require(changed != texture && sampler.RedBits(*changed) == std::bit_cast<std::uint32_t>(0.5f),
-            "loss of write watching did not rebuild the sampled snapshot with its current GPU pixels");
+        Require(changed == texture && sampler.RedBits(*changed) == std::bit_cast<std::uint32_t>(0.5f),
+            "loss of write watching did not validate the unchanged snapshot against its retained bytes");
         texture = std::move(changed);
     }
     Require(lookup() == texture, "an unchanged untracked sampled snapshot was rebuilt");
@@ -799,9 +799,12 @@ void StorageRoundTripTest(const Context& context, bool keepCached, bool clearPen
         Require(rebound != nullptr && sampler.RedBits(*rebound) == std::bit_cast<std::uint32_t>(writtenDepth),
             "rebinding depth did not import the retained storage writer's GPU pixel bits");
     }
-    if (!keepCached) Require(retained.expired(), "a completed depth rebind retained the consumed storage writer");
+    if (!keepCached) {
+        const auto plane = retained.lock();
+        Require(plane != nullptr && !plane->PendingWrites(), "a completed depth rebind left pending writes in its cached depth plane");
+    }
     if (keepCached) {
-        Require(writer->Cached(), "the depth writer left the storage cache before the coherence check");
+        Require(!retained.expired(), "the depth plane cache lost its storage image before the coherence check");
         target.clearDepth = 0.5f;
         if (!clearPendingWriter) DepthSurfaceView(context, target);
         const auto beforeClear = AgcDriver::GuestMemory::CollectWrites(memory.Address(), DepthSliceBytes(Extent, 4));
@@ -821,13 +824,8 @@ void StorageRoundTripTest(const Context& context, bool keepCached, bool clearPen
 
     auto replacement = View(Extent.width / 4, Extent.height / 4, memory.Address());
     replacement.format = 29; // R16G16_SFLOAT in a smaller linear buffer at the reused address.
-    bool refused = false;
-    try {
-        CachedStorageSurface(context, replacement);
-    } catch (const std::runtime_error& error) {
-        refused = std::string(error.what()).find("is not implemented") != std::string::npos;
-    }
-    Require(refused && DepthSurfaceAt(target.address), "an incompatible storage view discarded current GPU depth pixels without newer guest writes");
+    const auto unrelated = CachedStorageSurface(context, replacement);
+    Require(unrelated != nullptr && DepthSurfaceAt(target.address), "an ordinary storage view discarded current GPU depth pixels without newer guest writes");
     if (skipClearBind) rebound = Sample(context, resource);
     if (keepCached) Require(sampler.RedBits(*rebound) == std::bit_cast<std::uint32_t>(target.clearDepth),
         "an older cached storage writer replaced the newer native depth clear");
@@ -843,6 +841,10 @@ void StorageRoundTripTest(const Context& context, bool keepCached, bool clearPen
         std::uint32_t value;
         std::memcpy(&value, replacementReadback.Bytes().data() + offset, sizeof(value));
         Require(value == replacementPixel, "retiring a reused depth address replaced newer guest pixels with stale depth bits");
+    }
+    if (!keepCached) {
+        ClearDepthSurfaces(context.device);
+        Require(retained.expired(), "clearing depth surfaces retained an unused storage plane");
     }
 }
 

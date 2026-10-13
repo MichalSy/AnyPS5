@@ -10,6 +10,8 @@ and file-based pad input are not enabled on main.
 - The queue-idle publication policy uses upstream's 50 ms quiet interval.
 - Texture snapshots use upstream's layer validity and import-watch handling;
   the old scalar validity/maybe-written comparison optimization is removed.
+  Sampled snapshots retain upstream's CPU comparison bytes; discarding them made
+  empty byte comparisons incorrectly reuse stale GPU pixels.
 - CMASK unknown-code handling follows upstream's expanded interpretation.
   Temporary invalid-code diagnostics are removed.
 - Recursive ELF discovery uses upstream's signature checks and converter.
@@ -49,9 +51,16 @@ including the complete graphics suite, actual NID-patched libraries, descriptor
 number collision, canonical aliases, queued CMASK, depth plane sampling/storage,
 shader caches, zero-stride fetch, idle publication and recursive module loading.
 
-Two additional suites remain failing: `agc_driver_depth_mips` does not recognize
-a new CPU write beyond the selected mip footprint, and
-`agc_driver_depth_surface_last_writer` does not replace a watched sampled
-snapshot after a CPU write. These checks remain enabled. Their failures prevent
-claiming that all memory/rendering behavior or Sackboy rendering is correct.
+The complete `agc_driver_depth_mips` and
+`agc_driver_depth_surface_last_writer` suites pass. Native MSAA depth sampling
+uses matching image views; mismatched sample counts/extents remain rejected.
+Plain depth arrays use the existing array storage path, while unsupported
+combined depth/stencil array views retain upstream validation. Tests follow
+upstream plane-cache ownership and byte-based snapshot validation, and check
+GPU pixels, pending writes and plane release on cache teardown.
+
+An additional general `guest_memory` check fails its application-area boundary
+assertion in `CheckFixedMappingsReachTheApplicationAreaEnd`; this is outside these graphics
+changes. Complete memory/rendering correctness and Sackboy rendering remain
+unverified.
 Linux was validated; a native Windows build and game smoke tests were not run.

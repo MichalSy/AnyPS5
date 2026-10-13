@@ -374,7 +374,6 @@ public:
         key[10] = components.b;
         key[11] = components.a;
         if (const auto found = textures.find(key); found != textures.end()) return found->second;
-        Require(target.samples == 1, "sampling a multisampled depth surface is not implemented");
         const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
         if (!SampledAccepts(words, resource)) {
             char text[448];
@@ -995,6 +994,8 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     const auto& base = (*found)->target;
     const auto format = ResolveTextureFormat(resource.format);
     const auto extent = surfaceExtent(base);
+    Require(base.samples == VK_SAMPLE_COUNT_1_BIT || (*found)->SampledAccepts(words, resource),
+        "sampling this depth view requires multisampled texture materialization");
     if (resource.width != extent.width || resource.height != extent.height) {
         if ((*found)->OverwrittenInMemory()) (*found)->Retire();
         return nullptr;
@@ -1239,9 +1240,10 @@ std::shared_ptr<StorageTexture> DepthSurfaceStorage(const Context& context, std:
         if (ResolveTextureFormat(resource.format) != expected && !depthBits) return nullptr;
         Require(stencil || surface->hostFormat == target.format, "storage access to a depth plane stored as another host depth format is not implemented");
         Require(target.samples == 1u, "storage image access to a multisampled depth surface is not implemented");
-        // Full mip chains and canonical aliases retain the established storage path.
+        // Full mip chains and arrays retain the established storage path.
         if (target.mipCount != 1u) return nullptr;
-        if (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray != 0 && surface->CanonicalResource(stencil)) return nullptr;
+        if (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray != 0 &&
+            (target.stencilAddress == 0 || surface->CanonicalResource(stencil))) return nullptr;
         Require(mip == 0 && resource.mipCount == 1 && resource.baseLevel == 0 && resource.lastLevel == 0 && resource.baseArray == 0 &&
             (resource.dimension == TextureDimension::k2D || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray == 0)) && target.samples == 1u,
             "storage image access to depth/stencil surface: this view is not implemented");

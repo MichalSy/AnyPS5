@@ -731,9 +731,6 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
         }
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
-        // Clear snapshots are validated by their keys; watched snapshots by stamps. The upload
-        // owns its staging bytes. Only untracked, uncompressed memory needs a CPU comparison copy.
-        if (*keys != DccKeys::Uncompressed || (generation != 0 && GuestMemory::Watched(address, bytes))) std::vector<std::byte>().swap(entry.bytes);
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
