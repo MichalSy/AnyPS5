@@ -2372,7 +2372,10 @@ void CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const bool labels = Recorder::PendingCompletionLabels() != 0;
     if ((context.copiedWriters == nullptr || context.copiedWriters->empty()) && drawWriters->empty() && !labels) return;
     if (!recorder->PendingWriteOverlaps(address, bytes)) return;
-    if (labels && recorder->PendingLabelIn(address, bytes)) {
+    // The process-wide count can belong to another range or a deferred interrupt.
+    // Labels already stored by the GPU remain GPU-ordered unless CPU completion
+    // must restore their bytes after a copied writer.
+    if (labels && recorder->CompletionLabelIn(address, bytes)) {
         Recorder::CountSync(4);
         recorder->SyncThrough(address, bytes);
         return;

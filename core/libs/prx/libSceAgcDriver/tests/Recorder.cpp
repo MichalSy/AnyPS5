@@ -458,6 +458,20 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     update(direct, 2);
     recorder.Sync();
     Require(*block == 45, "direct consumers lost GPU-ordered updates");
+    // An unrelated CPU label must not turn an already GPU-stored label into a
+    // CPU dependency merely because the process-wide completion count is nonzero.
+    alignas(64) static std::uint32_t unrelatedLabel = 0;
+    update(direct, 1);
+    const std::uint32_t gpuLabel = 46;
+    recorder.AfterCompletions(address, std::as_bytes(std::span(&gpuLabel, 1)), 1001, 0, true);
+    recorder.AfterCompletions(reinterpret_cast<std::uint64_t>(&unrelatedLabel), std::as_bytes(std::span(&label, 1)), 1002, 0, false);
+    const auto labelSubmissions = recorder.Submissions();
+    CompletePendingCpuWrites(context, address, sizeof(*block));
+    Require(recorder.Submissions() == labelSubmissions && *block == 45, "an unrelated CPU label forced a wait for a GPU-only label");
+    recorder.Sync();
+    Require(*block == 46 && unrelatedLabel == 40, "GPU and CPU label completion changed each other's values");
+    *block = 45;
+    AgcDriver::GuestMemory::MarkWritten(address, sizeof(*block));
     {
         TextureDetiler detiler(context);
         auto imageContext = context;

@@ -43,6 +43,8 @@ and file-based pad input are not enabled on main.
   later GPU resource uses those direct writes; their recorded hazards remain.
   Whole-heap address-table requests wait through the overlapping copied output
   ranges, preserving unrelated later GPU batches instead of draining the heap.
+  A pending CPU label or interrupt elsewhere does not force CPU completion of
+  labels already stored by the GPU in the requested range.
 - Retired depth surfaces no longer validate or consume storage writes to their
   former memory. Retained views stay alive for recorded work without restoring
   depth ownership over memory reused for another resource.
