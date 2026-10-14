@@ -276,7 +276,8 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if (descriptor.dwordCount != 4u) fail("buffer specialization requires four descriptor words");
         const auto& buffer = info.buffers[index];
         if (buffer.gpuDescriptorOnly) {
-            plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, descriptor.dwords[3]});
+            const auto word3 = (descriptor.dwords[3] >> 30u) != 0u ? 1u << 30u : descriptor.dwords[3];
+            plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, word3});
             continue;
         }
         const auto format = (descriptor.dwords[3] >> 12u) & 0x7fu;

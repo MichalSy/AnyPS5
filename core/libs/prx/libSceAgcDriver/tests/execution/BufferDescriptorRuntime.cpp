@@ -142,27 +142,33 @@ void ConditionalDescriptor() {
         {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))},
         {tableAddress, std::as_bytes(std::span(table, 4))},
     }};
-    enum class Scenario { Valid, SkippedInvalid, UsedInvalid };
-    for (const auto mode : {Scenario::Valid, Scenario::SkippedInvalid, Scenario::UsedInvalid}) {
+    enum class Scenario { Valid, SkippedInvalid, UsedInvalid, InvalidTypeA, InvalidTypeB };
+    std::vector<std::uint32_t> invalidTypeModule;
+    for (const auto mode : {Scenario::Valid, Scenario::SkippedInvalid, Scenario::UsedInvalid, Scenario::InvalidTypeA, Scenario::InvalidTypeB}) {
         std::fill_n(output, Lanes, Fill);
         auto descriptor = BufferDescriptor(input, Lanes * 4u);
         if (mode == Scenario::SkippedInvalid) descriptor = {0x2f7c2c7bu, 0x3bcf2fb5u, 0x2f5a2c65u, 0x3bb72f96u};
         if (mode == Scenario::UsedInvalid) descriptor[3] = (descriptor[3] & ~(0x7fu << 12u)) | (114u << 12u);
+        if (mode == Scenario::InvalidTypeA) descriptor[3] = 0x42485d80u;
+        if (mode == Scenario::InvalidTypeB) descriptor[3] = 0x60e98f40u;
         std::copy(descriptor.begin(), descriptor.end(), table);
         userData[10] = mode == Scenario::SkippedInvalid ? 0u : 1u;
         auto request = Request(userData, device->ComputeTarget(Lanes), memory, code);
         request.useCache = false;
         const auto shader = ShaderRecompiler::Recompile(request);
+        if (mode == Scenario::InvalidTypeA) invalidTypeModule = shader.spirv.Copy();
+        if (mode == Scenario::InvalidTypeB) Require(shader.spirv.Copy() == invalidTypeModule, "changing an invalid conditional descriptor type payload created another shader module");
+        const bool invalid = mode == Scenario::UsedInvalid || mode == Scenario::InvalidTypeA || mode == Scenario::InvalidTypeB;
         bool faulted = false;
         try {
             device->Dispatch(shader, 1, 1, 1);
             device->WaitIdle();
         } catch (const std::runtime_error& error) {
             const std::string message(error.what());
-            if (mode != Scenario::UsedInvalid || message.find("BDA access failed") == std::string::npos || message.find("reason=8") == std::string::npos) throw;
+            if (!invalid || message.find("BDA access failed") == std::string::npos || message.find("reason=8") == std::string::npos) throw;
             faulted = true;
         }
-        if (mode == Scenario::UsedInvalid) {
+        if (invalid) {
             Require(faulted || std::all_of(output, output + Lanes, [](auto value) { return value == Fill; }),
                 "an executed invalid conditional descriptor continued to write after its GPU fault");
             continue;
