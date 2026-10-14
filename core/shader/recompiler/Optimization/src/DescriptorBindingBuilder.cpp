@@ -275,11 +275,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         const auto& descriptor = snapshot.buffers.at(index);
         if (descriptor.dwordCount != 4u) fail("buffer specialization requires four descriptor words");
         const auto& buffer = info.buffers[index];
-        if (buffer.gpuDescriptorOnly) {
-            const auto word3 = (descriptor.dwords[3] >> 30u) != 0u ? 1u << 30u : descriptor.dwords[3];
-            plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, word3});
-            continue;
-        }
+        if (buffer.gpuDescriptorOnly) continue;
         const auto format = (descriptor.dwords[3] >> 12u) & 0x7fu;
         const bool present = descriptor.dwords[2] != 0u && (descriptor.dwords[0] != 0u || (descriptor.dwords[1] & 0xffffu) != 0u);
         if (buffer.descriptorFormatted && (format > static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float) || (present && format == 0u))) fail("buffer specialization has an unsupported format");

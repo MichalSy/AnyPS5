@@ -1348,7 +1348,6 @@ IrResourcePlan handBuiltPlan() {
     every.planningOnly = true;
     every.coherent = true;
     every.gpuDescriptor = true;
-    every.gpuDescriptorOnly = true;
     every.flushDenormals = true;
     plan.memoryInfo = {memory, every, MemoryInfo{}};
     DescriptorSource buffer;

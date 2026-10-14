@@ -60,7 +60,7 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
     const bool runtime = memory.gpuDescriptor || state.registrationModules;
     const auto first = PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords;
     const auto word1 = runtime ? context.Arg(*handle, 1u) : state.module.SpecializationConstant(TypeU32(state), first, 0u);
-    const bool runtimeFormat = (memory.gpuDescriptor && !memory.gpuDescriptorOnly) || (state.registrationModules && !state.program.Info().buffers.at(memory.resource).descriptorFormatted);
+    const bool runtimeFormat = memory.gpuDescriptor || (state.registrationModules && !state.program.Info().buffers.at(memory.resource).descriptorFormatted);
     const auto word3 = runtimeFormat ? context.Arg(*handle, 3u) : state.module.SpecializationConstant(TypeU32(state), first + 1u, 0u);
     const auto u32 = TypeU32(state);
     auto base = ConstantU32(state, 0u);
@@ -505,7 +505,7 @@ std::uint32_t formattedGpuCall(SpirvValueEmitContext& context, const IrValue& in
     const bool stops = state.bdaStopsInvocations;
     const auto valueType = components == 1u ? u32 : TypeU32Composite(state, components);
     const auto resultType = stops ? (store ? u32 : state.module.Type(spv::OpTypeStruct, valueType, u32)) : (store ? state.module.Type(spv::OpTypeVoid) : valueType);
-    const std::array<std::uint32_t, 7> key{components, store ? 1u : 0u, memory.d16 ? 1u : 0u, memory.coherent ? 1u : 0u, static_cast<std::uint32_t>(memory.kind), stops ? 1u : 0u, memory.gpuDescriptorOnly ? memory.resource + 1u : 0u};
+    const std::array<std::uint32_t, 6> key{components, store ? 1u : 0u, memory.d16 ? 1u : 0u, memory.coherent ? 1u : 0u, static_cast<std::uint32_t>(memory.kind), stops ? 1u : 0u};
     auto function = state.formattedGpuBufferFunctions.find(key);
     if (function == state.formattedGpuBufferFunctions.end()) {
         const auto id = state.module.AllocateId();
@@ -536,8 +536,7 @@ std::uint32_t formattedGpuCall(SpirvValueEmitContext& context, const IrValue& in
         const auto zero = components == 1u ? ConstantU32(state, 0u) : ConstantU32CompositeZero(state, components);
         if (stops) state.bdaStopValue = store ? ConstantU32(state, 1u) : state.module.Constant(spv::OpConstantComposite, resultType, zero, ConstantU32(state, 1u));
         state.bdaPcOverride = parameters[9];
-        const auto word3 = memory.gpuDescriptorOnly ? state.module.SpecializationConstant(u32, PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords + 1u, 0u) : parameters[3];
-        const RuntimeDescriptor shared{parameters[0], parameters[1], parameters[2], word3, parameters[4], parameters[5], parameters[6], parameters[7], parameters[8]};
+        const RuntimeDescriptor shared{parameters[0], parameters[1], parameters[2], parameters[3], parameters[4], parameters[5], parameters[6], parameters[7], parameters[8]};
         const auto value = formatSwitch(context, instruction, shared, components, store, store ? parameters[10] : 0u);
         if (!stops && store) {
             state.module.AddFunction(spv::OpReturn);

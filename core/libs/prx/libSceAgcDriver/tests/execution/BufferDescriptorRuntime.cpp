@@ -142,11 +142,13 @@ void ConditionalDescriptor() {
         {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))},
         {tableAddress, std::as_bytes(std::span(table, 4))},
     }};
-    enum class Scenario { Valid, SkippedInvalid, UsedInvalid, InvalidTypeA, InvalidTypeB };
+    enum class Scenario { Valid, ZeroSelectors, SkippedInvalid, UsedInvalid, InvalidTypeA, InvalidTypeB };
+    std::vector<std::uint32_t> validModule;
     std::vector<std::uint32_t> invalidTypeModule;
-    for (const auto mode : {Scenario::Valid, Scenario::SkippedInvalid, Scenario::UsedInvalid, Scenario::InvalidTypeA, Scenario::InvalidTypeB}) {
+    for (const auto mode : {Scenario::Valid, Scenario::ZeroSelectors, Scenario::SkippedInvalid, Scenario::UsedInvalid, Scenario::InvalidTypeA, Scenario::InvalidTypeB}) {
         std::fill_n(output, Lanes, Fill);
         auto descriptor = BufferDescriptor(input, Lanes * 4u);
+        if (mode == Scenario::ZeroSelectors) descriptor[3] = 0x18004000u;
         if (mode == Scenario::SkippedInvalid) descriptor = {0x2f7c2c7bu, 0x3bcf2fb5u, 0x2f5a2c65u, 0x3bb72f96u};
         if (mode == Scenario::UsedInvalid) descriptor[3] = (descriptor[3] & ~(0x7fu << 12u)) | (114u << 12u);
         if (mode == Scenario::InvalidTypeA) descriptor[3] = 0x42485d80u;
@@ -156,6 +158,8 @@ void ConditionalDescriptor() {
         auto request = Request(userData, device->ComputeTarget(Lanes), memory, code);
         request.useCache = false;
         const auto shader = ShaderRecompiler::Recompile(request);
+        if (mode == Scenario::Valid) validModule = shader.spirv.Copy();
+        if (mode == Scenario::ZeroSelectors) Require(shader.spirv.Copy() == validModule, "changing a valid conditional descriptor format created another shader module");
         if (mode == Scenario::InvalidTypeA) invalidTypeModule = shader.spirv.Copy();
         if (mode == Scenario::InvalidTypeB) Require(shader.spirv.Copy() == invalidTypeModule, "changing an invalid conditional descriptor type payload created another shader module");
         const bool invalid = mode == Scenario::UsedInvalid || mode == Scenario::InvalidTypeA || mode == Scenario::InvalidTypeB;
