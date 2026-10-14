@@ -283,6 +283,31 @@ void RuntimeStoreFormats() {
             device->WaitIdle();
             Require(std::memcmp(actual, expected, Lanes * 16u + 16u) == 0, "runtime formatted store differs at NUM_RECORDS boundary");
             Require(std::all_of(actual + (Lanes - 1u) * 16u, actual + Lanes * 16u + 16u, [](std::byte value) { return value == std::byte{0xcd}; }), "out-of-range runtime formatted store performed a partial write");
+            for (const auto misalignment : {1u, 2u, 3u}) {
+                std::memset(actual, 0xcd, Lanes * 16u + 16u);
+                std::memset(expected, 0xcd, Lanes * 16u + 16u);
+                *formatWord = 0x31042facu; // Four SNORM16 components, including negative values.
+                const auto unalignedActual = BufferDescriptor(actual + misalignment, Lanes * 16u);
+                std::copy(unalignedActual.begin(), unalignedActual.end(), userData.begin());
+                userData[3] = *formatWord;
+                auto unalignedRequest = Request(userData, device->ComputeTarget(Lanes), {}, runtimeCode);
+                unalignedRequest.useCache = false;
+                const auto unalignedShader = ShaderRecompiler::Recompile(unalignedRequest);
+                // The specialized reference requires an element-aligned base. Compare its
+                // aligned bytes with the runtime path's shifted bytes and untouched prefix.
+                const auto unalignedExpected = BufferDescriptor(expected, Lanes * 16u);
+                std::copy(unalignedExpected.begin(), unalignedExpected.end(), userData.begin());
+                userData[3] = *formatWord;
+                auto referenceRequest = Request(userData, device->ComputeTarget(Lanes), {}, referenceCode);
+                referenceRequest.useCache = false;
+                const auto referenceShader = ShaderRecompiler::Recompile(referenceRequest);
+                device->Dispatch(referenceShader, 1, 1, 1);
+                device->WaitIdle();
+                device->Dispatch(unalignedShader, 1, 1, 1);
+                device->WaitIdle();
+                Require(std::memcmp(actual + misalignment, expected, Lanes * 16u + 8u) == 0, "runtime SNORM16 store differs at base alignment " + std::to_string(misalignment));
+                Require(std::all_of(actual, actual + misalignment, [](std::byte value) { return value == std::byte{0xcd}; }), "runtime SNORM16 store modified bytes before its unaligned base");
+            }
         }
     }
 }

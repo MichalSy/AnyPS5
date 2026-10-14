@@ -538,6 +538,7 @@ std::uint32_t genericFormattedStore(SpirvValueEmitContext& context, const IrValu
     const auto values = storeValues(state, data, components);
     EmitIfCondition(state, inBounds, [&] {
         auto packedValue = constant(0u);
+        std::array<std::uint32_t, 4> encodedValues{};
         for (std::uint32_t component = 0; component < 4u; ++component) {
             auto encoded = constant(0u);
             if (component < components) {
@@ -554,10 +555,24 @@ std::uint32_t genericFormattedStore(SpirvValueEmitContext& context, const IrValu
             const auto mask = Binary(state, spv::OpShiftRightLogical, u32, constant(0xffffffffu), shift);
             const auto bitOffset = Select(state, u32, packed, field(state, bitOffsets, component * 8u, 8u), constant(0u));
             packedValue = EmitOrU32(state, packedValue, Binary(state, spv::OpShiftLeftLogical, u32, Binary(state, spv::OpBitwiseAnd, u32, encoded, mask), bitOffset));
-            EmitIfCondition(state, both(state, active[component], Unary(state, spv::OpLogicalNot, boolean, packed)), [&] {
-                EmitIfCondition(state, equal(state, bits[component], constant(8u)), [&] { writeBuffer(context, instruction, addresses[component].guest, encoded, 8u); });
-                EmitIfCondition(state, equal(state, bits[component], constant(16u)), [&] { writeBuffer(context, instruction, addresses[component].guest, encoded, 16u); });
-                EmitIfCondition(state, equal(state, bits[component], constant(32u)), [&] { writeBuffer(context, instruction, addresses[component].guest, encoded, 32u); });
+            encodedValues[component] = encoded;
+        }
+        for (std::uint32_t first = 0; first < 4u; first += 2u) {
+            const auto second = first + 1u;
+            const auto adjacent = Binary(state, spv::OpIEqual, boolean, addresses[second].guest, Binary(state, spv::OpIAdd, TypeScalarU64(state), addresses[first].guest, BdaConstant(state, 2u)));
+            const auto pair = both(state, both(state, active[second], Unary(state, spv::OpLogicalNot, boolean, packed)), both(state, adjacent, both(state, equal(state, bits[first], constant(16u)), equal(state, bits[second], constant(16u)))));
+            EmitIfCondition(state, pair, [&] {
+                EmitBdaHalfwordPairWrites(context, instruction, addresses[first].guest, encodedValues[first], encodedValues[second]);
+            });
+            EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, pair), [&] {
+                for (std::uint32_t component = first; component <= second; ++component) {
+                    EmitIfCondition(state, both(state, active[component], Unary(state, spv::OpLogicalNot, boolean, packed)), [&] {
+                        const auto encoded = encodedValues[component];
+                        EmitIfCondition(state, equal(state, bits[component], constant(8u)), [&] { writeBuffer(context, instruction, addresses[component].guest, encoded, 8u); });
+                        EmitIfCondition(state, equal(state, bits[component], constant(16u)), [&] { writeBuffer(context, instruction, addresses[component].guest, encoded, 16u); });
+                        EmitIfCondition(state, equal(state, bits[component], constant(32u)), [&] { writeBuffer(context, instruction, addresses[component].guest, encoded, 32u); });
+                    });
+                }
             });
         }
         EmitIfCondition(state, packed, [&] { writeBuffer(context, instruction, addresses[0].guest, packedValue); });

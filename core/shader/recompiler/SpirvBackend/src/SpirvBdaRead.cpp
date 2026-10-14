@@ -470,6 +470,37 @@ void EmitBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t
     });
 }
 
+void EmitBdaHalfwordPairWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t low, std::uint32_t high) {
+    auto& state = ctx.state;
+    const auto separate = [&] {
+        EmitBdaWrite(ctx, inst, address, low, 16u);
+        EmitBdaWrite(ctx, inst, AddBdaImmediate(ctx, inst, address, 2), high, 16u);
+    };
+    if (state.bdaWriteProbeFunction == 0u) {
+        separate();
+        return;
+    }
+    // A non-faulting probe lets split mappings keep their byte-wise stores and faults. Only
+    // a complete aligned writable span is combined; neighbouring bytes are never touched.
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto instruction = BdaInstructionPc(state, inst);
+    const auto physical = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaWriteProbeFunction, address, ConstantU32(state, 4u), instruction);
+    const auto mapped = Binary(state, spv::OpINotEqual, boolean, physical, BdaConstant(state, 0u));
+    const auto aligned = Binary(state, spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, BdaAddressUnaligned(state, address)), Unary(state, spv::OpLogicalNot, boolean, BdaAddressUnaligned(state, physical)));
+    const auto combined = Binary(state, spv::OpLogicalAnd, boolean, mapped, aligned);
+    EmitIfCondition(state, combined, [&] {
+        const auto u32 = TypeU32(state);
+        const auto packed = Binary(state, spv::OpBitwiseOr, u32, Binary(state, spv::OpBitwiseAnd, u32, low, ConstantU32(state, 0xffffu)), Binary(state, spv::OpShiftLeftLogical, u32, high, ConstantU32(state, 16u)));
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, physical);
+        state.module.AddFunction(spv::OpStore, pointer, packed, BdaAccessMask(state, inst), 4u);
+        state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.bdaNoteWriteFunction, address);
+    });
+    EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, combined), separate);
+}
+
 void DefineBdaByteWriteFunctions(SpirvEmitterState& state) {
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
