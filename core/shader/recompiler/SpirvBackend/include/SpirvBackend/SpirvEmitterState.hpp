@@ -204,6 +204,7 @@ struct SpirvValueEmitContext {
 
     SpirvEmitterState& state;
     std::unordered_map<const IrValue*, std::uint32_t> definitions;
+    std::unordered_set<const IrValue*> batchedScalarReads;
     std::uint32_t scratchU32Variable = 0;
     SpirvValueEmitContext* otherHalf = nullptr;
     std::uint32_t half = 0;

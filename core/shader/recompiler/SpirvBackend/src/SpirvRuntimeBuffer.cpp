@@ -652,6 +652,39 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
     return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
 }
 
+std::uint32_t EmitRuntimeScalarBufferLoads(SpirvValueEmitContext& context, std::span<const IrValue* const> instructions) {
+    auto& state = context.state;
+    const auto& first = *instructions.front();
+    const auto count = static_cast<std::uint32_t>(instructions.size());
+    const auto resource = descriptor(context, first);
+    const auto u64 = TypeScalarU64(state);
+    const auto size =
+        Select(state, u64, equal(state, resource.stride, ConstantU32(state, 0u)), Unary(state, spv::OpUConvert, u64, resource.records),
+               Binary(state, spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, resource.stride), Unary(state, spv::OpUConvert, u64, resource.records)));
+    const auto dynamic = context.Arg(first, 1u);
+    const auto address = EmitAddU32(state, dynamic, ConstantU32(state, context.Memory(first).offset));
+    const auto last = EmitAddU32(state, address, ConstantU32(state, (count - 1u) * 4u));
+    const auto noCarry = both(state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address, dynamic),
+                              Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), last, address));
+    const auto byte = EmitAndConstant(state, address, ~3u);
+    const auto offset = Unary(state, spv::OpUConvert, u64, byte);
+    const auto inBounds =
+        both(state, noCarry,
+             both(state, resource.valid,
+                  Binary(state, spv::OpULessThanEqual, TypeBool(state), Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, count * 4u)), size)));
+    return EmitValueIfElse(
+        state, inBounds, TypeU32Composite(state, count),
+        [&] {
+            return composite(state, count, EmitBdaDwordReads(context, first, AddBdaAddress(context, first, resource.base, offset, false), 0u, count, true));
+        },
+        [&] {
+            std::array<std::uint32_t, 4> values{};
+            for (std::uint32_t component = 0; component < count; ++component)
+                values[component] = EmitRuntimeScalarBufferLoad(context, *instructions[component]);
+            return composite(state, count, values);
+        });
+}
+
 std::uint32_t EmitRuntimeBufferAtomic(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t bits, std::uint32_t active, const std::function<std::uint32_t(std::uint32_t)>& operation) {
     auto& state = context.state;
     if (bits != 32u && bits != 64u) context.Fail(instruction, "unsupported runtime buffer atomic width");

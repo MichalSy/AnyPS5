@@ -472,6 +472,64 @@ std::uint32_t RouteFlatAccess(SpirvEmitterState& state, std::uint32_t address, s
     });
 }
 
+// Combine only surviving consecutive components of one SMEM instruction.
+bool LoadScalarGroup(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem) {
+    if (ctx.batchedScalarReads.erase(&inst) != 0)
+        return true;
+    if (ctx.state.currentBlock == nullptr || mem.componentCount < 2u || mem.coherent)
+        return false;
+    const auto& instructions = ctx.state.currentBlock->Instructions();
+    auto next = std::find(instructions.begin(), instructions.end(), &inst);
+    if (next == instructions.end())
+        return false;
+    std::array<const IrValue*, 4> group{&inst};
+    std::uint32_t count = 1;
+    while (++next != instructions.end() && count < group.size()) {
+        const auto* candidate = *next;
+        if (candidate->HasImmediate())
+            continue;
+        if (candidate->Opcode() != inst.Opcode() || candidate->Flags<MemoryFlags>().pc != inst.Flags<MemoryFlags>().pc)
+            break;
+        const auto& other = ctx.Memory(*candidate);
+        if (other.kind != mem.kind || other.planningOnly || other.coherent || other.gpuDescriptor != mem.gpuDescriptor ||
+            other.addressIsFull != mem.addressIsFull || other.componentCount != mem.componentCount || other.componentIndex != mem.componentIndex + count ||
+            other.offset != mem.offset + count * 4u)
+            break;
+        if (candidate->ArgumentCount() != inst.ArgumentCount())
+            break;
+        bool same = true;
+        for (std::size_t index = 0; index < inst.ArgumentCount(); ++index) {
+            const auto* left = candidate->Argument(index)->Resolve();
+            const auto* right = inst.Argument(index)->Resolve();
+            same &= left == right ||
+                    (left->HasImmediate() && right->HasImmediate() && left->Type() == right->Type() && left->Type() == IrType::U32 &&
+                     left->ImmediateU32() == right->ImmediateU32()) ||
+                    (left->HasImmediate() && right->HasImmediate() && left->Type() == IrType::U1 && right->Type() == IrType::U1 &&
+                     left->ImmediateBool() == right->ImmediateBool());
+        }
+        if (!same)
+            break;
+        group[count++] = candidate;
+    }
+    if (count == 1u)
+        return false;
+    auto& state = ctx.state;
+    const auto composite =
+        mem.kind == ResourceKind::ScalarBuffer
+            ? EmitRuntimeScalarBufferLoads(ctx, std::span(group.data(), count))
+            : EmitValueOrDefaultIfCondition(state, ActiveArgument(ctx, inst), TypeU32Composite(state, count), ConstantU32CompositeZero(state, count), [&] {
+                  return ConstructU32Composite(state, count, EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset & ~3u, count, true));
+              });
+    for (std::uint32_t component = 0; component < count; ++component) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, composite, component);
+        ctx.Define(*group[component], value);
+        if (component != 0u)
+            ctx.batchedScalarReads.insert(group[component]);
+    }
+    return true;
+}
+
 void LoadAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t bits) {
     const auto& mem = ctx.Memory(inst);
     if (bits == 32u && mem.planningOnly) {
@@ -484,6 +542,8 @@ void LoadAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t 
         }));
         return;
     }
+    if (bits == 32u && mem.kind == ResourceKind::ScalarAddress && LoadScalarGroup(ctx, inst, mem))
+        return;
     switch (mem.kind) {
     case ResourceKind::Scratch:
         ctx.Define(inst, bits == 32u ? LoadWord(ctx, inst, mem) : LoadSubword(ctx, inst, mem, bits));
@@ -1405,6 +1465,8 @@ void EmitReadConstBuffer(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto& mem = ctx.Memory(inst);
     if (mem.planningOnly) return;
     if (mem.kind != ResourceKind::ScalarBuffer) ctx.Fail(inst, "must read a scalar buffer resource");
+    if (mem.gpuDescriptor && LoadScalarGroup(ctx, inst, mem))
+        return;
     ctx.Define(inst, EmitRuntimeScalarBufferLoad(ctx, inst));
 }
 

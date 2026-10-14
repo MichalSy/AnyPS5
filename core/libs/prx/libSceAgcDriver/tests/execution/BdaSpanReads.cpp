@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -105,15 +106,16 @@ std::vector<std::uint32_t> Expected() {
     return memory;
 }
 
-ShaderRecompiler::RecompileResult Recompile(std::span<const std::uint32_t> code, std::uint32_t waveSize, std::span<const std::uint32_t> userData, const ShaderRecompiler::SpirvTarget& target) {
-    const std::array<ShaderRecompiler::MemoryRegion, 1> regions{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+ShaderRecompiler::RecompileResult Recompile(std::span<const std::uint32_t> code, std::uint32_t waveSize, std::span<const std::uint32_t> userData,
+                                            const ShaderRecompiler::SpirvTarget& target, std::optional<ShaderRecompiler::MemoryRegion> data = std::nullopt) {
+    std::vector<ShaderRecompiler::MemoryRegion> regions{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}};
+    if (data)
+        regions.push_back(*data);
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0, {false, false, false}, false, 1};
-    ShaderRecompiler::RecompileRequest request{
-        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
-        {waveSize, 0, userData, compute, std::nullopt, std::nullopt, regions},
-        target,
-        {0, 0, 0, 128}
-    };
+    ShaderRecompiler::RecompileRequest request{{ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+                                               {waveSize, 0, userData, compute, std::nullopt, std::nullopt, regions},
+                                               target,
+                                               {0, 0, 0, 128}};
     request.useCache = false;
     return ShaderRecompiler::Recompile(request);
 }
@@ -134,6 +136,62 @@ void Run(AgcDriver::VulkanDevice& device, GuestBlock& guest, bool coherent, bool
     }
 }
 
+void RunScalar(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::uint32_t waveSize, const ShaderRecompiler::SpirvTarget& target) {
+    // s_load_dwordx4 s[8:11], s[0:1], s2; copy to v[1:4]; write one vector per
+    // lane.
+    alignas(256) const std::array<std::uint32_t, 13> code{0xf4080200u, 0x04000000u, 0xbf8cc07fu, 0x7e020208u, 0x7e040209u, 0x7e06020au, 0x7e08020bu,
+                                                          0x340a0084u, 0x4a0a0affu, OutputBase,  0xdc788000u, 0x00000105u, 0xbf810000u};
+    for (const std::uint32_t offset : {LoadBase, LoadBase + 4u, LoadBase + 12u}) {
+        auto memory = Initial();
+        std::memcpy(guest.Data(), memory.data(), BlockBytes);
+        const auto address = reinterpret_cast<std::uintptr_t>(guest.Data());
+        const std::array<std::uint32_t, 3> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), offset};
+        const auto result = Recompile(code, waveSize, userData, target);
+        device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+        device.WaitIdle();
+        std::memcpy(memory.data(), guest.Data(), BlockBytes);
+        auto expected = Initial();
+        for (std::uint32_t lane = 0; lane < Threads; ++lane) {
+            for (std::uint32_t component = 0; component < 4; ++component)
+                expected[OutputBase / 4u + lane * 4u + component] = expected[offset / 4u + component];
+        }
+        for (std::size_t index = 0; index < memory.size(); ++index) {
+            Require(memory[index] == expected[index], "BDA scalar group at " + std::to_string(index * 4) + " offset " + std::to_string(offset) + " wave " +
+                                                          std::to_string(waveSize) + " got " + Hex(memory[index]) + " expected " + Hex(expected[index]));
+        }
+    }
+}
+
+void RunScalarBuffer(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::uint32_t waveSize, const ShaderRecompiler::SpirvTarget& target) {
+    // Load a runtime V#, then s_buffer_load_dwordx4 s[16:19], s[8:11], s3.
+    alignas(256) const std::array<std::uint32_t, 18> code{0xbf068004u, 0xbf850002u, 0xf4080200u, 0x04000000u, 0xbf8cc07fu, 0xf4280404u,
+                                                          0x06000000u, 0xbf8cc07fu, 0x7e020210u, 0x7e040211u, 0x7e060212u, 0x7e080213u,
+                                                          0x340a0084u, 0x4a0a0affu, OutputBase,  0xdc788000u, 0x00000105u, 0xbf810000u};
+    for (const std::uint32_t records : {48u, 44u, 40u, 36u}) {
+        auto initial = Initial();
+        const auto address = reinterpret_cast<std::uintptr_t>(guest.Data());
+        const auto source = address + 0x1000u;
+        initial[LoadBase / 4u] = static_cast<std::uint32_t>(source);
+        initial[LoadBase / 4u + 1u] = static_cast<std::uint32_t>(source >> 32u);
+        initial[LoadBase / 4u + 2u] = records;
+        initial[LoadBase / 4u + 3u] = 56u << 12u;
+        for (std::uint32_t component = 0; component < 4u; ++component)
+            initial[(0x1000u + 32u) / 4u + component] = 0x92000000u + component;
+        std::memcpy(guest.Data(), initial.data(), BlockBytes);
+        const std::array<std::uint32_t, 5> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), LoadBase, 32u, 1u};
+        const auto result = Recompile(code, waveSize, userData, target, ShaderRecompiler::MemoryRegion{address, std::as_bytes(std::span(initial))});
+        device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+        device.WaitIdle();
+        auto memory = initial;
+        std::memcpy(memory.data(), guest.Data(), BlockBytes);
+        auto expected = initial;
+        for (std::uint32_t lane = 0; lane < Threads; ++lane) {
+            for (std::uint32_t component = 0; component < 4u; ++component)
+                expected[OutputBase / 4u + lane * 4u + component] = 32u + component * 4u + 4u <= records ? 0x92000000u + component : 0u;
+        }
+        Require(memory == expected, "BDA scalar buffer group changed bounds, values, or neighboring bytes");
+    }
+}
 }
 
 int main() {
@@ -150,6 +208,10 @@ int main() {
                 if (split.subgroupSize != native.subgroupSize) Run(*device, guest, coherent, barrier, 64, split, "wave64 split");
             }
         }
+        RunScalar(*device, guest, 32, native);
+        RunScalar(*device, guest, 64, native);
+        RunScalarBuffer(*device, guest, 32, native);
+        RunScalarBuffer(*device, guest, 64, native);
         std::puts("BDA span read tests passed");
         return 0;
     } catch (const std::exception& error) {
