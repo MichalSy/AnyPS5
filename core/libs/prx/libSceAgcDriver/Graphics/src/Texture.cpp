@@ -211,6 +211,7 @@ VkImageViewType ViewTypeFor(TextureDimension dimension, [[maybe_unused]] std::ui
         case TextureDimension::kCube: return VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         case TextureDimension::k3D: return VK_IMAGE_VIEW_TYPE_3D;
         case TextureDimension::k1DArray: return VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+        case TextureDimension::k2DMsaa: break;
     }
     throw std::runtime_error("AGC graphics: Texture encountered an unknown guest texture dimension");
 }
@@ -779,7 +780,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
     }
 }
 
-Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType) : context(context) {
+Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType, std::uint32_t baseLayer) : context(context) {
     layout = VK_IMAGE_LAYOUT_GENERAL;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = depthImage;
@@ -787,7 +788,7 @@ Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthForma
     viewInfo.format = depthFormat;
     viewFormat = depthFormat;
     viewInfo.components = components;
-    viewInfo.subresourceRange = {aspect, 0, 1, 0, viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : VK_REMAINING_ARRAY_LAYERS};
+    viewInfo.subresourceRange = {aspect, 0, 1, baseLayer, viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : VK_REMAINING_ARRAY_LAYERS};
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
     viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
     if (viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY) return;
@@ -3031,6 +3032,13 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    std::vector<bool> unsaved(trackedLayers, false);
+    bool anyUnsaved = false;
+    for (std::uint32_t layer = first; layer < first + count; ++layer) {
+        unsaved[layer] = !layerPending[layer] && !layerOriginal[layer] && layerGeneration[layer] == 0;
+        anyUnsaved = anyUnsaved || unsaved[layer];
+    }
+    if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(&unsaved);
     for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
@@ -3222,6 +3230,15 @@ bool StorageTexture::keptAtUnwatchHolds(std::uint64_t from, std::uint32_t unit) 
     return found != keptAtUnwatch.end() && layerOriginal[unit] && found->second == layerGeneration[unit];
 }
 
+void StorageTexture::forgetSavedOver(std::uint64_t address, std::size_t bytes) {
+    // Only these units' bytes changed under the saved copy. Units outside keep it: results still
+    // pending there (the flush before the fill or copy stored only the units it overlaps) are
+    // compared with it at their store when the memory is outside the write watch.
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        if (layerBegin(unit) < address + bytes && address < layerBegin(unit) + layerBytes(unit)) layerOriginal[unit] = false;
+    }
+}
+
 void StorageTexture::saveBeforeUnwatch() {
     std::vector<bool> units(trackedLayers, false);
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) units[unit] = layerPending[unit] && !layerOriginal[unit] && layerGeneration[unit] != 0;
@@ -3307,6 +3324,26 @@ void StorageTexture::FlushAllPending(const char* reason) {
     static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason));
 }
 
+std::size_t StorageTexture::StoreSmallPending(const char* reason) {
+    std::vector<std::shared_ptr<StorageTexture>> small;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        for (auto* texture : pending.textures) {
+            if (texture->guestBytes > SmallStoreBytes) continue;
+            if (auto alive = texture->weak_from_this().lock()) small.push_back(std::move(alive));
+        }
+    }
+    std::size_t stored = 0;
+    for (const auto& texture : small) {
+        const auto address = texture->descriptor.baseAddress;
+        const auto bytes = static_cast<std::size_t>(texture->guestBytes);
+        if (!HostImportCovers(texture->context, address, bytes)) continue;
+        if (FlushPending(address, bytes, nullptr, reason)) ++stored;
+    }
+    return stored;
+}
+
 bool StorageTexture::AnyPending() {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
@@ -3317,6 +3354,12 @@ bool StorageTexture::StoreAtFlipRequested(const char* value) {
     if (value == nullptr) return false;
     if (std::strcmp(value, "1") == 0) return true;
     throw std::runtime_error(std::string("APS5_STORE_AT_FLIP=") + value + ": expected 1");
+}
+
+bool StorageTexture::StoreAtLabelRequested(const char* value) {
+    if (value == nullptr) return false;
+    if (std::strcmp(value, "1") == 0) return true;
+    throw std::runtime_error(std::string("APS5_STORE_AT_LABEL=") + value + ": expected 1");
 }
 
 std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t address, std::uint64_t bytes) {
@@ -3894,7 +3937,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
         std::lock_guard lock(live.mutex);
         for (auto* texture : live.textures) {
             if (texture == this || texture->released || !texture->overlaps(begin, bytes)) continue;
-            texture->layerOriginal.assign(texture->trackedLayers, false);
+            texture->forgetSavedOver(begin, bytes);
             if (texture->descriptor.dccAddress != 0) aliasedKeys = true;
         }
     }
@@ -4028,7 +4071,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         for (auto* texture : live.textures) {
-            if (texture != this && !texture->released && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) texture->layerOriginal.assign(texture->trackedLayers, false);
+            if (texture != this && !texture->released && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) texture->forgetSavedOver(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
         }
     }
     GuestMemory::MarkWritten(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -4428,18 +4471,16 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (layers[layer]) layerPending[layer] = false;
         }
-        const bool allKept = std::none_of(skippedLayer.begin(), skippedLayer.end(), [](bool kept) { return kept; });
-        if (allKept || !adjacent.empty()) {
-            const auto now = memoizedCollect ? GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)) : GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
-            for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-                if (layers[layer] && !skippedLayer[layer]) layerGeneration[layer] = now;
-            }
-            refreshGeneration();
-            advanceAdjacent(adjacent, now, firstBlock, lastBlock);
-            if (!shadowed.empty()) MarkShadowed(*shadowImport, shadowed, now);
-        } else if (!shadowed.empty()) {
-            MarkShadowed(*shadowImport, shadowed, GuestMemory::TrackerGeneration());
+        bool advances = false;
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) advances = advances || (layers[layer] && !skippedLayer[layer]);
+        if (!advances && adjacent.empty() && shadowed.empty()) return;
+        const auto now = memoizedCollect ? GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)) : GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+            if (layers[layer] && !skippedLayer[layer]) layerGeneration[layer] = now;
         }
+        refreshGeneration();
+        advanceAdjacent(adjacent, now, firstBlock, lastBlock);
+        if (!shadowed.empty()) MarkShadowed(*shadowImport, shadowed, now);
     };
     if (keep.empty()) {
         // Every selected block was written by the CPU since the layer's generation: nothing to
@@ -4583,7 +4624,24 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // the round trip through the CPU below would store stale texels over whatever the memory
     // holds now. Its selected units are dropped instead. APS5_NO_UNREGISTERED_DROP=1 stores.
     static const bool unregisteredDrop = std::getenv("APS5_NO_UNREGISTERED_DROP") == nullptr;
+    bool overhang = false;
     if (unregisteredDrop && !RegisteredReadableCovers(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+        const auto allocationEnd = RegisteredReadableEnd(descriptor.baseAddress);
+        const auto& level = mips.front();
+        const auto rowBytes = std::uint64_t{level.height} * level.pitchBytes;
+        const auto lastRowTail = mips.size() == 1 && arrayLayers == 1 && !level.tail && level.tiledSize > rowBytes ? level.tiledSize - rowBytes : 0;
+        const auto end = descriptor.baseAddress + guestBytes;
+        if (allocationEnd > descriptor.baseAddress && end - allocationEnd <= lastRowTail) {
+            auto covered = allocationEnd;
+            while (covered < end) {
+                const auto next = RegisteredReadableEnd(covered);
+                if (next <= covered) break;
+                covered = next;
+            }
+            overhang = covered >= end;
+        }
+    }
+    if (unregisteredDrop && !overhang && !RegisteredReadableCovers(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx: memory no longer registered; %zu pending ranges dropped\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), keep.size());
         unregisteredDropped.fetch_add(1, std::memory_order_relaxed);

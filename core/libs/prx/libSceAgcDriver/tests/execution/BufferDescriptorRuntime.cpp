@@ -102,12 +102,18 @@ void Run(AgcDriver::VulkanDevice& device, bool registrationModules) {
     }
 }
 
-void ConditionalDescriptor() {
-    alignas(256) static constexpr std::array<std::uint32_t, 13> code{
+void ConditionalDescriptor(bool scalar) {
+    alignas(256) static constexpr std::array<std::uint32_t, 13> vectorCode{
         0x34020082u, 0x7e040280u, 0xbf06800au, 0xbf850006u,
         0xf4080004u, 0xfa000000u, 0xbf8cc07fu, 0xe0001000u, 0x80000201u,
         0xbf8c3f70u, 0xe0701000u, 0x80010201u, 0xbf810000u,
     };
+    alignas(256) static constexpr std::array<std::uint32_t, 14> scalarCode{
+        0x34020082u, 0x7e040280u, 0xbf06800au, 0xbf850007u,
+        0xf4080004u, 0xfa000000u, 0xbf8cc07fu, 0xf4200200u, 0xfa000004u,
+        0xbf8cc07fu, 0x7e040208u, 0xe0701000u, 0x80010201u, 0xbf810000u,
+    };
+    const auto code = scalar ? std::span<const std::uint32_t>(scalarCode) : std::span<const std::uint32_t>(vectorCode);
 #ifdef _WIN32
     auto* block = static_cast<std::byte*>(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
 #else
@@ -142,10 +148,10 @@ void ConditionalDescriptor() {
         {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))},
         {tableAddress, std::as_bytes(std::span(table, 4))},
     }};
-    enum class Scenario { Valid, ZeroSelectors, SkippedInvalid, UsedInvalid, InvalidTypeA, InvalidTypeB };
+    enum class Scenario { Valid, ZeroSelectors, SkippedInvalid, UsedInvalid, InvalidTypeA, InvalidTypeB, ReservedWord1 };
     std::vector<std::uint32_t> validModule;
     std::vector<std::uint32_t> invalidTypeModule;
-    for (const auto mode : {Scenario::Valid, Scenario::ZeroSelectors, Scenario::SkippedInvalid, Scenario::UsedInvalid, Scenario::InvalidTypeA, Scenario::InvalidTypeB}) {
+    for (const auto mode : {Scenario::Valid, Scenario::ZeroSelectors, Scenario::SkippedInvalid, Scenario::UsedInvalid, Scenario::InvalidTypeA, Scenario::InvalidTypeB, Scenario::ReservedWord1}) {
         std::fill_n(output, Lanes, Fill);
         auto descriptor = BufferDescriptor(input, Lanes * 4u);
         if (mode == Scenario::ZeroSelectors) descriptor[3] = 0x18004000u;
@@ -153,6 +159,7 @@ void ConditionalDescriptor() {
         if (mode == Scenario::UsedInvalid) descriptor[3] = (descriptor[3] & ~(0x7fu << 12u)) | (114u << 12u);
         if (mode == Scenario::InvalidTypeA) descriptor[3] = 0x42485d80u;
         if (mode == Scenario::InvalidTypeB) descriptor[3] = 0x60e98f40u;
+        if (mode == Scenario::ReservedWord1) descriptor[1] |= 0x40000000u;
         std::copy(descriptor.begin(), descriptor.end(), table);
         userData[10] = mode == Scenario::SkippedInvalid ? 0u : 1u;
         auto request = Request(userData, device->ComputeTarget(Lanes), memory, code);
@@ -162,7 +169,7 @@ void ConditionalDescriptor() {
         if (mode == Scenario::ZeroSelectors) Require(shader.spirv.Copy() == validModule, "changing a valid conditional descriptor format created another shader module");
         if (mode == Scenario::InvalidTypeA) invalidTypeModule = shader.spirv.Copy();
         if (mode == Scenario::InvalidTypeB) Require(shader.spirv.Copy() == invalidTypeModule, "changing an invalid conditional descriptor type payload created another shader module");
-        const bool invalid = mode == Scenario::UsedInvalid || mode == Scenario::InvalidTypeA || mode == Scenario::InvalidTypeB;
+        const bool invalid = !scalar && (mode == Scenario::UsedInvalid || mode == Scenario::InvalidTypeA || mode == Scenario::InvalidTypeB || mode == Scenario::ReservedWord1);
         bool faulted = false;
         try {
             device->Dispatch(shader, 1, 1, 1);
@@ -178,7 +185,8 @@ void ConditionalDescriptor() {
             continue;
         }
         for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
-            Require(output[lane] == (mode == Scenario::Valid ? input[lane] : 0u),
+            const auto expected = scalar && mode != Scenario::SkippedInvalid ? input[1] : mode == Scenario::Valid ? input[lane] : 0u;
+            Require(output[lane] == expected,
                 "conditional descriptor produced an incorrect value or touched its skipped resource");
         }
     }
@@ -279,6 +287,59 @@ void RuntimeStoreFormats() {
     }
 }
 
+void ScalarReads(AgcDriver::VulkanDevice& device) {
+    constexpr std::array<std::uint32_t, 8> scalarCode{0x34020082u, 0xf4200200u, 0xfa000004u, 0xbf8cc07fu, 0x7e040208u, 0xe0701000u, 0x80010201u, 0xbf810000u};
+    std::array<std::uint32_t, 8> userData{};
+    const auto output = BufferDescriptor(Output.data(), sizeof(Output));
+    std::copy(output.begin(), output.end(), userData.begin() + 4);
+    auto request = Request(userData, device.ComputeTarget(Lanes), {});
+    request.shader.code = scalarCode;
+    request.shader.codeAddress = reinterpret_cast<std::uintptr_t>(scalarCode.data());
+    request.useCache = false;
+    std::uint32_t expected = 0;
+    std::memcpy(&expected, Input.data() + 4u, sizeof(expected));
+    for (const auto ignoredWord1 : {0u, 0x40000000u}) {
+        for (const auto word : {0u, 0x31016facu, 0x91b00f2eu, 0xffffffffu}) {
+            auto input = BufferDescriptor(Input.data(), InputBytes);
+            input[1] |= ignoredWord1;
+            input[3] = word;
+            std::copy(input.begin(), input.end(), userData.begin());
+            Output.fill(Fill);
+            const auto result = ShaderRecompiler::Recompile(request);
+            device.Dispatch(result, 1, 1, 1);
+            device.WaitIdle();
+            Require(std::all_of(Output.begin(), Output.end(), [expected](std::uint32_t value) { return value == expected; }), "scalar buffer read changed with ignored descriptor word " + Hex(word));
+        }
+    }
+    constexpr std::array<std::uint32_t, 13> mixedCode{0xf4200200u, 0xfa000004u, 0xbf8cc07fu, 0x34020082u, 0xe0301000u, 0x80000201u, 0xbf8c3f70u, 0xe0701000u, 0x80010201u, 0x7e060208u, 0xe0701000u, 0x80010301u, 0xbf810000u};
+    for (const auto code : {std::span<const std::uint32_t>(Code), std::span<const std::uint32_t>(mixedCode)}) {
+        request.shader.code = code;
+        request.shader.codeAddress = reinterpret_cast<std::uintptr_t>(code.data());
+        try {
+            static_cast<void>(ShaderRecompiler::Recompile(request));
+        } catch (const std::runtime_error& error) {
+            Require(std::string(error.what()).find("buffer descriptor uses an unsupported type") != std::string::npos, "vector buffer descriptor failed for another reason");
+            continue;
+        }
+        throw std::runtime_error("a vector or mixed buffer access accepted a non-buffer descriptor type");
+    }
+    for (const auto code : {std::span<const std::uint32_t>(Code), std::span<const std::uint32_t>(mixedCode)}) {
+        request.shader.code = code;
+        request.shader.codeAddress = reinterpret_cast<std::uintptr_t>(code.data());
+        auto input = BufferDescriptor(Input.data(), InputBytes);
+        input[1] |= 0x40000000u;
+        std::copy(input.begin(), input.end(), userData.begin());
+        const auto result = ShaderRecompiler::Recompile(request);
+        try {
+            device.Dispatch(result, 1, 1, 1);
+        } catch (const std::runtime_error& error) {
+            Require(std::string(error.what()).find("buffer descriptor has reserved bits set") != std::string::npos, "vector or mixed buffer descriptor failed for another reason");
+            continue;
+        }
+        throw std::runtime_error("a vector or mixed buffer access accepted reserved descriptor bits");
+    }
+}
+
 }
 
 int main() {
@@ -288,8 +349,10 @@ int main() {
         for (std::uint32_t index = 0; index < InputBytes; ++index) Input[index] = static_cast<std::uint8_t>(index * 41u + 3u + (index >> 3u));
         Run(*device, false);
         Run(*device, true);
-        ConditionalDescriptor();
+        ConditionalDescriptor(false);
+        ConditionalDescriptor(true);
         RuntimeStoreFormats();
+        ScalarReads(*device);
         std::puts("buffer descriptor runtime tests passed");
         return 0;
     } catch (const std::exception& error) {

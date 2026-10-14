@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -30,6 +31,7 @@ class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
 class PlaceholderImages;
+class VertexInputCache;
 
 class PipelineCacheSynchronization {
 public:
@@ -48,13 +50,33 @@ inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
 }
 
+inline std::function<void()>& DeviceLostHook() {
+    static std::function<void()> hook;
+    return hook;
+}
+
+inline const void*& DeviceLostOwner() {
+    static const void* owner = nullptr;
+    return owner;
+}
+
+inline void ReportDeviceLost() {
+    static std::atomic<bool> reported{false};
+    if (DeviceLostHook() && !reported.exchange(true)) DeviceLostHook()();
+}
+
 inline void Check(VkResult result, const char* operation) {
+    if (result == VK_ERROR_DEVICE_LOST) ReportDeviceLost();
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 
 inline void Require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("AGC graphics: ") + reason);
 }
+
+struct DescriptorRejected : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 // Device entry points resolved once per device (VulkanDevice's State fills it after setup): the
 // loader's vkGetDeviceProcAddr is a name lookup under its global mutex per call, paid at every
@@ -179,6 +201,11 @@ struct Context {
     bool descriptorIndexing = false;
     VkPhysicalDeviceDescriptorIndexingPropertiesEXT descriptorIndexingLimits{};
     bool imageInt64Atomics = false;
+    bool runtimeDescriptorArray = false;
+    bool partiallyBound = false;
+    bool variableDescriptorCount = false;
+    std::uint32_t imageTableCapacity = 0;
+    std::uint32_t samplerTableCapacity = 0;
     bool geometryShader = false;
     bool sampleRateShading = false;
     bool shaderClipDistance = false;
@@ -197,11 +224,13 @@ struct Context {
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
+    VkSampleCountFlags sampleLocationGridSampleCounts = 0;
     PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
 
     PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
         return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
     }
+    VertexInputCache* vertexInputs = nullptr;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {
@@ -280,6 +309,9 @@ inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
     if (context.graphicsPipelineLibrary) context.Resolved(&DeviceFunctions::cmdEndRendering, "vkCmdEndRenderingKHR")(commands);
     else context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
 }
+
+std::uint32_t ImageTableCapacity(const Context& context);
+std::uint32_t SamplerTableCapacity(const Context& context);
 
 }
 

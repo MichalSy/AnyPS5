@@ -61,7 +61,7 @@ public:
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
     // CanCopyFrom says whether the two descriptors address the same surface compatibly.
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
-    Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D);
+    Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D, std::uint32_t baseLayer = 0);
     struct DepthCopyTag {};
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag);
     static VkFormat DepthCopyFormat(VkFormat colorFormat);
@@ -194,9 +194,12 @@ public:
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr);
     static void FlushAllPending(const char* reason);
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
+    static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
+    static std::size_t StoreSmallPending(const char* reason);
     static bool AnyPending();
     static void FlushDumpSelected(const char* reason);
     static bool StoreAtFlipRequested(const char* value);
+    static bool StoreAtLabelRequested(const char* value);
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
     static void BumpPendingSerial();
@@ -369,6 +372,9 @@ private:
     void saveBeforeUnwatch();
     void forgetKeptAtUnwatch(std::uint32_t unit);
     bool keptAtUnwatchHolds(std::uint64_t from, std::uint32_t unit) const;
+    // Drops the saved guest bytes of the units over [address, address + bytes) (another image's fill
+    // or copy supersedes them there); the other units' bytes stay valid.
+    void forgetSavedOver(std::uint64_t address, std::size_t bytes);
     bool guestBytesSettled() const;
     // Tracked units as 64 KiB write-stamp blocks (`blockUnits`: a thin tiled surface at a 64 KiB
     // aligned base; APS5_NO_BLOCK_TRACKING=1 tracks array layers as above instead): a fill of one

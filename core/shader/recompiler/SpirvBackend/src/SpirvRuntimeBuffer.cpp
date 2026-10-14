@@ -70,7 +70,8 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
         const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, field(state, context.Arg(*handle, 1u), 0u, 16u)), BdaConstant(state, 32u));
         base = Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, context.Arg(*handle, 0u)), high);
     }
-    auto invalid = nonzero(state, field(state, word3, 30u, 2u));
+    auto invalid = memory.kind == ResourceKind::ScalarBuffer ? ConstantBool(state, false)
+        : Binary(state, spv::OpLogicalOr, TypeBool(state), nonzero(state, field(state, word3, 30u, 2u)), nonzero(state, field(state, word1, 30u, 1u)));
     auto index = ConstantU32(state, 0u);
     if (context.Memory(instruction).kind == ResourceKind::Buffer) {
         index = context.Arg(instruction, 1u);

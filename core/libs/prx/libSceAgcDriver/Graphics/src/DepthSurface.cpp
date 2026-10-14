@@ -10,6 +10,7 @@
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -326,7 +327,7 @@ public:
     DepthPlaneCopy(const DepthPlaneCopy&) = delete;
     DepthPlaneCopy& operator=(const DepthPlaneCopy&) = delete;
 
-    std::shared_ptr<Texture> Refresh(std::span<const DepthPlaneSlice> slices, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType) {
+    std::shared_ptr<Texture> Refresh(std::span<const DepthPlaneSlice> slices, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType, std::uint32_t baseLayer) {
         Require(slices.size() == layers, "depth plane copy slices do not match its layers");
         const auto geometry = DescribeSurface(resource);
         if (geometry.layers != layers || geometry.sliceLinearBytes < sliceBytes() || geometry.mips.empty()) {
@@ -366,10 +367,10 @@ public:
             held = current;
         }
         if (!copiedLayers.empty() || !uploads.empty()) record(slices, resource, geometry, copiedLayers, uploads, uploadLayers);
-        const std::array<std::uint32_t, 5> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType)};
+        const std::array<std::uint32_t, 6> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType), baseLayer};
         auto& texture = textures[key];
         if (texture == nullptr) {
-            texture = std::make_shared<Texture>(context, image, format, aspect(), components, viewType);
+            texture = std::make_shared<Texture>(context, image, format, aspect(), components, viewType, baseLayer);
             texture->MarkRefreshedPerUse();
         }
         return texture;
@@ -394,7 +395,7 @@ private:
     std::unique_ptr<DeviceBuffer> staging;
     std::size_t stagingSize = 0;
     std::vector<std::unique_ptr<DeviceBuffer>> retiredStaging;
-    std::map<std::array<std::uint32_t, 5>, std::shared_ptr<Texture>> textures;
+    std::map<std::array<std::uint32_t, 6>, std::shared_ptr<Texture>> textures;
     std::vector<GuestLayer> guestLayers;
     std::vector<DepthPlaneSlice> surfaceLayers;
     bool filled = false;
@@ -489,7 +490,7 @@ struct LayeredSlice {
 
 class LayeredDepthStorage {
 public:
-    LayeredDepthStorage(const Context& context, const GuestTextureResource& resource, const DepthTarget& base, std::uint32_t bytesPerTexel, std::uint32_t layers) : context(context), base(base), extent(base.extent), bytesPerTexel(bytesPerTexel), layers(layers) {
+    LayeredDepthStorage(const Context& context, const GuestTextureResource& resource, const DepthTarget& base, std::uint32_t bytesPerTexel, std::uint32_t firstLayer, std::uint32_t layers) : context(context), base(base), extent(base.extent), bytesPerTexel(bytesPerTexel), firstLayer(firstLayer), layers(layers) {
         const auto bytes = DescribeSurface(resource).guestBytes;
         StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(bytes), nullptr, "storage image creation", PublishScope::None);
         storage = StorageTexture::Create(context, *context.detiler, resource, 0);
@@ -542,6 +543,7 @@ public:
     const DepthTarget base;
     const VkExtent2D extent;
     const std::uint32_t bytesPerTexel;
+    const std::uint32_t firstLayer;
     const std::uint32_t layers;
     std::shared_ptr<StorageTexture> storage;
 
@@ -553,8 +555,8 @@ private:
     }
 };
 
-std::map<std::tuple<VkDevice, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, int, int>, std::unique_ptr<LayeredDepthStorage>>& layeredStorages() {
-    static auto* storages = new std::map<std::tuple<VkDevice, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, int, int>, std::unique_ptr<LayeredDepthStorage>>();
+std::map<std::tuple<VkDevice, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, int, int, std::uint32_t>, std::unique_ptr<LayeredDepthStorage>>& layeredStorages() {
+    static auto* storages = new std::map<std::tuple<VkDevice, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, int, int, std::uint32_t>, std::unique_ptr<LayeredDepthStorage>>();
     return *storages;
 }
 
@@ -637,6 +639,12 @@ std::set<std::uint64_t>& clearedHtiles() {
 
 const DepthSurface* drawnDepth = nullptr;
 
+std::atomic<std::uint64_t> surfacesSerial{0};
+
+}
+
+std::uint64_t DepthSurfacesSerial() {
+    return surfacesSerial.load(std::memory_order_acquire);
 }
 
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
@@ -695,6 +703,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     }
     const bool created = surface == nullptr;
     if (created) {
+        surfacesSerial.fetch_add(1, std::memory_order_release);
         surfaces().push_back(std::make_unique<DepthSurface>(context, target));
         surface = surfaces().back().get();
     }
@@ -756,6 +765,7 @@ void NoteHtileDepthClear(std::uint64_t htileAddress) {
 void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard lock(surfacesMutex());
     drawnDepth = nullptr;
+    surfacesSerial.fetch_add(1, std::memory_order_release);
     std::erase_if(depthOwners(), [&](const auto& entry) { return entry.first.first == device; });
     std::erase_if(stencilOwners(), [&](const auto& entry) { return entry.first.first == device; });
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
@@ -791,7 +801,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     Require(found->hostFormat == base.format, "sampling several slices or an integer view of a depth plane that the device stores in another depth format is not implemented");
     const auto copyFormat = integer ? VK_FORMAT_R16_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
     const auto layers = cube ? 6u : layered ? resource.depthOrLastArray + 1u : 1u;
-    if ((format != copyFormat && !depthBits) || resource.width != base.extent.width || resource.height != base.extent.height || resource.baseLevel != 0 || resource.lastLevel != 0 || resource.baseArray != 0 || (cube && resource.depthOrLastArray != 0 && resource.depthOrLastArray != 5) || (resource.dimension != TextureDimension::k2D && resource.dimension != TextureDimension::k2DArray && !cube)) {
+    if ((format != copyFormat && !depthBits) || resource.width != base.extent.width || resource.height != base.extent.height || resource.baseLevel != 0 || resource.lastLevel != 0 || (resource.baseArray != 0 && (cube || !layered || resource.baseArray > resource.depthOrLastArray)) || (cube && resource.depthOrLastArray != 0 && resource.depthOrLastArray != 5) || (resource.dimension != TextureDimension::k2D && resource.dimension != TextureDimension::k2DArray && !cube)) {
         char text[320];
         std::snprintf(text, sizeof(text), "AGC graphics: sampling the depth planes of depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u texture of guest format %u (vk %d), dimension %d, %u slices, levels %u-%u, base slice %u is not implemented", static_cast<unsigned long long>(base.address), base.extent.width, base.extent.height, static_cast<int>(base.format), resource.width, resource.height, resource.format, static_cast<int>(format), static_cast<int>(resource.dimension), layers, resource.baseLevel, resource.lastLevel, resource.baseArray);
         throw std::runtime_error(text);
@@ -809,7 +819,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     if (copy == nullptr) {
         copy = std::make_unique<DepthPlaneCopy>(context, base.extent, imageFormat, layers);
     }
-    return copy->Refresh(slices, resource, components, cube || resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D);
+    return copy->Refresh(slices, resource, components, cube || resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, layered && !cube ? resource.baseArray : 0u);
 }
 
 bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resource, const Texture* texture) {
@@ -865,7 +875,7 @@ std::vector<LayeredSlice> layeredSlices(const Context& context, const LayeredDep
     const auto& base = storage.base;
     std::vector<LayeredSlice> slices;
     const auto& list = surfaces();
-    for (std::uint32_t layer = 0; layer < storage.layers; ++layer) {
+    for (std::uint32_t layer = storage.firstLayer; layer < storage.layers; ++layer) {
         const auto address = base.address + static_cast<std::uint64_t>(layer) * DepthSliceBytes(base.extent, storage.bytesPerTexel);
         const auto slice = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == context.device && surface->target.address == address && surface->target.extent.width == base.extent.width && surface->target.extent.height == base.extent.height && surface->target.format == base.format && surface->target.samples == 1; });
         if (slice != list.rend()) slices.push_back({slice->get(), layer});
@@ -878,11 +888,6 @@ std::shared_ptr<StorageTexture> layeredDepthStorage(const Context& context, Dept
     const auto layers = resource.depthOrLastArray + 1u;
     const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
     const auto bytesPerTexel = d16 ? 2u : 4u;
-    if (resource.baseArray != 0) {
-        char text[256];
-        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to the depth planes of depth surface 0x%llx through a 2D array view of slices %u-%u is not implemented", static_cast<unsigned long long>(target.address), resource.baseArray, resource.depthOrLastArray);
-        throw std::runtime_error(text);
-    }
     surface.RequireStorable(resource, mip);
     const auto geometry = DescribeSurface(resource);
     if (layers > 1 && geometry.GuestLayerOffset(1) != DepthSliceBytes(target.extent, bytesPerTexel)) {
@@ -890,8 +895,8 @@ std::shared_ptr<StorageTexture> layeredDepthStorage(const Context& context, Dept
         std::snprintf(text, sizeof(text), "AGC graphics: storage image access to the depth planes of depth surface 0x%llx with a layer pitch of 0x%llx bytes, not the depth slice size 0x%llx, is not implemented", static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(geometry.GuestLayerOffset(1)), static_cast<unsigned long long>(DepthSliceBytes(target.extent, bytesPerTexel)));
         throw std::runtime_error(text);
     }
-    auto& entry = layeredStorages()[{context.device, resource.baseAddress, resource.width, resource.height, layers, resource.format, static_cast<int>(resource.tileMode), static_cast<int>(resource.dimension)}];
-    if (entry == nullptr) entry = std::make_unique<LayeredDepthStorage>(context, resource, target, bytesPerTexel, layers);
+    auto& entry = layeredStorages()[{context.device, resource.baseAddress, resource.width, resource.height, layers, resource.format, static_cast<int>(resource.tileMode), static_cast<int>(resource.dimension), resource.baseArray}];
+    if (entry == nullptr) entry = std::make_unique<LayeredDepthStorage>(context, resource, target, bytesPerTexel, resource.baseArray, layers);
     else static_cast<void>(entry->storage->Refresh());
     const auto slices = layeredSlices(context, *entry);
     for (const auto& slice : slices) slice.surface->ApplyFastClear();

@@ -4,7 +4,7 @@
 
 ## Input and conversion
 
-Use a clean ELF executable. Place its bundled ELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable, or under the parent directory selected with `--sce-module-path <path>`. The option accepts absolute paths and paths relative to the current working directory; do not include the `sce_module` directory itself. Only files directly inside the module directories are processed. SELF/fSELF containers are skipped with a warning; unwrap them before relinking if they need to be included. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error.
+Use a clean ELF executable. Place its bundled ELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable, or under the parent directory selected with `--sce-module-path <path>`. The option accepts absolute paths and paths relative to the current working directory; do not include the `sce_module` directory itself. Only files directly inside the module directories are processed. SELF/fSELF containers are skipped with a warning; unwrap them before relinking if they need to be included. `tools/unwrap_self.py <input.self> <output.elf>` does that for a decrypted container: it places the segments at the offsets of the SELF segment records and restores `p_offset % p_align == p_vaddr % p_align`, and it refuses a container whose load segments all look encrypted. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error.
 
 ```text
 source/
@@ -54,6 +54,7 @@ All switches are disabled by default. `unused-filter` defaults to `0`; `--rpath`
 | `--windows-gui`               | Select the Windows GUI subsystem instead of the console subsystem. Requires `--windows`.                                                                                                                                                                                                                                                                                                                                                                                    |
 | `--windows-fixed-base <address>` | Map the lowest ELF load page at this fixed Windows address, given in decimal or hexadecimal (`0x`). Requires `--windows`, a 64 KiB-aligned address from `0x20000` through `0x7fffffff0000`, and a complete image fitting in the user address space. The main executable has no ASLR or base relocations; an occupied address fails to load. Bundled modules keep their normal placement. |
 | `--trace-imports`             | Pass each function import through the libc.prx call tracer, see [tracing system library calls](#tracing-system-library-calls). Requires `--windows`; conflicts with `--lazy-binding`.                                                                                                                                                                                                                                                                                       |
+| `--linux-fixed-base <address>` | Load the Linux executable at this fixed address, given in decimal or hexadecimal (`0x`): every virtual address of the image is offset by it, so virtual address 0 is placed at the address, as the console places an executable. Requires a 64 KiB-aligned address from `0x10000` through `0x7fffffff0000` that is a multiple of every `PT_LOAD` alignment, and an image that ends in the user address space. The executable is written as `ET_EXEC`, without ASLR. Bundled modules keep their normal placement. Conflicts with `--windows`, `--macos` and `--lazy-binding`. |
 | `--to-intel`                  | Convert supported AMD-only instructions in the executable and bundled modules. Unsupported instructions or unreachable conversion stubs cause an error.                                                                                                                                                                                                                                                                                                                     |
 | `--to-rosetta`                | Convert as `--to-intel` does and also lower what Rosetta lacks: RDSEED becomes RDRAND, CLWB a NOP, and RDPID returns processor 0. Implies `--to-intel`. Independent of `--macos`: `--macos` alone leaves these instructions as they are. Conflicts with `--windows`.                                                    |
 | `unused-filter=0`             | Keep all imported NID references.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
@@ -79,7 +80,11 @@ The `--skip-sce-module`, `--exclude-sce-module <file>`, `--skip-syscall-check`, 
 
 ## Runtime layout
 
-For an executable that assumes its image starts at `0x400000`, use `relinker --windows --windows-fixed-base 0x400000 source/input.elf app.exe`. This maps its lowest ELF load page there; the PE headers occupy the preceding 64 KiB. Use this option only when the executable requires an exact address. Without it, the Windows executable has no `DYNAMIC_BASE` and loads at its preferred base `0x140000000`; relocations are kept, so Windows relocates it if that range is taken. Modules keep `DYNAMIC_BASE`. This option does not change Linux or macOS output.
+For an executable that assumes its image starts at `0x400000`, use `relinker --windows --windows-fixed-base 0x400000 source/input.elf app.exe`. This maps its lowest ELF load page there; the PE headers occupy the preceding 64 KiB. Use this option only when the executable requires an exact address. Without it, the Windows executable has no `DYNAMIC_BASE` and loads at its preferred base `0x140000000`; relocations are kept, so Windows relocates it if that range is taken. Modules keep `DYNAMIC_BASE`. This option does not change macOS output.
+
+For an executable that assumes its image starts at `0x400000`, as Ruffle (PPSA68091), VLC (PPSA85300) and XPSemu (PPSA97358) do when they read their `app0/imports.txt`, use `relinker --linux-fixed-base 0x400000 source/input.elf app.elf` on Linux. Use this option only when the executable requires a fixed address. Without it, Linux output is a position-independent executable as before.
+
+The same base is applied to executables selected with `--executable`; bundled PRX modules are not rebased.
 
 Paths are relative to the output executable:
 
@@ -89,11 +94,12 @@ libs/
     *.prx
 app0/
     <app resources>
+    eboot.bin
     sce_module/
         <converted modules>
 ```
 
-Use `sce_modules/` or `prx/` instead of `sce_module/` if that is the input directory name. Relinker preserves each module's directory under `app0/` and prints its exact path. Place app resources in `app0/` separately. Copy the built system libraries from `build/core/libs/libs/*.prx` into `libs/`; use libraries built for the target OS. A custom `--rpath` changes the system library location.
+Use `sce_modules/` or `prx/` instead of `sce_module/` if that is the input directory name. Relinker preserves each module's directory under `app0/` and prints its exact path. Place app resources in `app0/` separately, including the title's original `eboot.bin`: titles test `/app0/eboot.bin` to find their own directory, as it is always present on the console (ProsperoTV, ProsperoRadio, ProsperoLight and ProsperoLichess fall back to an empty `/data/homebrew/<title id>` and fail to load their fonts without it). Only the converted executable runs. Copy the built system libraries from `build/core/libs/libs/*.prx` into `libs/`; use libraries built for the target OS. A custom `--rpath` changes the system library location.
 
 Use the generated files printed as `Guest module:` for bundled title modules. `libs/` is for AnyPS5 system libraries, not the original PS5 `.prx` files. Placing an original PS5 module in `libs/` on Windows makes Windows try to load it as a DLL and can fail with error 193 (not a valid Win32 application).
 
@@ -156,9 +162,17 @@ $env:VK_LOADER_DRIVERS_DISABLE = '*dzn*'
 
 Do not disable Dozen if it is the only Vulkan driver available; the application would have no device to use. `VK_LOADER_DRIVERS_DISABLE` matches Vulkan driver manifest filenames and requires a Vulkan loader built with headers 1.3.234 or later ([loader documentation](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderInterfaceArchitecture.md#filter-environment-variables)).
 
+On Windows, NVIDIA driver 610.47 can crash in its shader compiler while pipelines are created: the log ends in `FATAL: unhandled exception 0xc0000005` with `nvgpucomp64.dll` in `rip`, on a driver thread. PPSA25344 on an RTX 3060 stopped this way in 3 of 3 New Game loads, also with `APS5_NO_PIPELINE_LTO=1`; with driver 617.42 the same build and scene ran for 40 minutes. Update the driver when the crash is in `nvgpucomp64.dll`.
+
+### HDR output
+
+HDR output is available on Windows only. Titles see it when the monitor showing the window runs in HDR mode (Settings > Display > Use HDR), the window's Vulkan surface offers an HDR10 (`VK_COLOR_SPACE_HDR10_ST2084_EXT`) swapchain in a 10-bit format, the instance has `VK_EXT_swapchain_colorspace` and the device `VK_EXT_hdr_metadata`. The monitor's luminance comes from DXGI; a monitor that reports no peak luminance is taken as 1000 nits peak and full-frame, 0 nits black. On Linux and other hosts the output is always SDR, because the surface's formats do not show whether the display is in HDR. A title's BT.2100 PQ display buffers then reach the display unchanged; without HDR output they are converted to SDR.
+
 ### Storing GPU results at each flip
 
 GPU results in storage images and render targets stay on the GPU until something reads their memory. A title that frees such an image after waiting for its GPU work and reuses the memory can have its new data overwritten when the results are stored later ([TechnicalDebt](../dev/TechnicalDebt.md)). `APS5_STORE_AT_FLIP=1` stores every pending result when a display buffer is flipped, at the cost of one write-back per pending image and frame. Any other value stops the title at its first flip.
+
+A title's own CPU reads of that memory are not seen, so a title that waits for a GPU label and then reads the results reads stale memory. `APS5_STORE_AT_LABEL=1` stores every pending result before each label the GPU writes (`RELEASE_MEM`, `WRITE_DATA`, `DMA_DATA`), at the cost of a write-back of every pending image per label. Any other value stops the title at its first label.
 
 ### Tracing system library calls
 
@@ -172,6 +186,10 @@ most called traced imports (1 calls in total):
 ```
 
 Limits are listed in the [libc](../dev/debt/libc.md) and [relinker](../dev/debt/relinker.md) technical debt.
+
+### Windows crash diagnostics
+
+Set `APS5_CRASH_INDIRECT_MEMORY=1` before launching the executable to include up to 64 bytes from each pointer found in the register memory dump. The report labels each block with its register, pointer offset and target address. Inaccessible, incomplete and executable targets are skipped. This additional dump is disabled when the variable is unset or empty.
 
 ## Exit codes
 

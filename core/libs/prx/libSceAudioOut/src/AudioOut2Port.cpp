@@ -122,13 +122,9 @@ std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, const AudioOut2
         if (index >= g_ports.size()) continue;
         const auto& port = g_ports[index];
         if (!port.used || port.generation != generation || port.context != &context || port.channels == 0) continue;
-        auto route = AudioOut2RouteForPort(port.type, port.channels);
-        if (padOut == nullptr) {
-            if (route == AudioOut2Route::PadVibration) continue;
-            route = AudioOut2Route::Main;
-        }
-        if (route == AudioOut2Route::Main) AccumulatePort(port, data, out, frames);
-        else AccumulatePadPort(port, data, route, padOut, frames);
+        const auto route = AudioOut2RouteForPort(port.type, port.channels);
+        if (route == AudioOut2Route::Main || (context.padDevice == 0 && route == AudioOut2Route::PadSpeaker)) AccumulatePort(port, data, out, frames);
+        else if (padOut != nullptr) AccumulatePadPort(port, data, route, padOut, frames);
         mixed++;
     }
     return mixed;
@@ -223,13 +219,13 @@ int APS5_VABI sceAudioOut2PortDestroy(AudioOut2PortHandle port) {
 
 int APS5_VABI sceAudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortState* state) {
     std::lock_guard lock(g_portsLock);
-    if (!FromHandle(port)) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
+    const auto* entry = FromHandle(port);
+    if (!entry) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     if (!state) return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
+    *state = AudioOut2PortState{};
     state->output = OUTPUT_MAIN;
-    state->num_channels = AUDIO_OUT2_OUTPUT_CHANNELS;
+    state->num_channels = static_cast<std::uint8_t>(entry->channels);
     state->volume = VOLUME_MAX;
-    state->reroute_counter = 0;
-    state->flags = 0;
     return 0;
 }
 

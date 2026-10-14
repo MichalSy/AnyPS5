@@ -43,8 +43,8 @@ struct PathAliases {
 };
 
 PathAliases& Aliases() {
-    static PathAliases aliases;
-    return aliases;
+    static auto* aliases = new PathAliases;
+    return *aliases;
 }
 
 std::string TrimSlashes(const char* path) {
@@ -138,11 +138,16 @@ private:
         return directory;
     }
 };
-WorkingDirectory& Directories() { static WorkingDirectory state; return state; }
-void RequireHostDirectory(const WorkingDirectory& state, const std::filesystem::path& guest) {
-    const auto relative = guest.relative_path();
-    const auto alias = ResolveAlias(relative.generic_string());
-    const auto host = alias ? *alias : ResolveHostPath(state.root, relative).make_preferred();
+WorkingDirectory& Directories() {
+    static auto* state = new WorkingDirectory;
+    return *state;
+}
+std::filesystem::path HostPath(WorkingDirectory& state, const std::filesystem::path& guest) {
+    if (auto aliased = ResolveAlias(guest.relative_path().generic_string())) return *aliased;
+    return ResolveHostPath(state.root, guest.relative_path()).make_preferred();
+}
+void RequireHostDirectory(WorkingDirectory& state, const std::filesystem::path& guest) {
+    const auto host = HostPath(state, guest);
     std::error_code error;
     const auto status = std::filesystem::status(host, error);
     if (std::filesystem::is_directory(status)) return;
@@ -160,7 +165,7 @@ void RequireHostDirectory(const WorkingDirectory& state, const std::filesystem::
 #endif
     throw std::filesystem::filesystem_error("Guest path component is not a directory", host, error);
 }
-std::filesystem::path GuestPath(const WorkingDirectory& state, const char* path) {
+std::filesystem::path GuestPath(WorkingDirectory& state, const char* path) {
     std::string text(path);
     for (auto& character : text) if (character == '\\') character = '/';
     std::filesystem::path input(text);

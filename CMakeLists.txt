@@ -93,6 +93,10 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_run_game.py ${CMAKE_CXX_COMPILER})
             set_tests_properties(run_game PROPERTIES TIMEOUT 30)
         endif()
+        add_test(NAME shader_cache_native_paths COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/tests/test_shader_cache_native_paths.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/ShaderCacheVersion.cmake ${CMAKE_COMMAND})
+        set_tests_properties(shader_cache_native_paths PROPERTIES TIMEOUT 20)
         add_test(NAME pr_overlap_encoding COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_encoding.py)
         add_test(NAME pr_overlap_dependencies COMMAND ${Python3_EXECUTABLE}
@@ -113,16 +117,22 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress_read_encoding.py)
         add_test(NAME import_audit COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_import_audit.py)
+        add_test(NAME unwrap_self COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_unwrap_self.py)
         add_test(NAME conventions_function_bodies COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_comments.py)
         add_test(NAME conventions_wrapped_declarations COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_wrapped_declarations.py)
         add_test(NAME conventions_ci_gate COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_ci_gate.py)
+        add_test(NAME conventions_doc_links COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_doc_links.py)
         add_test(NAME test_registration COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_test_registration.py)
         add_test(NAME check_skips COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_skips.py)
+        add_test(NAME check_main_sync COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_main_sync.py)
         add_test(NAME stubgen COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_stubgen.py)
         add_test(NAME debt_split COMMAND ${Python3_EXECUTABLE}
@@ -131,6 +141,9 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_stubgen_stdout_newlines.py)
         add_test(NAME hardware_oracle COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/hw-oracle/test_hw_oracle.py)
+        add_test(NAME hardware_oracle_compare COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/hw-oracle/test_compare_results.py)
+        set_tests_properties(hardware_oracle_compare PROPERTIES TIMEOUT 20)
         add_test(NAME pr_overlap_exports COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_exports.py)
         add_test(NAME pr_overlap_wrapped_exports COMMAND ${Python3_EXECUTABLE}
@@ -148,8 +161,15 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_trace_digest.py)
         add_test(NAME conventions_body_bom COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_body_bom.py)
+        add_test(NAME conventions_blob_reads COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_blob_reads.py)
         add_test(NAME conventions_agent_files COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_agent_files.py)
+        add_test(NAME check_compile COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_compile.py)
+        add_test(NAME performance_compare COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_performance_compare.py)
+        set_tests_properties(performance_compare PROPERTIES TIMEOUT 20)
     endif()
 endif()
 
