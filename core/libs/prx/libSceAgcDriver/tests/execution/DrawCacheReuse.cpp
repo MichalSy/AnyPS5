@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -21,8 +23,14 @@ using AgcDriver::DriverDetail::DrawMiss;
 using AgcDriver::DriverDetail::DrawKeySightings;
 
 alignas(256) constexpr std::array<std::uint32_t, 8> VertexCode{0x7e000208u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf80008cfu, 0x03020100u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 16> TriangleVertexCode{
+    0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
+    0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
+};
 alignas(256) constexpr std::array<std::uint32_t, 8> PixelCode{0x7e000200u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 8> ConstantPixelCode{0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0x7e000202u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
+alignas(256) std::array<float, 4> PixelConstant{};
 
 struct Header {
     Shader shader{};
@@ -31,6 +39,8 @@ struct Header {
 
 alignas(8) Header VertexHeader{};
 alignas(8) Header PixelHeader{};
+alignas(8) Header TriangleVertexHeader{};
+alignas(8) Header ConstantPixelHeader{};
 
 const Shader* Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -49,10 +59,10 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-std::vector<std::uint32_t> Draws(float scale, std::initializer_list<float> pixelWords) {
+std::vector<std::uint32_t> Draws(float scale, const std::uint32_t* vertexCode, std::uint32_t vertexUserSgprs, const std::uint32_t* pixelCode, std::uint32_t pixelUserSgprs, const std::vector<std::vector<std::uint32_t>>& pixelWords) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
-    const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
-    const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
+    const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
+    const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode);
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000},
         {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
@@ -73,28 +83,47 @@ std::vector<std::uint32_t> Draws(float scale, std::initializer_list<float> pixel
         {0x111, std::bit_cast<std::uint32_t>(-2.0f)}, {0x112, std::bit_cast<std::uint32_t>(2.0f)},
         {0x113, std::bit_cast<std::uint32_t>(1.0f)}, {0x114, 0},
         {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)},
+        {0x2fe, 0}, {0x302, 0}, {0x306, 0}, {0x30a, 0},
     };
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
-        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 1u << 1u}, {0x8c, 0},
-        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 1u << 1u}, {0x00c, std::bit_cast<std::uint32_t>(1.0f)},
+        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, vertexUserSgprs << 1u}, {0x8c, 0},
+        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, pixelUserSgprs << 1u},
     };
     std::vector<std::uint32_t> commands;
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
     for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
-    for (const auto word : pixelWords) {
-        Append(commands, 0x76, {0x00c, std::bit_cast<std::uint32_t>(word)});
+    for (const auto& words : pixelWords) {
+        for (std::uint32_t k = 0; k < words.size(); ++k) Append(commands, 0x76, {0x00c + k, words[k]});
         Append(commands, 0x2d, {3, 2});
     }
     return commands;
 }
 
-AgcDriver::DriverDetail::DrawEntryCounters Submit(float scale, std::initializer_list<float> pixelWords) {
-    auto commands = Draws(scale, pixelWords);
+AgcDriver::DriverDetail::DrawEntryCounters Submit(std::vector<std::uint32_t> commands) {
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
     return AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+}
+
+AgcDriver::DriverDetail::DrawEntryCounters Submit(float scale, std::initializer_list<float> pixelWords) {
+    std::vector<std::vector<std::uint32_t>> words;
+    for (const auto word : pixelWords) words.push_back({std::bit_cast<std::uint32_t>(word)});
+    return Submit(Draws(scale, VertexCode.data(), 1, PixelCode.data(), 1, words));
+}
+
+AgcDriver::DriverDetail::DrawEntryCounters SubmitConstantDraws(std::size_t draws) {
+    const auto constant = reinterpret_cast<std::uintptr_t>(PixelConstant.data());
+    const std::vector<std::vector<std::uint32_t>> words(draws, {static_cast<std::uint32_t>(constant), static_cast<std::uint32_t>(constant >> 32u)});
+    return Submit(Draws(32.0f, TriangleVertexCode.data(), 0, ConstantPixelCode.data(), 2, words));
+}
+
+unsigned BrightestColorByte() {
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
+    unsigned brightest = 0;
+    for (const auto value : ColorMemory) brightest = std::max(brightest, static_cast<unsigned>(value));
+    return brightest;
 }
 
 void ThirdDrawHitsTheCache(bool libraries) {
@@ -125,6 +154,34 @@ void UserDataDrawsReuseTheirShape(bool libraries) {
     Require(fresh.dataHits - known.dataHits == 1, mode + ": the third key of a new shape made " + std::to_string(fresh.dataHits - known.dataHits) + " data-only hits, expected 1");
 }
 
+void StageDataHitsRefreshTheirWords(bool libraries) {
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
+    const bool enabled = std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") == nullptr;
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    ColorMemory.fill(std::byte{0});
+    PixelConstant[0] = 0.25f;
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto cached = SubmitConstantDraws(3);
+    Require(cached.inserts - before.inserts == 1 && cached.hits - before.hits == 1, mode + ": three draws of a pixel shader reading a constant through its user words did not insert once and hit once");
+    Require(!enabled || cached.stageDataInserts - before.stageDataInserts == 1, mode + ": the inserted draw recorded " + std::to_string(cached.stageDataInserts - before.stageDataInserts) + " stages with data positions, expected the fragment stage");
+    Require(BrightestColorByte() == 64, mode + ": the draws of constant 0.25 wrote " + std::to_string(BrightestColorByte()) + ", expected 64");
+    PixelConstant[0] = 1.0f;
+    const auto refreshed = SubmitConstantDraws(1);
+    const auto fragmentMisses = refreshed.misses[static_cast<std::size_t>(DrawMiss::FragmentDiffering)] - cached.misses[static_cast<std::size_t>(DrawMiss::FragmentDiffering)];
+    if (!enabled) {
+        Require(fragmentMisses == 1, mode + ": with stage data hits off, a changed constant did not miss on the fragment stage");
+    } else if (verify) {
+        Require(refreshed.stageDataVerified - cached.stageDataVerified == 1, mode + ": the stage data hit was verified " + std::to_string(refreshed.stageDataVerified - cached.stageDataVerified) + " times, expected once");
+    } else {
+        Require(refreshed.hits - cached.hits == 1 && fragmentMisses == 0, mode + ": a draw whose constant changed missed the cached draw");
+        Require(refreshed.stageDataHits - cached.stageDataHits == 1 && refreshed.stageDataWords - cached.stageDataWords == 1, mode + ": the hit refreshed " + std::to_string(refreshed.stageDataWords - cached.stageDataWords) + " words in " + std::to_string(refreshed.stageDataHits - cached.stageDataHits) + " stages, expected 1 word in the fragment stage");
+        Require(refreshed.inserts == cached.inserts, mode + ": a stage data hit inserted a draw entry");
+    }
+    Require(BrightestColorByte() == 255, mode + ": the draw of constant 1.0 wrote " + std::to_string(BrightestColorByte()) + ", expected 255");
+}
+
 void SightingsKeepCollidingKeys() {
     DrawKeySightings sightings(DrawKeySightings::Ways);
     Require(!sightings.SeenBefore(0) && sightings.SeenBefore(0), "draw key 0 was not admitted at its second sight");
@@ -149,6 +206,7 @@ int main() {
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         ThirdDrawHitsTheCache(libraries);
         UserDataDrawsReuseTheirShape(libraries);
+        StageDataHitsRefreshTheirWords(libraries);
         AgcDriverShutdown_nid_postfix();
         std::cout << "A repeated draw reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
         return 0;

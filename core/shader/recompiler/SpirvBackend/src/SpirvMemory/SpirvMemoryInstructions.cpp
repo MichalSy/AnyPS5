@@ -1857,10 +1857,21 @@ std::uint32_t EmitSharedAtomicRsub32(SpirvValueEmitContext& ctx, const IrValue& 
 
 std::uint32_t EmitSharedAtomicFAdd32(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto data = ctx.Arg(inst, 1);
+    const auto& mem = SharedMemory(ctx, inst);
+    const bool flushInputs = mem.flushDenormals;
+    const bool flushResult = mem.flushDenormalResults;
+    const AtomicFloatBits dataBits{ctx.state, false};
+    const auto dataOperand = Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), dataBits.flush(data, flushInputs));
+    const auto dataNan = dataBits.nan(data);
+    const auto quietData = dataBits.op(spv::OpBitwiseOr, data, dataBits.constant(dataBits.quiet()));
     return SharedAtomicUpdate(ctx, inst, [&](SpirvEmitterState& state, std::uint32_t old) {
-        const auto sum = Binary(state, spv::OpFAdd, TypeF32(state), Unary(state, spv::OpBitcast, TypeF32(state), old), Unary(state, spv::OpBitcast, TypeF32(state), data));
+        const AtomicFloatBits bits{state, false};
+        const auto sum = Binary(state, spv::OpFAdd, TypeF32(state), Unary(state, spv::OpBitcast, TypeF32(state), bits.flush(old, flushInputs)), dataOperand);
         state.module.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-        return Unary(state, spv::OpBitcast, TypeU32(state), sum);
+        auto result = bits.flush(Unary(state, spv::OpBitcast, TypeU32(state), sum), flushResult);
+        result = bits.select(bits.nan(result), bits.constant(0xffc00000u), result);
+        result = bits.select(bits.nan(old), bits.op(spv::OpBitwiseOr, old, bits.constant(bits.quiet())), result);
+        return bits.select(dataNan, quietData, result);
     });
 }
 
