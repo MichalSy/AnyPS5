@@ -847,7 +847,7 @@ void EmitRuntimeBufferStore(SpirvValueEmitContext& context, const IrValue& instr
     });
 }
 
-std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const IrValue& instruction) {
+static std::uint32_t ScalarBufferLoadOne(SpirvValueEmitContext& context, const IrValue& instruction) {
     auto& state = context.state;
     if (std::ranges::find(state.supportedCapabilities, spv::CapabilityInt64) == state.supportedCapabilities.end()) context.Fail(instruction, "scalar buffer bounds require shaderInt64");
     state.module.EmitCapability(spv::CapabilityInt64);
@@ -861,6 +861,81 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
     const auto inBounds = both(state, noCarry, both(state, resource.valid, Binary(state, spv::OpULessThanEqual, TypeBool(state), Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, 4u)), size)));
     if (!context.Memory(instruction).gpuDescriptor) return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, byte, 32u); });
     return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
+}
+
+
+std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const IrValue& instruction) {
+    auto& state = context.state;
+    // Keep one guest scalar instruction together; fall back per word at descriptor boundaries.
+    if (auto found = state.bdaGroupedLoads.find(&instruction); found != state.bdaGroupedLoads.end()) {
+        auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, found->second.first, found->second.second);
+        return value;
+    }
+    const auto& memory = context.Memory(instruction);
+    if (!memory.gpuDescriptor || memory.coherent || (memory.offset & 3u) || !instruction.Parent()) return ScalarBufferLoadOne(context, instruction);
+    std::vector<std::pair<const IrValue*, std::uint32_t>> members{{&instruction, 0u}};
+    std::uint32_t used = 1u, last = 0;
+    auto& list = instruction.Parent()->Instructions();
+    auto it = std::find(list.begin(), list.end(), &instruction);
+    if (it == list.end()) return ScalarBufferLoadOne(context, instruction);
+    for (++it; it != list.end(); ++it) {
+        auto* other = *it;
+        if (other->Opcode() != instruction.Opcode()) {
+            if (IrOpcodeHasSideEffects(other->Opcode()) || AddressOpcodeInfoOf(other->Opcode()).access != AddressAccess::None ||
+                BufferAccessOf(other->Opcode()) != BufferAccess::None)
+                break;
+            continue;
+        }
+        if (other->Flags<MemoryFlags>().pc != instruction.Flags<MemoryFlags>().pc) break;
+        const auto& memberMemory = context.Memory(*other);
+        if (memberMemory.planningOnly || !memberMemory.gpuDescriptor || memberMemory.coherent || memberMemory.kind != memory.kind ||
+            other->ArgumentCount() != instruction.ArgumentCount())
+            continue;
+        bool same = true;
+        for (std::size_t j = 0; j < instruction.ArgumentCount(); ++j)
+            if (instruction.Argument(j)->Resolve() != other->Argument(j)->Resolve()) same = false;
+        auto delta = memberMemory.offset - memory.offset;
+        if (!same || delta == 0 || delta > 12 || (delta & 3u) || (used & (1u << (delta / 4)))) continue;
+        used |= 1u << (delta / 4);
+        last = std::max(last, delta / 4);
+        members.push_back({other, delta / 4});
+    }
+    if (members.size() == 1) return ScalarBufferLoadOne(context, instruction);
+    const auto resource = descriptor(context, instruction);
+    const auto u64 = TypeScalarU64(state), u32 = TypeU32(state), boolean = TypeBool(state), v4 = TypeU32Vector(state, 4);
+    const auto size =
+        Select(state, u64, equal(state, resource.stride, ConstantU32(state, 0u)), Unary(state, spv::OpUConvert, u64, resource.records),
+               Binary(state, spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, resource.stride), Unary(state, spv::OpUConvert, u64, resource.records)));
+    const auto initial = context.Arg(instruction, 1u);
+    const auto first = EmitAddU32(state, initial, ConstantU32(state, memory.offset));
+    const auto ending = EmitAddU32(state, first, ConstantU32(state, last * 4));
+    auto valid =
+        both(state, resource.valid,
+             both(state, Binary(state, spv::OpUGreaterThanEqual, boolean, first, initial), Binary(state, spv::OpUGreaterThanEqual, boolean, ending, first)));
+    const auto byte = EmitAndConstant(state, first, ~3u), offset = Unary(state, spv::OpUConvert, u64, byte);
+    valid = both(state, valid, Binary(state, spv::OpULessThanEqual, boolean, Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, last * 4 + 4)), size));
+    const auto composite = [&](const std::array<std::uint32_t, 4>& values) {
+        auto v = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, v4, v, values[0], values[1], values[2], values[3]);
+        return v;
+    };
+    const auto result = EmitValueIfElse(
+        state, valid, v4,
+        [&] {
+            return composite(EmitBdaDwordReads(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 0u, 4u, false, used));
+        },
+        [&] {
+            std::array<std::uint32_t, 4> values{ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u)};
+            for (auto [inst, component] : members)
+                values[component] = ScalarBufferLoadOne(context, *inst);
+            return composite(values);
+        });
+    for (auto [inst, component] : members)
+        state.bdaGroupedLoads[inst] = {result, component};
+    auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, u32, value, result, 0u);
+    return value;
 }
 
 std::uint32_t EmitRuntimeBufferAtomic(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t bits, std::uint32_t active, const std::function<std::uint32_t(std::uint32_t)>& operation) {

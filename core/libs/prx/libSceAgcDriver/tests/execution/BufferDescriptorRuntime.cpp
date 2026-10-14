@@ -102,7 +102,7 @@ void Run(AgcDriver::VulkanDevice& device, bool registrationModules) {
     }
 }
 
-void ConditionalDescriptor(bool scalar) {
+void ConditionalDescriptor(bool scalar, bool grouped = false, std::uint32_t lanes = Lanes) {
     alignas(256) static constexpr std::array<std::uint32_t, 13> vectorCode{
         0x34020082u, 0x7e040280u, 0xbf06800au, 0xbf850006u,
         0xf4080004u, 0xfa000000u, 0xbf8cc07fu, 0xe0001000u, 0x80000201u,
@@ -113,7 +113,13 @@ void ConditionalDescriptor(bool scalar) {
         0xf4080004u, 0xfa000000u, 0xbf8cc07fu, 0xf4200200u, 0xfa000004u,
         0xbf8cc07fu, 0x7e040208u, 0xe0701000u, 0x80010201u, 0xbf810000u,
     };
-    const auto code = scalar ? std::span<const std::uint32_t>(scalarCode) : std::span<const std::uint32_t>(vectorCode);
+    alignas(256) static constexpr std::array<std::uint32_t, 20> groupedCode{
+        0x34020084u, 0x7e040280u, 0x7e060280u, 0x7e080280u, 0x7e0a0280u, 0xbf06800au, 0xbf85000au,
+        0xf4080004u, 0xfa000000u, 0xbf8cc07fu, 0xf4280200u, 0xfa000004u, 0xbf8cc07fu,
+        0x7e040208u, 0x7e060209u, 0x7e08020au, 0x7e0a020bu, 0xe0781000u, 0x80010201u, 0xbf810000u,
+    };
+    const auto code = grouped ? std::span<const std::uint32_t>(groupedCode) : scalar ? std::span<const std::uint32_t>(scalarCode) : std::span<const std::uint32_t>(vectorCode);
+    const auto components = grouped ? 4u : 1u;
 #ifdef _WIN32
     auto* block = static_cast<std::byte*>(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
 #else
@@ -139,7 +145,7 @@ void ConditionalDescriptor(bool scalar) {
     auto* table = reinterpret_cast<std::uint32_t*>(block + 16384);
     for (std::uint32_t lane = 0; lane < Lanes; ++lane) input[lane] = 0x3f800000u + lane * 0x10000u;
     std::array<std::uint32_t, 12> userData{};
-    const auto outputDescriptor = BufferDescriptor(output, Lanes * 4u);
+    const auto outputDescriptor = BufferDescriptor(output, lanes * components * 4u);
     std::copy(outputDescriptor.begin(), outputDescriptor.end(), userData.begin() + 4);
     const auto tableAddress = reinterpret_cast<std::uintptr_t>(table);
     userData[8] = static_cast<std::uint32_t>(tableAddress);
@@ -148,11 +154,12 @@ void ConditionalDescriptor(bool scalar) {
         {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))},
         {tableAddress, std::as_bytes(std::span(table, 4))},
     }};
-    enum class Scenario { Valid, ZeroSelectors, SkippedInvalid, UsedInvalid, InvalidTypeA, InvalidTypeB, ReservedWord1 };
+    enum class Scenario { Valid, ZeroSelectors, SkippedInvalid, UsedInvalid, InvalidTypeA, InvalidTypeB, ReservedWord1, Records8, Records12, Records16, Absent, Base1, Base2, Base3 };
     std::vector<std::uint32_t> validModule;
     std::vector<std::uint32_t> invalidTypeModule;
-    for (const auto mode : {Scenario::Valid, Scenario::ZeroSelectors, Scenario::SkippedInvalid, Scenario::UsedInvalid, Scenario::InvalidTypeA, Scenario::InvalidTypeB, Scenario::ReservedWord1}) {
-        std::fill_n(output, Lanes, Fill);
+    for (const auto mode : {Scenario::Valid, Scenario::ZeroSelectors, Scenario::SkippedInvalid, Scenario::UsedInvalid, Scenario::InvalidTypeA, Scenario::InvalidTypeB, Scenario::ReservedWord1, Scenario::Records8, Scenario::Records12, Scenario::Records16, Scenario::Absent, Scenario::Base1, Scenario::Base2, Scenario::Base3}) {
+        if (!grouped && mode >= Scenario::Records8) continue;
+        std::fill_n(output, lanes * components, Fill);
         auto descriptor = BufferDescriptor(input, Lanes * 4u);
         if (mode == Scenario::ZeroSelectors) descriptor[3] = 0x18004000u;
         if (mode == Scenario::SkippedInvalid) descriptor = {0x2f7c2c7bu, 0x3bcf2fb5u, 0x2f5a2c65u, 0x3bb72f96u};
@@ -160,9 +167,14 @@ void ConditionalDescriptor(bool scalar) {
         if (mode == Scenario::InvalidTypeA) descriptor[3] = 0x42485d80u;
         if (mode == Scenario::InvalidTypeB) descriptor[3] = 0x60e98f40u;
         if (mode == Scenario::ReservedWord1) descriptor[1] |= 0x40000000u;
+        const auto baseOffset = mode == Scenario::Base1 ? 1u : mode == Scenario::Base2 ? 2u : mode == Scenario::Base3 ? 3u : 0u;
+        const auto records = mode == Scenario::Records8 ? 8u : mode == Scenario::Records12 ? 12u : mode == Scenario::Records16 ? 16u : mode == Scenario::Absent ? 0u : Lanes * 4u;
+        if (mode >= Scenario::Records8) descriptor = BufferDescriptor(reinterpret_cast<const std::byte*>(input) + baseOffset, records);
         std::copy(descriptor.begin(), descriptor.end(), table);
         userData[10] = mode == Scenario::SkippedInvalid ? 0u : 1u;
-        auto request = Request(userData, device->ComputeTarget(Lanes), memory, code);
+        auto request = Request(userData, device->ComputeTarget(lanes), memory, code);
+        request.context.waveSize = lanes;
+        request.context.compute->numThreads[0] = lanes;
         request.useCache = false;
         const auto shader = ShaderRecompiler::Recompile(request);
         if (mode == Scenario::Valid) validModule = shader.spirv.Copy();
@@ -184,10 +196,17 @@ void ConditionalDescriptor(bool scalar) {
                 "an executed invalid conditional descriptor continued to write after its GPU fault");
             continue;
         }
-        for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
-            const auto expected = scalar && mode != Scenario::SkippedInvalid ? input[1] : mode == Scenario::Valid ? input[lane] : 0u;
-            Require(output[lane] == expected,
-                "conditional descriptor produced an incorrect value or touched its skipped resource");
+        for (std::uint32_t lane = 0; lane < lanes; ++lane) {
+            for (std::uint32_t component = 0; component < components; ++component) {
+                std::uint32_t expected = scalar && mode != Scenario::SkippedInvalid ? input[1] : mode == Scenario::Valid ? input[lane] : 0u;
+                if (grouped) {
+                    expected = 0u;
+                    if (mode != Scenario::SkippedInvalid && 4u + (component + 1u) * 4u <= records)
+                        std::memcpy(&expected, reinterpret_cast<const std::byte*>(input) + baseOffset + 4u + component * 4u, sizeof(expected));
+                }
+                Require(output[lane * components + component] == expected,
+                    "conditional descriptor mode " + std::to_string(static_cast<unsigned>(mode)) + " lane " + std::to_string(lane) + " component " + std::to_string(component) + " expected " + Hex(expected) + " got " + Hex(output[lane * components + component]));
+            }
         }
     }
 }
@@ -376,6 +395,8 @@ int main() {
         Run(*device, true);
         ConditionalDescriptor(false);
         ConditionalDescriptor(true);
+        ConditionalDescriptor(true, true);
+        ConditionalDescriptor(true, true, 64u);
         RuntimeStoreFormats();
         ScalarReads(*device);
         std::puts("buffer descriptor runtime tests passed");
