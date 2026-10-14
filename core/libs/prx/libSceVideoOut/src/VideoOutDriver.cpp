@@ -17,6 +17,9 @@
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
+#if ANYPS5_ENABLE_DEBUG_BRIDGE
+#include "prx/libkernel/System/include/DebugBridge.hpp"
+#endif
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
 #if APS5_ENABLE_TIMING_LOG
 #include "prx/libSceVideoOut/include/FrameTimingLog.hpp"
@@ -284,6 +287,9 @@ VideoOutDriver::VideoOutDriver() {
         attached.get();
         vblankThread = std::jthread([this](std::stop_token token) { vblankLoop(token); });
         LibcRegisterShutdown_nid_postfix([] { VideoOutDriver::Get().Shutdown(); });
+#if ANYPS5_ENABLE_DEBUG_BRIDGE
+        DebugBridgeStart_nid_no_patch();
+#endif
     } catch (...) {
         if (vblankThread.joinable()) {
             vblankThread.request_stop();
@@ -575,6 +581,14 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     req.terminal = true;
     req.cfg->vblankCond.notify_all();
     timing.Mark("notify_game");
+#if ANYPS5_ENABLE_DEBUG_BRIDGE
+    if (req.cfg->busType == VIDEO_OUT_BUS_TYPE_MAIN) {
+        const auto finished = AgcDriver::FrameTiming::Clock::now();
+        DebugBridgePublishFrame_nid_no_patch({req.timing->Id(), static_cast<std::uint32_t>(req.outputHandle),
+            req.generation, req.cfg->flipStatus.count,
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(finished.time_since_epoch()).count())});
+    }
+#endif
 }
 
 void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& started) {

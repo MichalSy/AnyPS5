@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <optional>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -118,15 +119,30 @@ std::optional<std::filesystem::path> ResolveAlias(const std::string& guestPath) 
 struct WorkingDirectory {
     std::mutex mutex;
     const std::filesystem::path root = std::filesystem::canonical(std::filesystem::current_path());
-    std::filesystem::path current = root;
+    const std::optional<std::filesystem::path> gameRoot = configuredDirectory("ANYPS5_GAME_ROOT");
+    const std::optional<std::filesystem::path> codeRoot = configuredDirectory("ANYPS5_CODE_ROOT");
+    std::filesystem::path current = gameRoot ? "/app0" : "/";
+
+    WorkingDirectory() {
+        if (gameRoot) AddPathAlias_nid_no_patch("/app0", gameRoot->string().c_str());
+    }
+
+private:
+    static std::optional<std::filesystem::path> configuredDirectory(const char* name) {
+        const auto* configured = std::getenv(name);
+        if (!configured || !*configured) return std::nullopt;
+        const std::filesystem::path path(configured);
+        if (!path.is_absolute()) throw std::invalid_argument(std::string(name) + " must be an absolute directory");
+        const auto directory = std::filesystem::canonical(path);
+        if (!std::filesystem::is_directory(directory)) throw std::invalid_argument(std::string(name) + " is not a directory");
+        return directory;
+    }
 };
 WorkingDirectory& Directories() { static WorkingDirectory state; return state; }
-std::filesystem::path HostPath(WorkingDirectory& state, const std::filesystem::path& guest) {
-    if (auto aliased = ResolveAlias(guest.relative_path().generic_string())) return *aliased;
-    return ResolveHostPath(state.root, guest.relative_path()).make_preferred();
-}
-void RequireHostDirectory(WorkingDirectory& state, const std::filesystem::path& guest) {
-    const auto host = HostPath(state, guest);
+void RequireHostDirectory(const WorkingDirectory& state, const std::filesystem::path& guest) {
+    const auto relative = guest.relative_path();
+    const auto alias = ResolveAlias(relative.generic_string());
+    const auto host = alias ? *alias : ResolveHostPath(state.root, relative).make_preferred();
     std::error_code error;
     const auto status = std::filesystem::status(host, error);
     if (std::filesystem::is_directory(status)) return;
@@ -144,7 +160,7 @@ void RequireHostDirectory(WorkingDirectory& state, const std::filesystem::path& 
 #endif
     throw std::filesystem::filesystem_error("Guest path component is not a directory", host, error);
 }
-std::filesystem::path Resolve(WorkingDirectory& state, const char* path) {
+std::filesystem::path GuestPath(const WorkingDirectory& state, const char* path) {
     std::string text(path);
     for (auto& character : text) if (character == '\\') character = '/';
     std::filesystem::path input(text);
@@ -152,17 +168,25 @@ std::filesystem::path Resolve(WorkingDirectory& state, const char* path) {
     // Preserve the existing ability to pass explicit native drive paths.
     if (input.has_root_name()) return input;
 #endif
-    const auto current = std::filesystem::path("/") / state.current.lexically_relative(state.root);
-    const auto relative = (input.is_absolute() ? input : current / input).relative_path();
+    const auto relative = (input.is_absolute() ? input : state.current / input).relative_path();
     std::filesystem::path guest("/");
-    for (auto part = relative.begin(); part != relative.end(); ++part) {
-        if (*part == "..") {
+    for (const auto& part : relative) {
+        if (part == "..") {
             const auto parent = guest.lexically_normal();
             if (parent.has_relative_path()) RequireHostDirectory(state, parent);
         }
-        guest /= *part;
+        guest /= part;
     }
-    return HostPath(state, guest.lexically_normal());
+    guest = guest.lexically_normal();
+    return guest;
+}
+std::filesystem::path Resolve(WorkingDirectory& state, const char* path) {
+    const auto guest = GuestPath(state, path);
+#ifdef _WIN32
+    if (guest.has_root_name()) return guest;
+#endif
+    if (auto aliased = ResolveAlias(guest.relative_path().generic_string())) return *aliased;
+    return ResolveHostPath(state.root, guest.relative_path()).make_preferred();
 }
 #ifdef _WIN32
 using WriteMark = FILETIME;
@@ -250,9 +274,23 @@ int SetWorkingDirectory(WorkingDirectory& state, const std::filesystem::path& re
     const auto canonical = std::filesystem::canonical(resolved, error);
     if (error) return DirectoryFailure(error);
     if (!std::filesystem::is_directory(canonical, error)) return error ? DirectoryFailure(error) : 20;
+    auto& aliases = Aliases();
+    if (state.gameRoot) {
+        std::lock_guard lock(aliases.mutex);
+        for (const auto& [prefix, host] : aliases.entries) {
+            const auto base = std::filesystem::canonical(host, error);
+            if (error) { error.clear(); continue; }
+            const auto relative = canonical.lexically_relative(base);
+            if (relative.empty() || *relative.begin() == "..") continue;
+            state.current = (std::filesystem::path("/") / prefix / relative).lexically_normal();
+            if (state.current != state.current.root_path() && state.current.filename().empty()) state.current = state.current.parent_path();
+            return 0;
+        }
+    }
     const auto relative = canonical.lexically_relative(state.root);
     if (relative.empty() || *relative.begin() == "..") return 45;
-    state.current = canonical;
+    state.current = (std::filesystem::path("/") / relative).lexically_normal();
+    if (state.current != state.current.root_path() && state.current.filename().empty()) state.current = state.current.parent_path();
     return 0;
 }
 }
@@ -383,6 +421,17 @@ extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
     return Resolve(state, path);
 }
 
+extern "C" std::filesystem::path ResolveModulePath_nid_no_patch(const char* path) {
+    if (!path) { APS5_INVALID_ARG_EX; }
+    auto& state = Directories();
+    std::lock_guard lock(state.mutex);
+    const auto guest = GuestPath(state, path);
+    const auto relative = guest.relative_path().generic_string();
+    if (state.codeRoot && !guest.has_root_name() && HasPrefix(relative, "app0"))
+        return ResolveHostPath(*state.codeRoot, guest.relative_path()).make_preferred();
+    return Resolve(state, path);
+}
+
 extern "C" std::filesystem::path RelinkedModulePath_nid_no_patch(const std::filesystem::path& path) {
     auto relinked = path;
     relinked += ".guest.prx";
@@ -440,11 +489,10 @@ extern "C" char* APS5_VABI getcwd_nid_postfix(char* buffer, std::size_t size) {
         auto& state = Directories();
         std::lock_guard lock(state.mutex);
         std::error_code error;
-        if (!std::filesystem::is_directory(state.current, error)) {
+        if (!std::filesystem::is_directory(Resolve(state, state.current.string().c_str()), error)) {
             errno = error ? DirectoryFailure(error) : 2; return nullptr;
         }
-        const auto relative = state.current.lexically_relative(state.root);
-        const auto path = relative == "." ? std::string("/") : "/" + relative.generic_string();
+        const auto path = state.current.generic_string();
         const auto required = path.size() + 1;
         if ((buffer || size) && size < required) { errno = 34; return nullptr; }
         if (!buffer) buffer = static_cast<char*>(ApplicationHeapAllocate_nid_no_patch(size ? size : required));
