@@ -3,7 +3,6 @@
 
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include <cstdint>
-#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -39,18 +38,6 @@ inline constexpr std::uint32_t FunctionLdsDwordLimit = 8192u;
 [[nodiscard]] std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const IrProgram& program);
 [[nodiscard]] std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program);
 [[nodiscard]] bool IsWaveMaskBranch(BranchCondition condition);
-
-enum class OneLaneRejection {
-    None,
-    WaveOperation,
-    WaveSideEffect,
-    WaveMaskRegion,
-    SharedMemory,
-    BindlessIndex,
-};
-
-[[nodiscard]] OneLaneRejection Wave64OneLaneRejection(const IrProgram& program, std::uint32_t workgroupThreads, std::span<const std::uint32_t> capabilities, IrOpcode* blocker = nullptr);
-[[nodiscard]] const char* OneLaneRejectionName(OneLaneRejection rejection);
 
 }
 

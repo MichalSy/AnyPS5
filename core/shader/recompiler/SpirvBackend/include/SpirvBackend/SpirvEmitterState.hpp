@@ -90,7 +90,6 @@ struct SpirvEmitterState {
     const IrValue* independentReadWriteStore = nullptr;
     std::uint32_t hostSubgroupSize = 0;
     bool splitSubgroup = false;
-    bool waveSpansSubgroups = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
     bool registrationModules = false;
