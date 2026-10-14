@@ -204,6 +204,7 @@ CompiledVariant sampleVariant() {
     buffer.descriptorFormatted = true;
     buffer.formattedReadMask = 5u;
     buffer.typedAlignment = 2u;
+    buffer.gpuDescriptorOnly = true;
     info.info.buffers = {buffer, BufferResource{}};
     ImageResource image{};
     image.source = 5;
@@ -1347,6 +1348,7 @@ IrResourcePlan handBuiltPlan() {
     every.planningOnly = true;
     every.coherent = true;
     every.gpuDescriptor = true;
+    every.gpuDescriptorOnly = true;
     every.flushDenormals = true;
     plan.memoryInfo = {memory, every, MemoryInfo{}};
     DescriptorSource buffer;

@@ -16,6 +16,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1162,6 +1163,31 @@ private:
         source = InternSource(descriptor);
     }
 
+    bool ConditionalRead(const DescriptorSource& descriptor) const {
+        std::vector<const IrValue*> values;
+        for (const auto* word : descriptor.dwords) if (word != nullptr) values.push_back(word);
+        std::unordered_set<const IrValue*> visited;
+        while (!values.empty()) {
+            const auto* value = values.back()->Resolve();
+            values.pop_back();
+            if (!visited.insert(value).second) continue;
+            const auto* parent = value->Parent();
+            if (value->Opcode() == IrOpcode::ReadConst && parent != nullptr && parent != m_program.Blocks().front().get()) {
+                std::vector<const IrBlock*> pending{m_program.Blocks().front().get()};
+                std::unordered_set<const IrBlock*> seen;
+                while (!pending.empty()) {
+                    const auto* block = pending.back();
+                    pending.pop_back();
+                    if (block == parent || !seen.insert(block).second) continue;
+                    if (block->Successors().empty()) return true;
+                    for (const auto* next : block->Successors()) pending.push_back(next);
+                }
+            }
+            for (std::uint32_t index = 0; index < value->ArgumentCount(); ++index) values.push_back(value->Argument(index));
+        }
+        return false;
+    }
+
     bool TakeGpuDescriptor(IrValue& inst, std::uint32_t memoryIndex) {
         const IrValue* handle = inst.Argument(0)->Resolve();
         if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) {
@@ -1173,11 +1199,17 @@ private:
         auto& memory = m_program.Resources().memoryInfo[memoryIndex];
         const auto access = BufferAccessOf(inst.Opcode());
         if (ValidateSource(descriptor, badDword)) {
+            const bool conditional = ConditionalRead(descriptor);
             const auto source = InternSource(descriptor);
-            const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
+            const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc, conditional);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");
             AddMemoryPatch(memoryIndex, resource, 0u, false);
-            memory.gpuDescriptor = false;
+            memory.gpuDescriptor = conditional;
+            memory.gpuDescriptorOnly = conditional;
+            if (conditional) {
+                m_info.usesDma = true;
+                m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;
+            }
             m_info.usesFaultBuffer = m_info.usesFaultBuffer || access == BufferAccess::Atomic;
             return true;
         }
@@ -1197,15 +1229,16 @@ private:
         }
     }
 
-    std::uint32_t AddBuffer(std::uint32_t source, const MemoryInfo& memory, IrOpcode op, std::uint32_t pc) {
+    std::uint32_t AddBuffer(std::uint32_t source, const MemoryInfo& memory, IrOpcode op, std::uint32_t pc, bool gpuOnly = false) {
         for (std::uint32_t i = 0; i < m_info.buffers.size(); i++) {
-            if (m_info.buffers[i].source == source) {
+            if (m_info.buffers[i].source == source && m_info.buffers[i].gpuDescriptorOnly == gpuOnly) {
                 Merge(m_info.buffers[i], memory, op, pc);
                 return i;
             }
         }
         BufferResource resource;
         resource.source = source;
+        resource.gpuDescriptorOnly = gpuOnly;
         resource.firstUsePc = pc;
         Merge(resource, memory, op, pc);
         m_info.buffers.push_back(resource);

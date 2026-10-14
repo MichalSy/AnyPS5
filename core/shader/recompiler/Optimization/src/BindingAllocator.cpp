@@ -117,11 +117,11 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
 
     if (!info.buffers.empty()) {
-        std::vector<std::uint32_t> resources(info.buffers.size());
-        for (std::uint32_t i = 0; i < resources.size(); i++) {
-            resources[i] = i;
+        std::vector<std::uint32_t> resources;
+        for (std::uint32_t i = 0; i < info.buffers.size(); i++) {
+            if (!info.buffers[i].gpuDescriptorOnly) resources.push_back(i);
         }
-        addBinding(next, DescriptorBindingKind::Buffers, std::move(resources));
+        if (!resources.empty()) addBinding(next, DescriptorBindingKind::Buffers, std::move(resources));
     }
 
     std::array<std::vector<std::uint32_t>, ImageBindingCount> imageGroups;
