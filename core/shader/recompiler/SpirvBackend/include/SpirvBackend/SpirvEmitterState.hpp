@@ -129,6 +129,7 @@ struct SpirvEmitterState {
     std::uint32_t dot2F32F16Function = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
+    std::array<std::uint32_t, 2> bdaSpanLoadFunctions{};
     std::uint32_t bdaStopValue = 0;
     std::uint32_t bdaPcOverride = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
@@ -205,6 +206,7 @@ struct SpirvValueEmitContext {
     SpirvEmitterState& state;
     std::unordered_map<const IrValue*, std::uint32_t> definitions;
     std::unordered_set<const IrValue*> batchedScalarReads;
+    std::unordered_map<const IrBlock*, std::map<std::array<std::uint32_t, 4>, std::uint32_t>> scalarBufferBases;
     std::uint32_t scratchU32Variable = 0;
     SpirvValueEmitContext* otherHalf = nullptr;
     std::uint32_t half = 0;

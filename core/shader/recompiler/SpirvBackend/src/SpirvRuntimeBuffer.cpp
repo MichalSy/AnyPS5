@@ -636,6 +636,49 @@ void EmitRuntimeBufferStore(SpirvValueEmitContext& context, const IrValue& instr
     });
 }
 
+static std::uint32_t ResolvedScalarBufferBase(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource,
+                                              std::uint32_t size) {
+    auto& state = context.state;
+    const auto zero = BdaConstant(state, 0u);
+    if (state.currentBlock == nullptr || state.bdaProbeFunction == 0u || state.bdaSpanLoadFunctions[0] == 0u || BdaByteReadsForced() ||
+        context.Memory(instruction).coherent)
+        return zero;
+    const auto* handle = instruction.Argument(0)->Resolve();
+    std::array<std::uint32_t, 4> key{};
+    for (std::size_t index = 0; index < key.size(); ++index)
+        key[index] = context.Arg(*handle, index);
+    auto& bases = context.scalarBufferBases[state.currentBlock];
+    if (const auto found = bases.find(key); found != bases.end())
+        return found->second;
+    const auto fits = both(state, resource.valid,
+                           both(state, Binary(state, spv::OpUGreaterThan, TypeBool(state), size, zero),
+                                Binary(state, spv::OpULessThanEqual, TypeBool(state), size, BdaConstant(state, 0xffffffffu))));
+    const auto physical = EmitValueOrDefaultIfCondition(state, fits, TypeScalarU64(state), zero, [&] {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), value, state.bdaProbeFunction, resource.base,
+                                 Unary(state, spv::OpUConvert, TypeU32(state), size), BdaInstructionPc(state, instruction));
+        return value;
+    });
+    const auto aligned = equal(state, Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), physical, BdaConstant(state, 3u)), zero);
+    const auto base = Select(state, TypeScalarU64(state), aligned, physical, zero);
+    bases.emplace(key, base);
+    return base;
+}
+
+static std::array<std::uint32_t, 4> LoadResolvedScalarBuffer(SpirvValueEmitContext& context, std::uint32_t base, std::uint32_t offset, std::uint32_t count) {
+    auto& state = context.state;
+    const auto loaded = state.module.AllocateId();
+    const auto physical = Binary(state, spv::OpIAdd, TypeScalarU64(state), base, offset);
+    state.module.AddFunction(spv::OpFunctionCall, TypeU32Vector(state, 4), loaded, state.bdaSpanLoadFunctions[0], physical, ConstantU32(state, 0u),
+                             ConstantU32(state, (1u << count) - 1u));
+    std::array<std::uint32_t, 4> values{};
+    for (std::uint32_t component = 0; component < count; ++component) {
+        values[component] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), values[component], loaded, component);
+    }
+    return values;
+}
+
 std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const IrValue& instruction) {
     auto& state = context.state;
     if (std::ranges::find(state.supportedCapabilities, spv::CapabilityInt64) == state.supportedCapabilities.end()) context.Fail(instruction, "scalar buffer bounds require shaderInt64");
@@ -649,7 +692,16 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
     const auto offset = Unary(state, spv::OpUConvert, u64, byte);
     const auto inBounds = both(state, noCarry, both(state, resource.valid, Binary(state, spv::OpULessThanEqual, TypeBool(state), Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, 4u)), size)));
     if (!context.Memory(instruction).gpuDescriptor) return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, byte, 32u); });
-    return EmitValueOrZeroIfCondition(state, inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
+    if (state.bdaSpanLoadFunctions[0] == 0u)
+        return EmitValueOrZeroIfCondition(
+            state, inBounds, [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
+    const auto resolved = ResolvedScalarBufferBase(context, instruction, resource, size);
+    return EmitValueOrZeroIfCondition(state, inBounds, [&] {
+        return EmitValueIfElse(
+            state, Binary(state, spv::OpINotEqual, TypeBool(state), resolved, BdaConstant(state, 0u)), TypeU32(state),
+            [&] { return LoadResolvedScalarBuffer(context, resolved, offset, 1u)[0]; },
+            [&] { return readBuffer(context, instruction, AddBdaAddress(context, instruction, resource.base, offset, false), 32u); });
+    });
 }
 
 std::uint32_t EmitRuntimeScalarBufferLoads(SpirvValueEmitContext& context, std::span<const IrValue* const> instructions) {
@@ -672,10 +724,19 @@ std::uint32_t EmitRuntimeScalarBufferLoads(SpirvValueEmitContext& context, std::
         both(state, noCarry,
              both(state, resource.valid,
                   Binary(state, spv::OpULessThanEqual, TypeBool(state), Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, count * 4u)), size)));
+    const auto resolved = ResolvedScalarBufferBase(context, first, resource, size);
     return EmitValueIfElse(
         state, inBounds, TypeU32Composite(state, count),
         [&] {
-            return composite(state, count, EmitBdaDwordReads(context, first, AddBdaAddress(context, first, resource.base, offset, false), 0u, count, true));
+            if (state.bdaSpanLoadFunctions[0] == 0u)
+                return composite(state, count, EmitBdaDwordReads(context, first, AddBdaAddress(context, first, resource.base, offset, false), 0u, count, true));
+            return EmitValueIfElse(
+                state, Binary(state, spv::OpINotEqual, TypeBool(state), resolved, BdaConstant(state, 0u)), TypeU32Composite(state, count),
+                [&] { return composite(state, count, LoadResolvedScalarBuffer(context, resolved, offset, count)); },
+                [&] {
+                    return composite(state, count,
+                                     EmitBdaDwordReads(context, first, AddBdaAddress(context, first, resource.base, offset, false), 0u, count, true));
+                });
         },
         [&] {
             std::array<std::uint32_t, 4> values{};

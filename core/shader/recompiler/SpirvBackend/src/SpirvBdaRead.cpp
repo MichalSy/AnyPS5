@@ -356,6 +356,7 @@ void DefineBdaSpanReadFunctions(SpirvEmitterState& state) {
     for (const bool coherent : {false, true}) {
         if (!coherent || coherentAccesses) loaders[coherent] = DefineBdaSpanLoadFunction(state, coherent);
     }
+    state.bdaSpanLoadFunctions = loaders;
     for (const bool stop : {false, true}) {
         if (stop && !stops) continue;
         state.bdaStopsInvocations = stop;

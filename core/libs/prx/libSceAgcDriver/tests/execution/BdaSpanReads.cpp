@@ -163,22 +163,46 @@ void RunScalar(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::uint32_t
 }
 
 void RunScalarBuffer(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::uint32_t waveSize, const ShaderRecompiler::SpirvTarget& target) {
-    // Load a runtime V#, then s_buffer_load_dwordx4 s[16:19], s[8:11], s3.
-    alignas(256) const std::array<std::uint32_t, 18> code{0xbf068004u, 0xbf850002u, 0xf4080200u, 0x04000000u, 0xbf8cc07fu, 0xf4280404u,
-                                                          0x06000000u, 0xbf8cc07fu, 0x7e020210u, 0x7e040211u, 0x7e060212u, 0x7e080213u,
-                                                          0x340a0084u, 0x4a0a0affu, OutputBase,  0xdc788000u, 0x00000105u, 0xbf810000u};
-    for (const std::uint32_t records : {48u, 44u, 40u, 36u}) {
+    // Two s_buffer_load_dwordx4 instructions reuse one runtime V#; store both vectors per lane.
+    alignas(256) const std::array<std::uint32_t, 27> code{
+        0xbf068004u, 0xbf850002u, 0xf4080200u, 0x04000000u, 0xbf8cc07fu, 0xf4280404u, 0x06000000u, 0xbf8cc07fu, 0xf4280504u,
+        0xfa000000u, 0xbf8cc07fu, 0x7e020210u, 0x7e040211u, 0x7e060212u, 0x7e080213u, 0x340a0085u, 0x4a0a0affu, OutputBase,
+        0xdc788000u, 0x00000105u, 0x7e020214u, 0x7e040215u, 0x7e060216u, 0x7e080217u, 0xdc788010u, 0x00000105u, 0xbf810000u,
+    };
+    struct Case {
+        std::uint32_t source;
+        std::uint32_t offset;
+        std::uint32_t records;
+    };
+    const std::array<Case, 11> cases{{
+        {0x1000u, 32u, 48u},
+        {0x1001u, 32u, 48u},
+        {0x1000u, 32u, 0u},
+        {0x1000u, 32u, 44u},
+        {0x1000u, 32u, 40u},
+        {0x1000u, 32u, 36u},
+        {BlockBytes - 32u, 16u, 64u},
+        {BlockBytes - 32u, 16u, 32u},
+        {BlockBytes - 32u, 16u, 28u},
+        {BlockBytes - 32u, 16u, 24u},
+        {BlockBytes - 32u, 16u, 20u},
+    }};
+    for (const auto& test : cases) {
         auto initial = Initial();
         const auto address = reinterpret_cast<std::uintptr_t>(guest.Data());
-        const auto source = address + 0x1000u;
+        const auto source = address + test.source;
         initial[LoadBase / 4u] = static_cast<std::uint32_t>(source);
         initial[LoadBase / 4u + 1u] = static_cast<std::uint32_t>(source >> 32u);
-        initial[LoadBase / 4u + 2u] = records;
+        initial[LoadBase / 4u + 2u] = test.records;
         initial[LoadBase / 4u + 3u] = 56u << 12u;
-        for (std::uint32_t component = 0; component < 4u; ++component)
-            initial[(0x1000u + 32u) / 4u + component] = 0x92000000u + component;
+        for (std::uint32_t component = 0; component < 4u; ++component) {
+            const auto first = 0x92000000u + component;
+            const auto second = 0x91000000u + component;
+            std::memcpy(reinterpret_cast<std::byte*>(initial.data()) + test.source + test.offset + component * 4u, &first, 4);
+            std::memcpy(reinterpret_cast<std::byte*>(initial.data()) + test.source + component * 4u, &second, 4);
+        }
         std::memcpy(guest.Data(), initial.data(), BlockBytes);
-        const std::array<std::uint32_t, 5> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), LoadBase, 32u, 1u};
+        const std::array<std::uint32_t, 5> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), LoadBase, test.offset, 1u};
         const auto result = Recompile(code, waveSize, userData, target, ShaderRecompiler::MemoryRegion{address, std::as_bytes(std::span(initial))});
         device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
         device.WaitIdle();
@@ -186,10 +210,12 @@ void RunScalarBuffer(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::ui
         std::memcpy(memory.data(), guest.Data(), BlockBytes);
         auto expected = initial;
         for (std::uint32_t lane = 0; lane < Threads; ++lane) {
-            for (std::uint32_t component = 0; component < 4u; ++component)
-                expected[OutputBase / 4u + lane * 4u + component] = 32u + component * 4u + 4u <= records ? 0x92000000u + component : 0u;
+            for (std::uint32_t component = 0; component < 4u; ++component) {
+                expected[OutputBase / 4u + lane * 8u + component] = test.offset + component * 4u + 4u <= test.records ? 0x92000000u + component : 0u;
+                expected[OutputBase / 4u + lane * 8u + 4u + component] = component * 4u + 4u <= test.records ? 0x91000000u + component : 0u;
+            }
         }
-        Require(memory == expected, "BDA scalar buffer group changed bounds, values, or neighboring bytes");
+        Require(memory == expected, "BDA scalar buffer reuse changed bounds, values, or neighboring bytes");
     }
 }
 }
