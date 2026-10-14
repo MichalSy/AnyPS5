@@ -184,6 +184,101 @@ void ConditionalDescriptor() {
     }
 }
 
+void RuntimeStoreFormats() {
+#ifdef _WIN32
+    auto* block = static_cast<std::byte*>(VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+    auto* block = static_cast<std::byte*>(std::aligned_alloc(65536, 65536));
+#endif
+    Require(block != nullptr, "runtime store formats allocation failed");
+    GuestAllocations::Mutation().Add(block, 65536, true, true, true);
+    struct Cleanup {
+        void* block;
+        ~Cleanup() {
+            GuestAllocations::Mutation().Remove(block);
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } cleanup{block};
+    const auto device = OpenVulkanTestDevice();
+    Require(device != nullptr, "runtime store format GPU unavailable");
+    auto* actual = block;
+    auto* expected = block + 4096;
+    auto* formatWord = reinterpret_cast<std::uint32_t*>(block + 8192);
+    for (const auto d16 : {false, true}) {
+        for (const auto components : {1u, 4u}) {
+            std::vector<std::uint32_t> referenceCode{
+                0x34020084u, 0x7e080208u, 0x7e0a0209u, 0x7e0c020au, 0x7e0e020bu,
+                0xe0001000u | ((d16 ? 0x84u : 0x04u) + components - 1u) << 18u, 0x80000401u, 0xbf810000u,
+            };
+            auto runtimeCode = referenceCode;
+            runtimeCode.insert(runtimeCode.begin(), {0xe0300000u, 0x80010200u, 0xbf8c3f70u, 0x7e060502u});
+            std::array<std::uint32_t, 12> userData{};
+            const auto outputDescriptor = BufferDescriptor(actual, Lanes * 16u);
+            std::copy(outputDescriptor.begin(), outputDescriptor.end(), userData.begin());
+            const auto tableDescriptor = BufferDescriptor(formatWord, 4u);
+            std::copy(tableDescriptor.begin(), tableDescriptor.end(), userData.begin() + 4);
+            const std::array<std::uint32_t, 4> values = d16 ? std::array<std::uint32_t, 4>{0x00003800u, 0x0000bc00u, 0x00007c00u, 0x00000001u} : std::array<std::uint32_t, 4>{0x3f000000u, 0xbf800000u, 0x7f800000u, 0x00000001u};
+            std::copy(values.begin(), values.end(), userData.begin() + 8);
+            auto runtimeRequest = Request(userData, device->ComputeTarget(Lanes), {}, runtimeCode);
+            runtimeRequest.useCache = false;
+            const auto runtimeShader = ShaderRecompiler::Recompile(runtimeRequest);
+            for (std::uint32_t format = 1; format <= 77u; ++format) {
+                std::memset(actual, 0xcd, Lanes * 16u + 16u);
+                std::memset(expected, 0xcd, Lanes * 16u + 16u);
+                *formatWord = (0x31016facu & ~(0x7fu << 12u)) | (format << 12u);
+                const auto referenceDescriptor = BufferDescriptor(expected, Lanes * 16u);
+                std::copy(referenceDescriptor.begin(), referenceDescriptor.end(), userData.begin());
+                userData[3] = *formatWord;
+                auto referenceRequest = Request(userData, device->ComputeTarget(Lanes), {}, referenceCode);
+                referenceRequest.useCache = false;
+                const auto referenceShader = ShaderRecompiler::Recompile(referenceRequest);
+                device->Dispatch(referenceShader, 1, 1, 1);
+                device->WaitIdle();
+                device->Dispatch(runtimeShader, 1, 1, 1);
+                device->WaitIdle();
+                Require(std::memcmp(actual, expected, Lanes * 16u + 16u) == 0, "runtime formatted store differs from specialized store: format " + std::to_string(format) + " components " + std::to_string(components) + " d16 " + std::to_string(d16));
+            }
+            for (const auto invalidFormat : {0u, 78u}) {
+                std::memset(actual, 0xcd, Lanes * 16u + 16u);
+                *formatWord = (0x31016facu & ~(0x7fu << 12u)) | (invalidFormat << 12u);
+                try {
+                    device->Dispatch(runtimeShader, 1, 1, 1);
+                    device->WaitIdle();
+                } catch (const std::runtime_error& error) {
+                    const std::string message(error.what());
+                    if (message.find("BDA access failed") == std::string::npos || message.find("reason=8") == std::string::npos) throw;
+                }
+                Require(std::all_of(actual, actual + Lanes * 16u + 16u, [](std::byte value) { return value == std::byte{0xcd}; }), "invalid runtime formatted store modified its output");
+            }
+            *formatWord = 0x3104dfacu;
+            std::memset(actual, 0xcd, Lanes * 16u + 16u);
+            std::memset(expected, 0xcd, Lanes * 16u + 16u);
+            const auto limitedActual = BufferDescriptor(actual, Lanes * 16u - 1u);
+            std::copy(limitedActual.begin(), limitedActual.end(), userData.begin());
+            userData[3] = *formatWord;
+            auto limitedRequest = Request(userData, device->ComputeTarget(Lanes), {}, runtimeCode);
+            limitedRequest.useCache = false;
+            const auto limitedShader = ShaderRecompiler::Recompile(limitedRequest);
+            const auto limitedExpected = BufferDescriptor(expected, Lanes * 16u - 1u);
+            std::copy(limitedExpected.begin(), limitedExpected.end(), userData.begin());
+            userData[3] = *formatWord;
+            auto controlRequest = Request(userData, device->ComputeTarget(Lanes), {}, referenceCode);
+            controlRequest.useCache = false;
+            const auto controlShader = ShaderRecompiler::Recompile(controlRequest);
+            device->Dispatch(controlShader, 1, 1, 1);
+            device->WaitIdle();
+            device->Dispatch(limitedShader, 1, 1, 1);
+            device->WaitIdle();
+            Require(std::memcmp(actual, expected, Lanes * 16u + 16u) == 0, "runtime formatted store differs at NUM_RECORDS boundary");
+            Require(std::all_of(actual + (Lanes - 1u) * 16u, actual + Lanes * 16u + 16u, [](std::byte value) { return value == std::byte{0xcd}; }), "out-of-range runtime formatted store performed a partial write");
+        }
+    }
+}
+
 }
 
 int main() {
@@ -194,6 +289,7 @@ int main() {
         Run(*device, false);
         Run(*device, true);
         ConditionalDescriptor();
+        RuntimeStoreFormats();
         std::puts("buffer descriptor runtime tests passed");
         return 0;
     } catch (const std::exception& error) {

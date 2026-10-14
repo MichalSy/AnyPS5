@@ -20,6 +20,8 @@
 
 ### Functional
 
+- GPU-selected formatted stores decode the existing format table and reuse the original conversion for each component type/width pair. The guarded writes preserve packed assembly, zero-fill beyond the opcode component count, bounds, byte widths and BDA faults. NVIDIA tests compare all 77 formats for scalar/vector stores and D16 against the unchanged specialized path; broader hardware and title performance remain to be measured.
+
 - Conditional buffer descriptors loaded on a path that does not dominate all exits use the existing checked GPU descriptor path. All descriptor words, including format and TYPE, are evaluated at execution instead of specializing their captured payload. Tests require module identity across valid format changes and invalid TYPE payloads, correct valid output, and InvalidDescriptor faults on executed invalid accesses. Per-lane descriptor changes outside the captured SRT contract are not covered.
 
 - [Cached source IR](../../../core/shader/recompiler/Recompiler.cpp) releases lazily allocated SSA construction tables after resource preparation and reclaims values unreachable from instructions, metadata and resource plans when retaining a pending source program. Immediate shader preparation skips reclamation because compilation consumes the program. Reclamation must account for every new IR pointer owner; a remaining external use throws. Live IDs are retained. Source and variant entries remain cached without an eviction bound. A pending source program is released after its first variant is obtained; memory beyond the measured title checkpoint and Linux performance remain unmeasured.

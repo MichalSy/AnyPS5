@@ -60,6 +60,7 @@ Counts Count(std::span<const std::uint32_t> words) {
 Counts Compile(std::size_t loads, bool formattedStores = false, bool gpu = false, bool vertex = false, bool registration = false) {
     std::vector<std::uint32_t> code;
     if (gpu) code.push_back(0x7e160500u);
+    if (gpu && formattedStores) code.push_back(0x7e0e0500u);
     for (std::uint32_t load = 0; load < loads; ++load) code.insert(code.end(), {0xe0000000u | (load * 4u), 0x80020000u | ((10u + load) << 8u)});
     code.push_back(0xbf8c3f70u);
     for (std::uint32_t load = 0; load < loads; ++load) code.insert(code.end(), {(formattedStores ? 0xe0100000u : 0xe0700000u) | (load * 4u), 0x80010000u | ((10u + load) << 8u)});
@@ -105,6 +106,8 @@ int main() {
         Check(storeOne.functions == none.functions + 2 && storeOne.calls == none.calls + 2, "formatted buffer once: a formatted load and a formatted store to another resource emitted " + std::to_string(storeOne.functions - none.functions) + " functions and " + std::to_string(storeOne.calls - none.calls) + " calls more than none, expected one function and one call each");
         Check(storeThree.functions == storeOne.functions && storeThree.calls == storeOne.calls + 4 && storeThree.switches == storeOne.switches, "formatted buffer once: two more formatted loads and stores emitted " + std::to_string(storeThree.functions - storeOne.functions) + " functions, " + std::to_string(storeThree.calls - storeOne.calls) + " calls and " + std::to_string(storeThree.switches - storeOne.switches) + " switches more, expected four calls only");
         Check(three.words - one.words < one.words - none.words, "formatted buffer once: 2 more formatted loads added " + std::to_string(three.words - one.words) + " SPIR-V words, as many as the first one with its shared function (" + std::to_string(one.words - none.words) + ")");
+        const auto gpuStore = Compile(1, true, true);
+        Check(gpuStore.words < 40000u, "formatted buffer once: runtime formatted load and store exceed 40000 words");
         const auto gpuThree = Compile(3, false, true);
         Check(gpuThree.functions == gpuOne.functions && gpuThree.calls > gpuOne.calls, "formatted buffer once: two more formatted loads from a GPU-selected descriptor emitted " + std::to_string(gpuThree.functions - gpuOne.functions) + " more functions, expected calls to the shared one");
         Check(gpuThree.switches == gpuOne.switches, "formatted buffer once: two more formatted loads from a GPU-selected descriptor emitted " + std::to_string(gpuThree.switches - gpuOne.switches) + " more format switches");
