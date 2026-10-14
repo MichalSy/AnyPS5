@@ -444,6 +444,10 @@ public:
     static bool GpuTimingEnabled();
     static bool BatchStampsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
+    static constexpr std::uint64_t DrawProgramKeyBit = std::uint64_t{1} << 63u;
+    // Times draw commands inside an already active render pass without ending it or resetting
+    // queries there. The pass's class timing must have initialized the query pool beforehand.
+    std::uint32_t BeginDrawGpuTiming(std::uint64_t programAddress, VkCommandBuffer commands);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]

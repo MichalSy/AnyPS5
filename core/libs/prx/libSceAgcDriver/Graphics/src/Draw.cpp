@@ -1541,6 +1541,18 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
 // resident targets with their views, the indirect records (null for a direct draw), how the
 // completion work is handled (`listed`, `completion`, `waited`: see Draw) and, from a recipe, the
 // push constant block (else assembled from the stages).
+// Group complete draws by their pixel program (or front-end program for depth-only draws).
+// This attributes the whole graphics pipeline, not the pixel stage in isolation.
+std::uint64_t drawProgramAddress(std::span<const CompiledShader> shaders) {
+    for (const auto& shader : shaders) {
+        if (shader.stage == ShaderRecompiler::ShaderStage::Fragment && shader.programAddress != 0) return shader.programAddress;
+    }
+    for (const auto& shader : shaders) {
+        if (shader.programAddress != 0) return shader.programAddress;
+    }
+    return 0;
+}
+
 struct RecordedDraw {
     Recorder* recorder = nullptr;
     std::shared_ptr<ShaderResources> resources;
@@ -1775,6 +1787,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    const auto programTiming = recorder->BeginDrawGpuTiming(drawProgramAddress(shaders), commands);
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (record.pipeline->SplitsFaces()) {
         record.pipeline->ContinueBackFaces(commands, state);
@@ -1784,6 +1797,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
+    recorder->EndGpuTiming(programTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
@@ -2287,6 +2301,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    const auto programTiming = recorded ? recorder->BeginDrawGpuTiming(drawProgramAddress(shaders), commands) : Recorder::NoTiming;
     recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
     if (pipeline->SplitsFaces()) {
         pipeline->ContinueBackFaces(commands, state);
@@ -2296,6 +2311,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
     }
+    if (recorded) recorder->EndGpuTiming(programTiming);
     if (meshArguments != nullptr && recorded) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(indirect.path, indirect.readMs, rewritten);
     auto checkRecords = indirectRecordCheck(args != nullptr ? &indirect : nullptr);
