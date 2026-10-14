@@ -829,7 +829,7 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
     for (const auto& mode : modes) message += " " + describe(mode.numericClass, mode.dimension, mode.conversionFormat, mode.packedFormat, mode.cube, mode.depthBits, mode.depthUnorm16, mode.srgbDecode);
     char words[96];
     std::snprintf(words, sizeof(words), "; T# %08x %08x %08x %08x %08x %08x %08x %08x", descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]);
-    throw std::runtime_error(message + words);
+    throw std::runtime_error(message + words + "; source " + std::to_string(image.source) + ", first use pc " + std::to_string(image.firstUsePc));
 }
 
 std::uint32_t ResourceMaterializer::EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index) {

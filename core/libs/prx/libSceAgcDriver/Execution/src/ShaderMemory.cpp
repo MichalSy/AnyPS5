@@ -256,7 +256,14 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.readMemory = &read;
     runtime.readSpecializationMemory = &read;
     runtime.accessible = &accessible;
-    auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    try {
+        capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+    } catch (const std::runtime_error& error) {
+        char where[96];
+        std::snprintf(where, sizeof(where), "shader resource capture 0x%llx stage %u: ", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage));
+        throw std::runtime_error(std::string(where) + error.what());
+    }
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);
         totals.resolveNanoseconds += capture->sourceNanoseconds;
