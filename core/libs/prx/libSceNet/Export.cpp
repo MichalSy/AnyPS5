@@ -77,6 +77,8 @@ constexpr int NET_AF_INET6 = 28;
 constexpr int NET_SOCK_STREAM = 1;
 constexpr int NET_SOCK_DGRAM = 2;
 constexpr int NET_SOCK_RAW = 3;
+constexpr int NET_SOCK_DGRAM_P2P = 6;
+constexpr int NET_SOCK_STREAM_P2P = 10;
 constexpr int NET_EPOLL_CTL_ADD = 1;
 constexpr int NET_EPOLL_CTL_MOD = 2;
 constexpr int NET_EPOLL_CTL_DEL = 3;
@@ -87,6 +89,7 @@ constexpr int NET_SO_ERROR = 0x1007;
 constexpr int NET_SO_NBIO = 0x1200;
 constexpr int NET_SO_REUSEADDR = 0x4;
 constexpr int NET_SO_BROADCAST = 0x20;
+constexpr int NET_SO_BROADCAST_PS5 = 0x20000;
 constexpr int NET_SO_SNDBUF = 0x1001;
 constexpr int NET_SO_RCVBUF = 0x1002;
 constexpr int NET_SO_SCE_SNDTIMEO = 0x1105;
@@ -629,11 +632,13 @@ int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol)
     if (family != NET_AF_INET && family != NET_AF_INET6) {
         return fail(NET_EAFNOSUPPORT);
     }
-    if (type != NET_SOCK_STREAM && type != NET_SOCK_DGRAM && type != NET_SOCK_RAW) {
+    const int transportType = type == NET_SOCK_DGRAM_P2P ? NET_SOCK_DGRAM :
+        type == NET_SOCK_STREAM_P2P ? NET_SOCK_STREAM : type;
+    if (transportType != NET_SOCK_STREAM && transportType != NET_SOCK_DGRAM && transportType != NET_SOCK_RAW) {
         return fail(NET_EPROTONOSUPPORT);
     }
     if (!initialize_sockets()) return fail(5);
-    const NativeSocket native = ::socket(family == NET_AF_INET ? AF_INET : AF_INET6, type, protocol);
+    const NativeSocket native = ::socket(family == NET_AF_INET ? AF_INET : AF_INET6, transportType, protocol);
     if (native == INVALID_NATIVE_SOCKET) return fail(native_error());
     const int ipv6_only = 1;
     if (family == NET_AF_INET6 &&
@@ -654,7 +659,7 @@ int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol)
     std::lock_guard lk(g_mutex);
     Sock s;
     s.family = family;
-    s.type = type;
+    s.type = transportType;
     s.native = std::move(handle);
     g_socks[fd] = s;
     return fd;
@@ -1013,6 +1018,7 @@ int APS5_VABI sceNetSetsockopt(int s, int level, int optname, const void* optval
     if (!optval || optlen < sizeof(int)) return fail(NET_EINVAL);
     int value = 0;
     std::memcpy(&value, optval, sizeof(value));
+    const bool broadcast = optname == NET_SO_BROADCAST || optname == NET_SO_BROADCAST_PS5;
     if (optname == NET_SO_NBIO) {
 #ifdef _WIN32
         u_long enabled = value != 0;
@@ -1025,8 +1031,8 @@ int APS5_VABI sceNetSetsockopt(int s, int level, int optname, const void* optval
     } else if (optname == NET_SO_RCVTIMEO || optname == NET_SO_SNDTIMEO) {
         if (value < 0) return fail(NET_EINVAL);
         if (set_native_timeout(socket.native->value, optname, value) != 0) return fail(native_error());
-    } else if (optname == NET_SO_REUSEADDR || optname == NET_SO_BROADCAST || optname == NET_SO_SNDBUF || optname == NET_SO_RCVBUF) {
-        const int native_option = optname == NET_SO_REUSEADDR ? SO_REUSEADDR : optname == NET_SO_BROADCAST ? SO_BROADCAST : optname == NET_SO_SNDBUF ? SO_SNDBUF : SO_RCVBUF;
+    } else if (optname == NET_SO_REUSEADDR || broadcast || optname == NET_SO_SNDBUF || optname == NET_SO_RCVBUF) {
+        const int native_option = optname == NET_SO_REUSEADDR ? SO_REUSEADDR : broadcast ? SO_BROADCAST : optname == NET_SO_SNDBUF ? SO_SNDBUF : SO_RCVBUF;
         if (::setsockopt(socket.native->value, SOL_SOCKET, native_option, reinterpret_cast<const char*>(&value), sizeof(value)) != 0)
             return fail(native_error());
     } else {
