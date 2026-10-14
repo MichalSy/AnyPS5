@@ -866,6 +866,7 @@ static std::uint32_t ScalarBufferLoadOne(SpirvValueEmitContext& context, const I
 
 std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const IrValue& instruction) {
     auto& state = context.state;
+    if (state.program.Resources().stage != IrShaderStage::Compute) return ScalarBufferLoadOne(context, instruction);
     // Keep one guest scalar instruction together; fall back per word at descriptor boundaries.
     if (auto found = state.bdaGroupedLoads.find(&instruction); found != state.bdaGroupedLoads.end()) {
         auto value = state.module.AllocateId();
