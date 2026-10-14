@@ -49,7 +49,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-std::vector<std::uint32_t> DrawThrice() {
+std::vector<std::uint32_t> Draws(float scale, std::initializer_list<float> pixelWords) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
     const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
@@ -69,7 +69,7 @@ std::vector<std::uint32_t> DrawThrice() {
         {0x90, 0x80000000}, {0x91, 0x40040},
         {0x94, 0x80000000}, {0x95, 0x40040},
         {0x318, static_cast<std::uint32_t>(color >> 8u)}, {0x390, static_cast<std::uint32_t>(color >> 40u)},
-        {0x10f, std::bit_cast<std::uint32_t>(32.0f)}, {0x110, std::bit_cast<std::uint32_t>(32.0f)},
+        {0x10f, std::bit_cast<std::uint32_t>(scale)}, {0x110, std::bit_cast<std::uint32_t>(scale)},
         {0x111, std::bit_cast<std::uint32_t>(-2.0f)}, {0x112, std::bit_cast<std::uint32_t>(2.0f)},
         {0x113, std::bit_cast<std::uint32_t>(1.0f)}, {0x114, 0},
         {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)},
@@ -82,26 +82,47 @@ std::vector<std::uint32_t> DrawThrice() {
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
     for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
-    Append(commands, 0x2d, {3, 2});
-    Append(commands, 0x2d, {3, 2});
-    Append(commands, 0x2d, {3, 2});
+    for (const auto word : pixelWords) {
+        Append(commands, 0x76, {0x00c, std::bit_cast<std::uint32_t>(word)});
+        Append(commands, 0x2d, {3, 2});
+    }
     return commands;
+}
+
+AgcDriver::DriverDetail::DrawEntryCounters Submit(float scale, std::initializer_list<float> pixelWords) {
+    auto commands = Draws(scale, pixelWords);
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    return AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
 }
 
 void ThirdDrawHitsTheCache(bool libraries) {
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
-    auto commands = DrawThrice();
-    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
-    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
-    AgcDriverWaitIdle_nid_postfix();
-    const auto counters = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto counters = Submit(32.0f, {1.0f, 1.0f, 1.0f});
     const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
     const auto layout = counters.misses[static_cast<std::size_t>(DrawMiss::Layout)];
     Require(counters.lookups == 3 && counters.absent == 2, mode + ": the three draws made " + std::to_string(counters.lookups) + " draw-cache lookups (" + std::to_string(counters.absent) + " without an entry), expected 3 lookups with 2 absent");
     Require(counters.inserts == 1, mode + ": the three draws inserted " + std::to_string(counters.inserts) + " draw entries, expected 1: a key is cached the second time it is seen");
     Require(layout == 0, mode + ": the repeated draw missed the draw cache on its push offset (" + std::to_string(layout) + " layout misses)");
     Require(counters.hits == 1, mode + ": the repeated draw did not reuse the cached draw (" + std::to_string(counters.hits) + " hits)");
+}
+
+void UserDataDrawsReuseTheirShape(bool libraries) {
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto known = Submit(32.0f, {2.0f, 3.0f, 4.0f});
+    Require(known.lookups - before.lookups == 3 && known.absent - before.absent == 3, mode + ": three draws with new user words did not miss the draw key three times");
+    Require(known.dataHits - before.dataHits == 3, mode + ": " + std::to_string(known.dataHits - before.dataHits) + " of three draws that differ from a cached draw only in user words reused its decode, expected 3");
+    Require(known.inserts == before.inserts, mode + ": a new key of a shape that has an entry was cached at its first sight");
+    const auto stages = known.dataStagesReused + known.dataStagesCompiled - before.dataStagesReused - before.dataStagesCompiled;
+    Require(stages == 6, mode + ": the three data-only hits accounted " + std::to_string(stages) + " stages, expected 6");
+    Require(verify ? known.dataVerified - before.dataVerified == 3 : known.dataStagesReused - before.dataStagesReused == 3, mode + ": the data-only hits reused " + std::to_string(known.dataStagesReused - before.dataStagesReused) + " stages and verified " + std::to_string(known.dataVerified - before.dataVerified) + ", expected the 3 vertex stages, whose user words did not change");
+    const auto fresh = Submit(16.0f, {5.0f, 6.0f, 7.0f});
+    Require(fresh.inserts - known.inserts == 1, mode + ": three keys of a new shape inserted " + std::to_string(fresh.inserts - known.inserts) + " draw entries, expected 1: the shape's second key");
+    Require(fresh.dataHits - known.dataHits == 1, mode + ": the third key of a new shape made " + std::to_string(fresh.dataHits - known.dataHits) + " data-only hits, expected 1");
 }
 
 void SightingsKeepCollidingKeys() {
@@ -127,6 +148,7 @@ int main() {
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         ThirdDrawHitsTheCache(libraries);
+        UserDataDrawsReuseTheirShape(libraries);
         AgcDriverShutdown_nid_postfix();
         std::cout << "A repeated draw reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
         return 0;

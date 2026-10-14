@@ -24,6 +24,7 @@ constexpr std::uint32_t spiPsInputCntl0 = 0x191;
 constexpr std::uint32_t spiPsInputEna = 0x1B3;
 constexpr std::uint32_t spiPsInputAddr = 0x1B4;
 constexpr std::uint32_t spiPsInControl = 0x1B6;
+constexpr std::uint32_t spiBarycCntl = 0x1B8;
 constexpr std::uint32_t dbShaderControl = 0x203;
 constexpr std::uint32_t spiShaderColFormat = 0x1C5;
 constexpr std::uint32_t defaultPixelInputs = 0x2u;
@@ -158,6 +159,7 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
         .posZ = loaded(PixelInput::PositionZ),
         .posW = loaded(PixelInput::PositionW),
         .frontFace = loaded(PixelInput::FrontFace),
+        .frontFaceAllBits = loaded(PixelInput::FrontFace) && ((read(context, spiBarycCntl, RegisterBank::Context) >> 24u) & 0x1u) != 0,
         .ancillary = loaded(PixelInput::Ancillary),
         .sampleShading = loaded(PixelInput::PerspectiveSample) && loaded(PixelInput::LinearSample),
         .noPerspective = loaded(PixelInput::LinearCenter),

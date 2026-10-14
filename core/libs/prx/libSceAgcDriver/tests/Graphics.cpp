@@ -62,7 +62,7 @@ AgcDriver::QueueState makeState() {
     queue.userConfig[0x242] = 4;
     queue.context = {
         {0x2d5, 0x2000},
-        {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
+        {0x1b6, 0}, {0x1b8, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
         {0x2dc, 0xaa00}, {0x2f8, 0}, {0x292, 2}, {0x293, 0},
         {0x80, 0}, {0x8d, 0}, {0x83, 0xffff}, {0x8c, 0xa},
         {0x2f9, 0x2d}, {0x313, 0x6000}, {0x30e, 0xffffffff}, {0x30f, 0xffffffff},
@@ -777,12 +777,14 @@ void ShaderStageTests() {
     Require(stages.path == AgcDriver::Graphics::ShaderPath::Tessellation && stages.tessellation, "tessellation routing changed");
     const auto& tessellation = *stages.tessellation;
     Require(tessellation.inputControlPoints == 3 && tessellation.outputControlPoints == 3 && tessellation.domain == 1 && tessellation.partitioning == 2 && tessellation.outputTopology == 2 && stages.minTessellationLevel == 1.0f && stages.maxTessellationLevel == 64.0f && tessellation.patchesPerGroup == 85 && tessellation.primitiveGroupSize == 85 && !tessellation.breakAtInstance, "the passthrough triangle-patch configuration decoded differently");
-    for (const auto [parameters, reason] : {std::pair{0x44049u, "VGT_TF_PARAM"}, std::pair{0x140049u, "VGT_TF_PARAM"}, std::pair{0x2040049u, "VGT_TF_PARAM"}, std::pair{0x40059u, "fractional-odd partitioning"}, std::pair{0x4004du, "fractional-odd partitioning"}, std::pair{0x40045u, "fractional-odd partitioning"}, std::pair{0x40048u, "fractional-odd partitioning"}, std::pair{0x40029u, "fractional-odd partitioning"}, std::pair{0x4004bu, "fractional-odd partitioning"}}) {
+    for (const auto [parameters, reason] : {std::pair{0x44049u, "VGT_TF_PARAM"}, std::pair{0x140049u, "VGT_TF_PARAM"}, std::pair{0x2040049u, "VGT_TF_PARAM"}, std::pair{0x40059u, "fractional-odd partitioning"}, std::pair{0x40045u, "fractional-odd partitioning"}, std::pair{0x40048u, "fractional-odd partitioning"}, std::pair{0x40029u, "fractional-odd partitioning"}, std::pair{0x4004bu, "fractional-odd partitioning"}}) {
         queue.context[0x2db] = parameters;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, reason);
     }
     queue.context[0x2db] = 0x40041;
     Require(AgcDriver::Graphics::DecodeState(queue).stages.tessellation->partitioning == 0, "integer-partitioned triangle patches decoded differently");
+    queue.context[0x2db] = 0x4004d;
+    Require(AgcDriver::Graphics::DecodeState(queue).stages.tessellation->partitioning == 3, "fractional-even-partitioned triangle patches decoded differently");
     queue.context[0x2d6] = 0x1043f;
     queue.context[0x2db] = 0x4006a;
     queue.context[0x286] = 0x41100000;
@@ -1130,6 +1132,11 @@ void PixelInputLayoutTests() {
     Require(PixelInputVgpr(pixel.inputAddr, PixelInput::PerspectiveCenter) == 0u && PixelInputVgpr(pixel.inputAddr, PixelInput::PerspectiveCentroid) == 2u && PixelInputVgpr(pixel.inputAddr, PixelInput::LinearCenter) == 4u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionX) == 6u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionY) == 7u, "the centroid layout moved the inputs");
     pixel = decode(0x1146u, 0x1146u);
     Require(pixel.linearCentroid && !pixel.noPerspective && PixelInputVgpr(pixel.inputAddr, PixelInput::LinearCentroid) == 4u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionX) == 6u && PixelInputVgpr(pixel.inputAddr, PixelInput::FrontFace) == 7u, "the linear centroid layout moved the inputs");
+    Require(!pixel.frontFaceAllBits, "FRONT_FACE_ALL_BITS was decoded from a clear SPI_BARYC_CNTL");
+    queue.context[0x1b8] = 1u << 24u;
+    Require(decode(0x1146u, 0x1146u).frontFaceAllBits, "SPI_BARYC_CNTL FRONT_FACE_ALL_BITS was not decoded");
+    Require(!decode(0x326u, 0x326u).frontFaceAllBits, "FRONT_FACE_ALL_BITS was decoded for a pixel program without the front-face input");
+    queue.context[0x1b8] = 0u;
     pixel = decode(0x506u, 0x7afu);
     Require(pixel.inputAddr == 0x7afu && !pixel.posY && pixel.posZ && PixelInputVgpr(pixel.inputAddr, PixelInput::PerspectiveCentroid) == 4u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionX) == 12u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionZ) == 14u, "ADDR-only inputs did not reserve their VGPRs");
     for (const auto bit : {0x8u, 0x4000u}) {
@@ -2266,6 +2273,7 @@ VKAPI_ATTR VkResult VKAPI_CALL sampleLocationDepthProperties(VkPhysicalDevice, V
 
 void multisampleTests() {
     using AgcDriver::Graphics::ColorMetadataPass;
+    using AgcDriver::Graphics::DecodeColorBuffer;
     using AgcDriver::Graphics::DecodeColorMetadataPass;
     using AgcDriver::Graphics::DecodeState;
     const auto multisampled = [] {
@@ -2482,6 +2490,10 @@ void multisampleTests() {
     queue.context[0x31f] = 0;
     expectFailure([&] { DecodeState(queue); }, "without a CMASK address");
     queue = multisampled();
+    queue.context[0x31c] |= 0x10000000u;
+    expectFailure([&] { DecodeState(queue); }, "DCC over a multisampled color target is unsupported");
+    expectFailure([&] { DecodeColorBuffer(queue.context, 0); }, "DCC over a multisampled color target is unsupported");
+    queue = multisampled();
     queue.context[0x31c] |= 0x2000;
     setCmaskAddress(queue);
     std::vector<AgcDriver::Graphics::RegisterRead> reads;
@@ -2512,6 +2524,9 @@ void multisampleTests() {
     queue = rasterizedResolve;
     queue.context[0x32b] = queue.context[0x31c] ^ (1u << 8u);
     expectFailure([&] { DecodeColorMetadataPass(queue); }, "different formats or extents");
+    queue = rasterizedResolve;
+    queue.context[0x31c] |= 0x10000000u;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "DCC over a multisampled color target is unsupported");
     queue = multisampled();
     queue.context[0x0] = 0;
     queue.context[0x202] = 0xcc0030;
@@ -2527,6 +2542,32 @@ void multisampleTests() {
     queue.context[0x0] = 0;
     queue.context[0x202] = 0xcc0020;
     expectFailure([&] { DecodeColorMetadataPass(queue); }, "multisampled color target");
+    queue.context[0x31c] |= 0x10000000u;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "DCC over a multisampled color target is unsupported");
+    queue = multisampled();
+    queue.context[0x2f8] = 0;
+    queue.context[0x0] = 0;
+    queue.context[0x202] = 0x00cc0050;
+    queue.context[0x31c] = 0x1002e028;
+    queue.context[0x31d] = 0x00012000;
+    queue.context[0x325] = 0x2000;
+    queue.context[0x323] = 0x3f800000;
+    queue.context[0x324] = 0x3f800000;
+    setCmaskAddress(queue);
+    auto fmaskPass = DecodeColorMetadataPass(queue);
+    Require(fmaskPass.has_value() && fmaskPass->mode == ColorMetadataPass::Mode::FmaskDecompress && fmaskPass->targets.size() == 1 && fmaskPass->targets[0].samples == 4 && fmaskPass->targets[0].cmaskAddress == cmaskAddress && fmaskPass->targets[0].dccAddress != 0, "an FMASK decompress of a 4x multisampled target with CMASK and DCC did not decode");
+    Require(fmaskPass->targets[0].clearWords[0] == 0x3f800000 && fmaskPass->targets[0].clearWords[1] == 0x3f800000, "fast clear words changed");
+    queue = makeState();
+    queue.context[0x0] = 0;
+    queue.context[0x202] = 0x00cc0050;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "over a single-sample target");
+    queue = multisampled();
+    queue.context[0x2f8] = 0;
+    queue.context[0x0] = 0;
+    queue.context[0x202] = 0x00cc0050;
+    queue.context[0x31c] = 0x00008028;
+    queue.context[0x31d] = 0x00012000;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "FMASK decompress of a target without a CMASK address");
 
     using AgcDriver::Graphics::DccKeys;
     using AgcDriver::Graphics::MultisampledCmask;
@@ -2546,6 +2587,7 @@ void multisampleTests() {
     MultisampledCmask seeded(0x30000, 0x1000);
     seeded.SeedKeys(DccKeys::Clear0000);
     Require(seeded.TakeClear(), "a fast-cleared seed did not clear its first use");
+    Require(!seeded.TakeClear(), "a subsequent use applied the clear again");
     MultisampledCmask mixedSeed(0x30000, 0x1000);
     mixedSeed.SeedKeys(DccKeys::Mixed);
     expectFailure([&] { mixedSeed.TakeClear(); }, "not modeled");
@@ -4715,6 +4757,40 @@ void copiedWriterIndirectOverlapTests() {
     ::operator delete(copiedBlock, std::align_val_t{half});
 }
 
+void registeredReadableCoverTests() {
+    using namespace AgcDriver::Graphics;
+
+    constexpr std::size_t block = 65536;
+    auto* memory = static_cast<std::byte*>(::operator new(4 * block, std::align_val_t{block}));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto add = [&](std::size_t index, bool readable) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, memory + index * block, block, readable, readable, true);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto remove = [&](std::size_t index) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, memory + index * block);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+
+    add(0, true);
+    add(1, true);
+    Require(RegisteredReadableCovers(base, block), "a registered allocation must be covered");
+    Require(RegisteredReadableCovers(base + block / 2, block), "a range across two adjacent registered allocations must be covered");
+    Require(RegisteredReadableCovers(base, 2 * block), "two adjacent registered allocations must be covered together");
+    Require(!RegisteredReadableCovers(base + block, 2 * block), "a range past the last registered allocation must not be covered");
+    add(3, true);
+    Require(!RegisteredReadableCovers(base, 4 * block), "a range over a gap between registered allocations must not be covered");
+    add(2, false);
+    Require(!RegisteredReadableCovers(base + block, 2 * block), "a range over an unreadable registered allocation must not be covered");
+    Require(RegisteredReadableCovers(base + 3 * block, block), "the readable allocation after an unreadable one must be covered");
+    Require(!RegisteredReadableCovers(base, 0), "an empty range must not be covered");
+    for (std::size_t index = 0; index < 4; ++index) remove(index);
+    Require(!RegisteredReadableCovers(base, block), "a removed allocation must not be covered");
+    ::operator delete(memory, std::align_val_t{block});
+}
+
 void rectListTests() {
     using namespace ShaderRecompiler;
     using namespace AgcDriver::Graphics;
@@ -5184,7 +5260,48 @@ void stencilRefExportTests() {
     Require(both == "capability extension depth replacing builtin store ", "a depth and stencil reference export declared the wrong outputs: " + both);
     const auto depthOnly = stencilRefShape(ShaderRecompiler::Recompile(stencilRefExportRequest(0x51u, stencilExport, DepthStencilRefExportCode)).spirv.Words());
     Require(depthOnly == "depth ", "an MRTZ stencil channel without STENCIL_TEST_VAL_EXPORT_ENABLE declared the wrong outputs: " + depthOnly);
-    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(stencilRefExportRequest(0x52u, plain))); }, "VK_EXT_shader_stencil_export");
+    const auto emulated = ShaderRecompiler::Recompile(stencilRefExportRequest(0x52u, plain));
+    Require(emulated.stencilReferences == std::vector<std::uint32_t>{0u} && emulated.stencilReplaySafe && stencilRefShape(emulated.spirv.Words()).empty(), "a constant stencil reference was not lowered to replay");
+    Require(emulated.stencilReferenceDword == 0u && emulated.pushConstants.size() == sizeof(std::uint32_t), "a stencil-only shader did not reserve dynamic reference data");
+    auto replayRequest = stencilRefExportRequest(0x52u, plain);
+    const auto replayHandle = ShaderRecompiler::PrepareShader(replayRequest);
+    const auto replayCapture = ShaderRecompiler::CaptureResources(replayRequest, ShaderRecompiler::SrtRuntime{}, *replayHandle);
+    const auto firstReplay = ShaderRecompiler::MaterializeShader(replayRequest, *replayCapture, *replayHandle);
+    replayRequest.layout.pushConstantOffsetBytes = 128u;
+    Require(ShaderRecompiler::MatchesPreparedShader(replayRequest, *replayHandle), "moving the stencil replay stage slot invalidated the prepared artifact");
+    const auto movedReplay = ShaderRecompiler::MaterializeShader(replayRequest, *replayCapture, *replayHandle);
+    Require(firstReplay->spirv != movedReplay->spirv && firstReplay->variantId == movedReplay->variantId && firstReplay->pushConstants == movedReplay->pushConstants, "prepared stencil replay did not move only the dynamic reference offset");
+    replayRequest.layout.pushConstantSizeBytes = 0u;
+    Require(!ShaderRecompiler::MatchesPreparedShader(replayRequest, *replayHandle), "prepared stencil replay accepted an exhausted push range");
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(replayRequest)); }, "unused push constant dword");
+    const std::array<std::uint32_t, 5> pushedDepthStencil{0x7e000200u, 0x7e0e02f2u, 0xf8001883u, 0x700u, 0xbf810000u};
+    const std::array<std::uint32_t, 1> pushedDepth{0x3f000000u};
+    auto pushedRequest = stencilRefExportRequest(0x53u, plain, pushedDepthStencil);
+    pushedRequest.context.userData = pushedDepth;
+    pushedRequest.layout = {0u, 0u, 96u, 32u};
+    const auto pushedHandle = ShaderRecompiler::PrepareShader(pushedRequest);
+    ShaderRecompiler::SrtRuntime pushedRuntime{};
+    pushedRuntime.userData = pushedDepth;
+    const auto pushedCapture = ShaderRecompiler::CaptureResources(pushedRequest, pushedRuntime, *pushedHandle);
+    const auto pushedResult = ShaderRecompiler::MaterializeShader(pushedRequest, *pushedCapture, *pushedHandle);
+    Require(pushedResult->stencilReferenceDword == 1u && pushedResult->pushConstants.size() == 8u, "a nonaligned replay stage did not reserve its reference after existing push data");
+    for (const auto [offset, bytes] : {std::pair{128u, 128u}, std::pair{120u, 8u}}) {
+        pushedRequest.layout.pushConstantOffsetBytes = offset;
+        pushedRequest.layout.pushConstantSizeBytes = bytes;
+        Require(ShaderRecompiler::MatchesPreparedShader(pushedRequest, *pushedHandle), "a replay payload could not move within a valid stage range");
+        const auto moved = ShaderRecompiler::MaterializeShader(pushedRequest, *pushedCapture, *pushedHandle);
+        Require(moved->pushConstants == pushedResult->pushConstants && moved->spirv != pushedResult->spirv, "moving replay push data changed its payload or retained its old offset");
+    }
+    pushedRequest.layout = {0u, 0u, 124u, 4u};
+    Require(!ShaderRecompiler::MatchesPreparedShader(pushedRequest, *pushedHandle), "a full push budget reused a replay artifact");
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(pushedRequest)); }, "unused push constant dword");
+    pushedRequest.layout.pushConstantSizeBytes = 8u;
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(pushedRequest)); }, "crosses a stage slot");
+    const std::array<std::uint32_t, 4> noStencilExport{0x7e0e02f2u, 0xf800180fu, 0x07070707u, 0xbf810000u};
+    auto noStencilRequest = stencilRefExportRequest(0x52u, plain, noStencilExport);
+    noStencilRequest.layout.pushConstantSizeBytes = 0u;
+    const auto noStencil = ShaderRecompiler::Recompile(noStencilRequest);
+    Require(noStencil.stencilReferences.empty() && noStencil.stencilReferenceDword == 0xffffffffu && noStencil.pushConstants.empty(), "a stencil export flag without a remaining stencil output reserved replay state");
     auto queue = stencilRefExportQueue(0x52u, 2u);
     queue.context[0x000] = 0;
     queue.context[0x002] = 0;
@@ -6573,6 +6690,7 @@ int main(int argc, char** argv) {
         floatControlsModeTests();
         barycentricEmulationTests();
         copiedWriterIndirectOverlapTests();
+        registeredReadableCoverTests();
         mock = MockVulkan{};
         auto bdaContext = mockContext();
         bdaContext.bufferDeviceAddress = true;

@@ -2870,7 +2870,7 @@ void verifyPixelRequestSerialization() {
     const auto fields = [](const ShaderPixelStageInfo& value) {
         return std::tie(value.interpolatorCount, value.interpolatorSettings, value.wave32, value.inputAddr,
                         value.hasPerspectiveCenterVgpr, value.perspectiveCentroid, value.posX, value.posY,
-                        value.posZ, value.posW, value.frontFace, value.ancillary, value.sampleShading,
+                        value.posZ, value.posW, value.frontFace, value.frontFaceAllBits, value.ancillary, value.sampleShading,
                         value.noPerspective, value.linearCentroid, value.pixelKillEnable, value.depthExportEnable,
                         value.sampleMaskExportEnable, value.earlyZ, value.executeOnNoop, value.conservativeZExport, value.orderedPixelShader,
                         value.targetOutputMode, value.targetExportMapping, value.alphaToCoverage, value.stencilRefExportEnable, value.rasterPrimitive, value.layerExported, value.ditheredAlphaToCoverage);
@@ -2902,6 +2902,7 @@ void verifyPixelRequestSerialization() {
         .posZ = true,
         .posW = true,
         .frontFace = true,
+        .frontFaceAllBits = true,
         .ancillary = true,
         .sampleShading = true,
         .noPerspective = true,
@@ -2969,7 +2970,13 @@ void verifyPixelRequestSerialization() {
     minimal.context.pixel->layerExported = true;
     minimal.context.pixel->ditheredAlphaToCoverage = true;
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQRkAAAA=", "new requests did not use serialization version 25");
+    require(requestPrefix(encoded, 8u) == "NVNQQRsAAAA=", "new requests did not use serialization version 27");
+    const std::array<std::uint32_t, 2> fallbacks{0x40u, 0x1ac4u};
+    auto withFallbacks = minimal;
+    withFallbacks.context.linkedCallFallbacks = fallbacks;
+    const auto fallbackRequest = serializer.Deserialize(serializer.Serialize(withFallbacks));
+    require(std::ranges::equal(fallbackRequest.request.context.linkedCallFallbacks, fallbacks), "the linked call fallbacks did not round-trip");
+    require(serializer.Deserialize(encoded).request.context.linkedCallFallbacks.empty(), "a request without linked call fallbacks gained some");
     require(serializer.Deserialize(encoded).request.context.pixel->rasterPrimitive == RasterPrimitive::Rectangle && serializer.Deserialize(encoded).request.context.pixel->ditheredAlphaToCoverage, "the pixel primitive class or dither mode did not round-trip");
     require(serializer.Deserialize(encoded).request.context.pixel->layerExported, "the pixel layer export did not round-trip");
     const auto legacy16 = serializer.Deserialize(
@@ -3078,10 +3085,10 @@ void verifyPixelRequestSerialization() {
         require(RecompileCacheKey::ContextHash(legacy19.request) == RecompileCacheKey::ContextHash(upgraded19.request), "upgrading version19 changed shader identity");
     }
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
-    for (std::size_t bytes = 0; bytes < 23u; ++bytes) {
-        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class, layer export or dither flag was accepted");
+    for (std::size_t bytes = 0; bytes < 24u; ++bytes) {
+        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class, layer export, dither or front-face flag was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRoAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRwAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
     static constexpr std::string_view version18Request{
@@ -3199,7 +3206,20 @@ void verifyVertexInfoVersion19() {
     std::size_t flagOffset = 0;
     while (flagOffset < legacyPixel.size() && legacyPixel[flagOffset] == exportedBytes[flagOffset]) ++flagOffset;
     require(flagOffset < legacyPixel.size(), "the pixel layer export flag is not serialized");
-    legacyPixel.erase(legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset), legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset + 2u));
+    auto allBitsPixel = pixel;
+    allBitsPixel.context.pixel->frontFaceAllBits = true;
+    const auto allBitsBytes = decodeBase64(serializer.Serialize(allBitsPixel));
+    auto version26Pixel = decodeBase64(encodedPixel);
+    std::size_t allBitsOffset = 0;
+    while (allBitsOffset < version26Pixel.size() && version26Pixel[allBitsOffset] == allBitsBytes[allBitsOffset]) ++allBitsOffset;
+    require(allBitsOffset == flagOffset + 2u, "the front-face all-bits flag does not follow the dithered coverage flag");
+    version26Pixel.erase(version26Pixel.begin() + static_cast<std::ptrdiff_t>(allBitsOffset));
+    version26Pixel[4] = 26u;
+    const auto replay26 = serializer.Deserialize(encodeBase64(version26Pixel));
+    require(replay26.request.context.pixel.has_value() && replay26.request.context.pixel->rasterPrimitive == RasterPrimitive::Rectangle && !replay26.request.context.pixel->frontFaceAllBits, "a version 26 request lost its pixel primitive class or read a front-face all-bits flag");
+    require(serializer.Serialize(replay26.request) == encodedPixel, "a version 26 request misread the fields after its dithered coverage flag");
+    legacyPixel.erase(legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset), legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset + 3u));
+    legacyPixel.resize(legacyPixel.size() - sizeof(std::uint64_t));
     for (const auto version : {19u, 20u, 21u, 22u}) {
         auto versionPixel = legacyPixel;
         versionPixel[4] = static_cast<std::uint8_t>(version);

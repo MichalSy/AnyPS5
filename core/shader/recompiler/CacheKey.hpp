@@ -52,6 +52,7 @@ public:
         append(key, request.context.pixel);
         append(key, request.context.vertex);
         append(key, request.context.floatMode);
+        appendFallbacks(key, request);
         appendMesh(key, request);
         appendTessellation(key, request);
         std::uint64_t hash = 0xcbf29ce484222325ull;
@@ -84,12 +85,18 @@ private:
         append(key, request.context.pixel);
         append(key, request.context.vertex);
         append(key, request.context.floatMode);
+        appendFallbacks(key, request);
         appendMesh(key, request);
         appendTessellation(key, request);
         append(key, request.target);
         append(key, DebugProbeActive());
         append(key, RayTracingStrict());
         append(key, RayTracingMiss());
+    }
+
+    static void appendFallbacks(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
+        append(key, request.context.linkedCallFallbacks.size());
+        for (const auto programCounter : request.context.linkedCallFallbacks) append(key, programCounter);
     }
 
     static void appendMesh(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
@@ -169,6 +176,7 @@ private:
         append(key, value.posZ);
         append(key, value.posW);
         append(key, value.frontFace);
+        append(key, value.frontFaceAllBits);
         append(key, value.ancillary);
         append(key, value.sampleShading);
         append(key, value.noPerspective);
