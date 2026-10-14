@@ -21,7 +21,7 @@ void ReturnBdaZeroIf(SpirvEmitterState& state, std::uint32_t condition) {
 }
 
 // (u64 address, u32 bytes, u32 instruction) -> u64 device address of the range holding all the bytes,
-std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read) {
+std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read, std::uint32_t rangeIndexCache = 0u) {
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
@@ -78,33 +78,54 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         {binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow},
     });
-    const auto header = state.module.AllocateId();
-    const auto body = state.module.AllocateId();
-    const auto continuation = state.module.AllocateId();
-    const auto merge = state.module.AllocateId();
-    const auto entryLabel = state.currentLabel;
-    state.module.AddFunction(spv::OpBranch, header);
-    EmitLabel(state, header);
-    const auto lower = state.module.AllocateId();
-    const auto upper = state.module.AllocateId();
-    const auto newLow = state.module.AllocateId();
-    const auto newHigh = state.module.AllocateId();
-    state.module.AddFunction(spv::OpPhi, u32, lower, constant(0), entryLabel, newLow, continuation);
-    state.module.AddFunction(spv::OpPhi, u32, upper, count, entryLabel, newHigh, continuation);
-    const auto search = binary(spv::OpULessThan, boolean, lower, upper);
-    state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
-    state.module.AddFunction(spv::OpBranchConditional, search, body, merge);
-    EmitLabel(state, body);
-    const auto midpoint = binary(spv::OpIAdd, u32, lower, binary(spv::OpShiftRightLogical, u32, binary(spv::OpISub, u32, upper, lower), constant(1)));
-    const auto entry = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, midpoint, constant(8)));
-    const auto before = binary(spv::OpULessThan, boolean, address, BdaLoadAddress(state, entry));
-    state.module.AddFunction(spv::OpSelect, u32, newLow, before, lower, binary(spv::OpIAdd, u32, midpoint, constant(1)));
-    state.module.AddFunction(spv::OpSelect, u32, newHigh, before, midpoint, upper);
-    state.module.AddFunction(spv::OpBranch, continuation);
-    EmitLabel(state, continuation);
-    state.module.AddFunction(spv::OpBranch, header);
-    EmitLabel(state, merge);
-    const auto index = lower;
+    const auto search = [&] {
+        const auto header = state.module.AllocateId();
+        const auto body = state.module.AllocateId();
+        const auto continuation = state.module.AllocateId();
+        const auto merge = state.module.AllocateId();
+        const auto entryLabel = state.currentLabel;
+        state.module.AddFunction(spv::OpBranch, header);
+        EmitLabel(state, header);
+        const auto lower = state.module.AllocateId();
+        const auto upper = state.module.AllocateId();
+        const auto newLow = state.module.AllocateId();
+        const auto newHigh = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, u32, lower, constant(0), entryLabel, newLow, continuation);
+        state.module.AddFunction(spv::OpPhi, u32, upper, count, entryLabel, newHigh, continuation);
+        const auto search = binary(spv::OpULessThan, boolean, lower, upper);
+        state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, search, body, merge);
+        EmitLabel(state, body);
+        const auto midpoint = binary(spv::OpIAdd, u32, lower, binary(spv::OpShiftRightLogical, u32, binary(spv::OpISub, u32, upper, lower), constant(1)));
+        const auto entry = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, midpoint, constant(8)));
+        const auto before = binary(spv::OpULessThan, boolean, address, BdaLoadAddress(state, entry));
+        state.module.AddFunction(spv::OpSelect, u32, newLow, before, lower, binary(spv::OpIAdd, u32, midpoint, constant(1)));
+        state.module.AddFunction(spv::OpSelect, u32, newHigh, before, midpoint, upper);
+        state.module.AddFunction(spv::OpBranch, continuation);
+        EmitLabel(state, continuation);
+        state.module.AddFunction(spv::OpBranch, header);
+        EmitLabel(state, merge);
+        return lower;
+    };
+    // Reuse the search result within this invocation's immutable table. Header, extent,
+    // permission and physical-address checks still run on every access.
+    auto candidate = constant(0u);
+    if (rangeIndexCache != 0u) {
+        const auto cached = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, cached, rangeIndexCache);
+        const auto exists = binary(spv::OpLogicalAnd, boolean, binary(spv::OpUGreaterThan, boolean, cached, constant(0u)), binary(spv::OpULessThanEqual, boolean, cached, count));
+        candidate = EmitValueOrZeroIfCondition(state, exists, [&] {
+            const auto entry = binary(spv::OpIAdd, u32, constant(4u), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, cached, constant(1u)), constant(8u)));
+            const auto begin = BdaLoadAddress(state, entry);
+            // The next start bounds the selected entry even if guest ranges overlap.
+            const auto beforeNext = EmitValueIfElse(state, binary(spv::OpULessThan, boolean, cached, count), boolean, [&] {
+                return binary(spv::OpULessThan, boolean, address, BdaLoadAddress(state, binary(spv::OpIAdd, u32, entry, constant(8u))));
+            }, [&] { return ConstantBool(state, true); });
+            const auto matches = binary(spv::OpLogicalAnd, boolean, binary(spv::OpUGreaterThanEqual, boolean, address, begin), beforeNext);
+            return Select(state, u32, matches, cached, constant(0u));
+        });
+    }
+    const auto index = rangeIndexCache != 0u ? EmitValueIfElse(state, binary(spv::OpINotEqual, boolean, candidate, constant(0u)), u32, [&] { return candidate; }, search) : search();
     fail(binary(spv::OpIEqual, boolean, index, constant(0)), BdaAbi::FaultReason::Unmapped);
     const auto selected = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, index, constant(1)), constant(8)));
     const auto at = [&](std::uint32_t offset) { return binary(spv::OpIAdd, u32, selected, constant(offset)); };
@@ -124,6 +145,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         {binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow},
     });
+    if (rangeIndexCache != 0u) state.module.AddFunction(spv::OpStore, rangeIndexCache, index);
     state.module.AddFunction(spv::OpReturnValue, result);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;
@@ -215,8 +237,10 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (state.faultBufferVariable != 0) DefineBdaFaultFunction(state);
     if (!state.program.Info().usesDma) return;
-    state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
-    if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
+    // One private index is shared by reads and their non-faulting probes, never by invocations.
+    const auto cache = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate, ConstantU32(state, 0u));
+    state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true, BdaAbi::Read, cache);
+    if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false, BdaAbi::Read, cache);
     DefineBdaDwordReadFunctions(state);
     DefineBdaSpanReadFunctions(state);
     if (state.program.Info().bdaWrites) {
